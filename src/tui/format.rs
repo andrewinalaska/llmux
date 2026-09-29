@@ -245,6 +245,24 @@ pub(crate) fn absolute_label(at: SystemTime, now: SystemTime, offset_secs: i64) 
     format!("{:02}-{:02} {}", month, day, clock_hm(at, offset_secs))
 }
 
+/// Label for a past instant: "14:30" when it falls on the same local calendar
+/// day as `now`, "06-15 09:00" (local month-day) otherwise — so multi-day
+/// spans stay unambiguous. Pure (offset injected) for unit tests.
+pub(crate) fn past_label(at: SystemTime, now: SystemTime, offset_secs: i64) -> String {
+    let day_of = |t: SystemTime| {
+        let epoch = t
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0) as i64;
+        epoch.saturating_add(offset_secs).div_euclid(86_400)
+    };
+    if day_of(at) == day_of(now) {
+        return clock_hm(at, offset_secs);
+    }
+    let (_, month, day) = civil_from_days(day_of(at));
+    format!("{:02}-{:02} {}", month, day, clock_hm(at, offset_secs))
+}
+
 /// Local "M/D HH:MM" for an event-banner deadline — unpadded month/day,
 /// zero-padded clock, at the given UTC `offset_secs`. Pure (offset injected)
 /// so the label is unit-testable without the machine's zone.
@@ -508,6 +526,18 @@ mod tests {
         assert_eq!(absolute_label(soon, now, 0), clock_hm(soon, 0));
         // Past timestamps degrade to clock form too (no negative dates).
         assert_eq!(absolute_label(now, now, 0), clock_hm(now, 0));
+    }
+
+    #[test]
+    fn past_label_shows_date_only_off_the_current_local_day() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_781_000_000);
+        let off = -8 * 3_600;
+        let hour_ago = now - Duration::from_secs(3_600);
+        assert_eq!(past_label(hour_ago, now, 0), clock_hm(hour_ago, 0));
+        let three_days = now - Duration::from_secs(3 * 86_400);
+        let label = past_label(three_days, now, off);
+        assert_eq!(label.len(), 11, "{label}");
+        assert_eq!(&label[2..3], "-");
     }
 
     #[test]

@@ -1495,8 +1495,8 @@ fn draw_session_detail(frame: &mut Frame, area: Rect, ctx: &FrameCtx, chrome: &C
             .collect::<Vec<_>>()
             .join(", ")
     };
-    let first = format::absolute_label(ms_to_systemtime(s.first_ms), ctx.now, ctx.tz_offset);
-    let last = format::absolute_label(ms_to_systemtime(s.last_ms), ctx.now, ctx.tz_offset);
+    let first = format::past_label(ms_to_systemtime(s.first_ms), ctx.now, ctx.tz_offset);
+    let last = format::past_label(ms_to_systemtime(s.last_ms), ctx.now, ctx.tz_offset);
     let lines = vec![
         Line::from(vec![
             Span::styled("confidence  ", dim()),
