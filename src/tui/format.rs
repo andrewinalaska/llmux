@@ -128,16 +128,17 @@ pub(crate) fn refreshed_marker(last_refresh_ms: Option<u64>, now: SystemTime) ->
     Some(format!("\u{21bb}{}", age_unit(ago)))
 }
 
-/// Fixed-width `MM/DD HH:MM` in UTC (11 chars) for the quota bars' absolute
-/// reset-time display (the `t` toggle). UTC by the same reasoning as
-/// [`clock_hms_utc`]; the in-bar width budget has no room for a zone suffix,
-/// so the toggle's footer hint carries the "UTC" fact. Civil-date math is the
-/// standard days-from-epoch algorithm (Howard Hinnant) — no chrono needed.
-pub(crate) fn absolute_utc_label(at: SystemTime) -> String {
+/// Fixed-width `MM/DD HH:MM` (11 chars) at `offset_secs` from UTC for the
+/// quota bars' absolute reset-time display (the `t` toggle). Callers pass the
+/// machine's local offset; the in-bar width budget has no room for a zone
+/// suffix. Civil-date math is the standard days-from-epoch algorithm
+/// (Howard Hinnant) — no chrono needed.
+pub(crate) fn absolute_stamp(at: SystemTime, offset_secs: i64) -> String {
     let secs = at
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    let secs = (secs as i64).saturating_add(offset_secs).max(0) as u64;
     let days = (secs / 86_400) as i64;
     let day_secs = secs % 86_400;
     // Civil from days (valid for the unix era we care about).
@@ -157,15 +158,20 @@ pub(crate) fn absolute_utc_label(at: SystemTime) -> String {
     )
 }
 
-/// Wall-clock HH:MM:SS in UTC for activity-log timestamps. UTC (not local)
-/// because std has no timezone database and pulling chrono in for a log
-/// prefix isn't worth the dependency.
-pub(crate) fn clock_hms_utc(at: SystemTime) -> String {
+/// Wall-clock HH:MM:SS in the machine's local zone for activity-log
+/// timestamps (offset via [`local_offset_secs`] / `localtime_r`).
+pub(crate) fn clock_hms_local(at: SystemTime) -> String {
+    clock_hms(at, local_offset_secs(at))
+}
+
+/// Wall-clock HH:MM:SS at a fixed UTC offset — pure, so it is unit-testable
+/// with explicit offsets.
+pub(crate) fn clock_hms(at: SystemTime, offset_secs: i64) -> String {
     let secs = at
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let day = secs % 86_400;
+    let day = (secs as i64).saturating_add(offset_secs).rem_euclid(86_400) as u64;
     format!(
         "{:02}:{:02}:{:02}",
         day / 3_600,
@@ -237,6 +243,24 @@ pub(crate) fn absolute_label(at: SystemTime, now: SystemTime, offset_secs: i64) 
     let local = (epoch as i64).saturating_add(offset_secs);
     let (_, month, day) = civil_from_days(local.div_euclid(86_400));
     format!("{:02}-{:02} {}", month, day, clock_hm(at, offset_secs))
+}
+
+/// Label for a past instant: "14:30" when it falls on the same local calendar
+/// day as `now`, "06/15/2026 09:00" (local MM/DD/YYYY) otherwise — so
+/// multi-day spans stay unambiguous. Pure (offset injected) for unit tests.
+pub(crate) fn past_label(at: SystemTime, now: SystemTime, offset_secs: i64) -> String {
+    let day_of = |t: SystemTime| {
+        let epoch = t
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0) as i64;
+        epoch.saturating_add(offset_secs).div_euclid(86_400)
+    };
+    if day_of(at) == day_of(now) {
+        return clock_hm(at, offset_secs);
+    }
+    let (year, month, day) = civil_from_days(day_of(at));
+    format!("{month:02}/{day:02}/{year:04} {}", clock_hm(at, offset_secs))
 }
 
 /// Local "M/D HH:MM" for an event-banner deadline — unpadded month/day,
@@ -468,11 +492,13 @@ mod tests {
     }
 
     #[test]
-    fn clock_is_utc_hms() {
+    fn clock_hms_applies_offset() {
         let at = SystemTime::UNIX_EPOCH + Duration::from_secs(3_661);
-        assert_eq!(clock_hms_utc(at), "01:01:01");
+        assert_eq!(clock_hms(at, 0), "01:01:01");
         let midnight = SystemTime::UNIX_EPOCH + Duration::from_secs(2 * 86_400);
-        assert_eq!(clock_hms_utc(midnight), "00:00:00");
+        assert_eq!(clock_hms(midnight, 0), "00:00:00");
+        // AKDT (UTC-8): 01:01:01Z is 17:01:01 the previous day.
+        assert_eq!(clock_hms(at, -8 * 3_600), "17:01:01");
     }
 
     #[test]
@@ -500,6 +526,18 @@ mod tests {
         assert_eq!(absolute_label(soon, now, 0), clock_hm(soon, 0));
         // Past timestamps degrade to clock form too (no negative dates).
         assert_eq!(absolute_label(now, now, 0), clock_hm(now, 0));
+    }
+
+    #[test]
+    fn past_label_shows_date_only_off_the_current_local_day() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_781_000_000);
+        let off = -8 * 3_600;
+        let hour_ago = now - Duration::from_secs(3_600);
+        assert_eq!(past_label(hour_ago, now, 0), clock_hm(hour_ago, 0));
+        let three_days = now - Duration::from_secs(3 * 86_400);
+        let label = past_label(three_days, now, off);
+        // 1_781_000_000 s is 2026-06-09 10:13Z; 3 days earlier, in UTC-8.
+        assert_eq!(label, "06/06/2026 02:13");
     }
 
     #[test]

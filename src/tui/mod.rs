@@ -509,7 +509,7 @@ pub(crate) struct Chrome {
     /// Session-local `u`-key override of the quota-gauge fill direction;
     /// `None` = the config default carried on the view applies.
     pub quota_display_override: Option<crate::config::QuotaDisplay>,
-    /// `t`-key session toggle: absolute UTC reset stamps in the quota bars.
+    /// `t`-key session toggle: absolute local reset stamps in the quota bars.
     pub reset_absolute: bool,
     /// Live text of the limits editor (`Mode::EditLimits`); empty otherwise.
     /// Rendered raw in the footer (percent ceilings are not secrets).
@@ -1942,7 +1942,7 @@ impl App {
             key.method,
             key.path,
             key.status,
-            format::clock_hms_utc(entry.at),
+            format::clock_hms_local(entry.at),
         );
         let state = if id == 0 {
             RawModalState::Failed(
@@ -3227,7 +3227,7 @@ impl App {
             // Quota-gauge fill direction (used% grows / left% drains) —
             // session-local override of config `quota_display`.
             KeyCode::Char('u') => self.toggle_quota_display(view),
-            // Reset display: countdown ↔ absolute UTC stamp in the quota bars.
+            // Reset display: countdown ↔ absolute local stamp in the quota bars.
             KeyCode::Char('t') => self.toggle_reset_display(),
             // Accounts row order WITHIN each backend group: name ↔ next-pick.
             KeyCode::Char('o') => self.toggle_account_sort(),
@@ -3288,12 +3288,12 @@ impl App {
         self.set_status(message);
     }
 
-    /// Flip the quota bars between reset countdown and absolute UTC stamp.
+    /// Flip the quota bars between reset countdown and absolute local stamp.
     fn toggle_reset_display(&mut self) {
         self.reset_absolute = !self.reset_absolute;
         self.set_status(
             if self.reset_absolute {
-                "reset shown as absolute time (UTC)"
+                "reset shown as absolute time (local)"
             } else {
                 "reset shown as countdown"
             }
