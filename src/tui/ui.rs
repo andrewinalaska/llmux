@@ -3516,7 +3516,7 @@ fn draw_input_modal(frame: &mut Frame, view: &DashboardView, modal: &InputModal)
     let title = format!(
         " 🔍 input — {} · {} ",
         kind.as_deref().unwrap_or("?"),
-        format::clock_hms_utc(entry.at),
+        format::clock_hms_local(entry.at),
     );
     let block = Block::new()
         .borders(Borders::ALL)
@@ -4382,7 +4382,7 @@ pub(crate) fn raw_general_lines(entry: &Completed) -> Vec<Line<'static>> {
                 dim(),
             ),
         ]),
-        field("time", format!("{} UTC", format::clock_hms_utc(entry.at))),
+        field("time", format::clock_hms_local(entry.at)),
         field("id", format!("#{id}")),
         field("model", format!("{model_label}{effort_label}{fast_label}")),
         field("account", account.as_deref().unwrap_or("?").to_string()),
@@ -5413,8 +5413,8 @@ fn quota_bar_text(
         .ok()
         .filter(|rem| !rem.is_zero());
     let (text, bold_chars) = match (absolute, live) {
-        // Absolute stamp (`t` toggle): `MM/DD HH:MM` UTC, date part bold.
-        (true, Some(_)) => (format::absolute_utc_label(window.resets_at), 5),
+        // Absolute stamp (`t` toggle): `MM/DD HH:MM` local, date part bold.
+        (true, Some(_)) => (format::absolute_stamp(window.resets_at, format::local_offset_secs(window.resets_at)), 5),
         (false, Some(rem)) => {
             let (head, tail) = format::countdown_units(rem);
             let bold = head.chars().count();
@@ -6642,7 +6642,7 @@ fn draw_activity(
                 // spinner+2 spaces so the following `kind` column lines up.
                 Span::styled(format!(" {glyph} "), Style::new().fg(color)),
                 Span::styled(
-                    format!("{}  ", format::clock_hms_utc(request.started_at)),
+                    format!("{}  ", format::clock_hms_local(request.started_at)),
                     dim(),
                 ),
             ];
@@ -6941,7 +6941,7 @@ fn folded_run_line(
     let marker = if expanded { '▾' } else { '▸' };
     let oldest = &run[run.len() - 1];
     let stamp = Span::styled(
-        format!(" {marker} {}  ", format::clock_hms_utc(oldest.at)),
+        format!(" {marker} {}  ", format::clock_hms_local(oldest.at)),
         dim(),
     );
     let newest = &run[0];
@@ -7051,7 +7051,7 @@ fn completed_line(
             //   ▸ HH:MM:SS kind name [model effort] email → 200 3.1s 269tok $0.0079 «label» "input…"
             let marker = if expanded { '▾' } else { '▸' };
             let stamp = Span::styled(
-                format!(" {marker} {}  ", format::clock_hms_utc(entry.at)),
+                format!(" {marker} {}  ", format::clock_hms_local(entry.at)),
                 dim(),
             );
             // Same display form as the accounts table (Z 2026-07-15
@@ -7176,7 +7176,7 @@ fn completed_line(
             Line::from(spans)
         }
         CompletedBody::Note { text, error } => {
-            let stamp = Span::styled(format!("   {}  ", format::clock_hms_utc(entry.at)), dim());
+            let stamp = Span::styled(format!("   {}  ", format::clock_hms_local(entry.at)), dim());
             let style = if *error {
                 Style::new().fg(Color::Red)
             } else {
