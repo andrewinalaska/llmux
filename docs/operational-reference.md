@@ -64,7 +64,7 @@ Metric semantics (v1, deliberately conservative):
 
 The activity feed gains the same per-request view: a `t/s` column (e2e) on every completed row, and the click-expanded detail shows `e2e` / `est … post-delta` / `ttfb` / `first output` when recorded. Attach clients receive the same rows on `GET /llmux/dashboard` (`daily_perf`).
 
-In the `sessions` tab, `o` cycles the sort (recent → tokens → requests), the mouse wheel moves the cursor, and a left-click selects the row under the pointer. The `t/s` column is the honest per-session output rate — Σ output tokens over Σ recorded request durations (raw-io records now carry `duration_ms`; pre-field history shows `—`, never a wall-clock-span fake).
+In the `sessions` tab, `o` cycles the sort (recent → tokens → requests), the mouse wheel moves the cursor, and a left-click selects the row under the pointer. The `t/s` column is the honest per-session output rate — Σ output tokens over Σ recorded request durations (never a wall-clock-span fake). The tab folds `activity.jsonl` (per-request metadata: `user_id`, model, account, tokens, duration), not the multi-GB `raw-io.jsonl` (~1,850x smaller on a real install), so it opens in seconds rather than minutes and works with `raw_io.enabled` off and beyond raw-io retention. Requests llmux answered locally (pool-exhausted 429s, pre-relay 502s, `count_tokens` estimates) count as session requests with zero tokens; streamed responses show their real token counts (raw-io's SSE bodies used to fold as 0); and history written before per-request `user_id` existed lands in the `ungrouped` row.
 
 ### Config tab (the config editor)
 

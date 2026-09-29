@@ -1,6 +1,15 @@
-//! Session grouping (issue #34): fold persisted [`RawIoRecord`]s into a
+//! Session grouping (issue #34): fold persisted request records into a
 //! confidence-labeled session timeline keyed by the request body's
 //! `metadata.user_id`.
+//!
+//! # Data source
+//!
+//! The TUI Sessions overlay folds `activity.jsonl` (per-request metadata,
+//! [`PersistedRequest`] → [`RecordMeta::from_persisted`], a pure field
+//! projection). It originally folded `raw-io.jsonl` ([`RawIoRecord`] →
+//! [`RecordMeta::from_record`], parsing the verbatim bodies) — that log is
+//! ~1,850x larger for the same history. Both projections feed the same
+//! [`SessionFolder`]; [`fold_sessions`] remains the raw-io one-shot fold.
 //!
 //! # Why `metadata.user_id`
 //!
@@ -29,6 +38,7 @@
 use std::collections::BTreeMap;
 
 use crate::proxy::raw_io::RawIoRecord;
+use crate::tui::activity::PersistedRequest;
 
 /// How confidently a group of records is attributed to one session.
 ///
@@ -173,6 +183,66 @@ impl RecordMeta {
             duration_ms: rec.duration_ms,
         }
     }
+
+    /// Project one `activity.jsonl` line ([`PersistedRequest`]) into the
+    /// fold's metadata — the Sessions overlay's production data source.
+    ///
+    /// A pure field projection: no body text exists on this record to parse.
+    /// `user_id` was extracted from the full request body at request time by
+    /// [`crate::routing::user_id_from_body`] (same `metadata.user_id` path and
+    /// same non-JSON / missing / non-string → `None` semantics as
+    /// [`user_id_from_request_body`]), and `tokens.input`/`tokens.output` are
+    /// the response's `usage.input_tokens`/`usage.output_tokens` the relay
+    /// already observed (`None` tokens → 0, like an unparseable raw-io body).
+    ///
+    /// `duration_ms` is always `Some`: it is a required field of every
+    /// `PersistedRequest` schema-v1 line, so unlike pre-field raw-io records
+    /// every activity record counts toward the session's timed-rate sums.
+    ///
+    /// # How this source differs from raw-io.jsonl (by design, documented)
+    ///
+    /// For the same logical request the two projections are identical (proven
+    /// by `from_persisted_folds_identically_to_raw_io_records`). The files do
+    /// not hold exactly the same SET of requests or the same derived values:
+    ///
+    /// - activity-only records: requests the proxy answers WITHOUT relaying an
+    ///   upstream response emit `RequestFinished` but no raw-io capture — a
+    ///   body-read failure / 413 (`user_id: None`, lands in `ungrouped`),
+    ///   pool-exhausted 429s and pre-relay 502s in `run_taxonomy_loop`, the
+    ///   compatibility-gate 400/502, locally-answered `count_tokens`, and the
+    ///   upstream-body-read-failure 502s in `relay` / `relay_translate`. These
+    ///   now count as session requests (with their duration — a parked 429 can
+    ///   be long — and zero tokens, so they also pull the session's `t/s` down).
+    /// - raw-io-only records: the streaming relays send `RequestFinished` via
+    ///   `try_send` on the bounded activity channel (`ACTIVITY_CHANNEL_CAP`)
+    ///   and a full channel drops it (never persisted), while the raw-io append
+    ///   is direct. Also raw-io keeps nothing when `raw_io.enabled` is off,
+    ///   and prunes to `raw_io.retention_days`; activity.jsonl is unconditional
+    ///   and unpruned.
+    /// - tokens: raw-io stores a STREAMED response as SSE text, which
+    ///   [`tokens_from_response_body`] cannot parse (→ 0/0); activity carries
+    ///   the usage the SSE relay observed, so streamed sessions now show real
+    ///   token counts.
+    /// - user_id: raw-io clips the request body to `raw_io.max_body_bytes`, so
+    ///   an over-cap body loses its `user_id` there; activity parsed the full
+    ///   body. Conversely, activity lines written before the `user_id` field
+    ///   existed (issue #32) replay as `None` → `ungrouped`.
+    /// - timing jitter: raw-io stamps `ts_ms`/`duration_ms` at capture, activity
+    ///   stamps `ts_ms` when the hub folds the event and `duration_ms` at emit —
+    ///   milliseconds apart for the same request.
+    pub(crate) fn from_persisted(p: &PersistedRequest) -> Self {
+        let (tokens_in, tokens_out) = p.tokens.map_or((0, 0), |t| (t.input, t.output));
+        Self {
+            ts_ms: p.ts_ms,
+            id: p.id,
+            user_id: p.user_id.clone(),
+            model: p.model.clone(),
+            account: p.account.clone(),
+            tokens_in,
+            tokens_out,
+            duration_ms: Some(p.duration_ms),
+        }
+    }
 }
 
 /// Mutable accumulator while folding; finalized into a [`Session`].
@@ -285,7 +355,7 @@ impl Acc {
 /// Incremental session fold: feed records in batches, read the timeline at any
 /// point. State is one small [`Acc`] per `user_id` — O(sessions), independent
 /// of how many records have been folded — so a streaming reader can fold an
-/// arbitrarily large raw-io log while holding only one batch at a time.
+/// arbitrarily large log while holding only one batch at a time.
 ///
 /// # Ordering
 ///
@@ -295,8 +365,8 @@ impl Acc {
 /// `(ts_ms, id)` before folding and each key's last-seen account carries over
 /// into the next batch. The result therefore equals a one-shot
 /// [`fold_sessions`] over all records whenever no record's timestamp precedes
-/// (for its own key) a record already folded in an EARLIER batch. raw-io.jsonl
-/// is appended in near-chronological order — disorder comes only from
+/// (for its own key) a record already folded in an EARLIER batch. Both
+/// activity.jsonl and raw-io.jsonl are appended in near-chronological order — disorder comes only from
 /// overlapping concurrent requests — so with batches of thousands of records
 /// that condition holds in practice; if it is violated, only
 /// `account_rotations` can differ (the late record is folded as if it came
@@ -376,6 +446,156 @@ pub fn fold_sessions(records: &[RawIoRecord]) -> Vec<Session> {
     let mut folder = SessionFolder::new();
     folder.add(records);
     folder.snapshot()
+}
+
+/// Shared fixture for the raw-io ⇄ activity equivalence proofs (used by this
+/// module's tests and by the TUI streaming-loader tests).
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::time::{Duration, UNIX_EPOCH};
+
+    use crate::proxy::raw_io::{RawIoRecord, RECORD_VERSION};
+    use crate::tui::activity::PersistedRequest;
+    use crate::tui::{ActivityEvent, TokenCounts};
+
+    /// One logical proxied request, from which BOTH on-disk twins are built.
+    #[derive(Debug, Clone)]
+    pub(crate) struct Logical {
+        pub id: u64,
+        pub ts_ms: u64,
+        /// How the request body carries `metadata.user_id`.
+        pub user_id: UserIdShape,
+        pub model: Option<String>,
+        pub account: Option<String>,
+        pub duration_ms: u64,
+        /// Response `usage` (`None` = the response carried no usage object,
+        /// e.g. an error body).
+        pub usage: Option<(u64, u64)>,
+    }
+
+    #[derive(Debug, Clone)]
+    pub(crate) enum UserIdShape {
+        Present(String),
+        /// No `metadata` object at all.
+        NoMetadata,
+        /// `metadata` present but no `user_id`.
+        NoUserId,
+        /// `metadata.user_id` is not a string (both extractors → `None`).
+        NonString,
+    }
+
+    impl Logical {
+        pub(crate) fn request_body(&self) -> String {
+            let model = self.model.as_deref().unwrap_or("unknown");
+            let meta = match &self.user_id {
+                UserIdShape::Present(uid) => format!(r#","metadata":{{"user_id":"{uid}"}}"#),
+                UserIdShape::NoMetadata => String::new(),
+                UserIdShape::NoUserId => r#","metadata":{"other":"x"}"#.to_string(),
+                UserIdShape::NonString => r#","metadata":{"user_id":42}"#.to_string(),
+            };
+            format!(r#"{{"model":"{model}"{meta},"messages":[{{"role":"user","content":"hi"}}]}}"#)
+        }
+
+        fn response_body(&self) -> String {
+            match self.usage {
+                // Cache counters ride along exactly as Anthropic reports them;
+                // both sides must fold only the fresh input/output fields.
+                Some((i, o)) => format!(
+                    r#"{{"id":"msg_{}","usage":{{"input_tokens":{i},"output_tokens":{o},"cache_read_input_tokens":999,"cache_creation_input_tokens":7}}}}"#,
+                    self.id
+                ),
+                None => r#"{"type":"error","error":{"type":"overloaded_error"}}"#.to_string(),
+            }
+        }
+
+        /// The raw-io.jsonl twin: verbatim bodies, metadata as top-level fields.
+        pub(crate) fn raw_io(&self) -> RawIoRecord {
+            RawIoRecord {
+                v: RECORD_VERSION,
+                ts_ms: self.ts_ms,
+                id: self.id,
+                group: Some("claude".into()),
+                model: self.model.clone(),
+                account: self.account.clone(),
+                status: Some(if self.usage.is_some() { 200 } else { 529 }),
+                duration_ms: Some(self.duration_ms),
+                request_body: self.request_body(),
+                response_body: self.response_body(),
+                request_headers: None,
+                response_headers: None,
+                upstream: None,
+            }
+        }
+
+        /// The activity.jsonl twin, built the way production builds it: the
+        /// `RequestFinished` event (with `user_id` from the PRODUCTION
+        /// extractor `routing::user_id_from_body` over the same request bytes,
+        /// and the usage the relay observed) through
+        /// `PersistedRequest::from_event`, then a JSON round-trip as on disk.
+        pub(crate) fn persisted(&self) -> PersistedRequest {
+            let event = ActivityEvent::RequestFinished {
+                id: self.id,
+                method: "POST".into(),
+                path: "/v1/messages".into(),
+                account: self.account.clone(),
+                status: if self.usage.is_some() { 200 } else { 529 },
+                duration: Duration::from_millis(self.duration_ms),
+                tokens: self.usage.map(|(input, output)| TokenCounts {
+                    input,
+                    output,
+                    cache_read: Some(999),
+                    cache_creation: Some(7),
+                }),
+                group: Some("claude".into()),
+                model: self.model.clone(),
+                effort: None,
+                fast: Some(false),
+                ttfb_ms: None,
+                ttft_ms: None,
+                gen_ms: None,
+                aborted: false,
+                user_id: crate::routing::user_id_from_body(self.request_body().as_bytes()),
+                kind: None,
+                excerpt: None,
+                tenant: None,
+            };
+            let rec = PersistedRequest::from_event(
+                &event,
+                UNIX_EPOCH + Duration::from_millis(self.ts_ms),
+            )
+            .expect("RequestFinished persists");
+            let line = serde_json::to_string(&rec).expect("serialize");
+            serde_json::from_str(&line).expect("round-trip")
+        }
+    }
+
+    /// `n` varied logical requests: ~23 interleaved sessions, every
+    /// missing-`user_id` shape, some with no account / model / usage, rotating
+    /// accounts, and timestamps disordered within aligned blocks of 8.
+    pub(crate) fn logical_requests(n: u64) -> Vec<Logical> {
+        (0..n)
+            .map(|i| {
+                let block = i / 8;
+                let within = 7 - (i % 8);
+                let user_id = match i % 97 {
+                    13 => UserIdShape::NoMetadata,
+                    41 => UserIdShape::NoUserId,
+                    77 => UserIdShape::NonString,
+                    _ => UserIdShape::Present(format!("u-{}", (i * 7 + i / 50) % 23)),
+                };
+                Logical {
+                    id: i + 1,
+                    ts_ms: 1_700_000_000_000 + block * 800 + within * 100,
+                    user_id,
+                    model: (i % 29 != 0)
+                        .then(|| if i % 4 == 0 { "opus" } else { "sonnet" }.to_string()),
+                    account: (i % 11 != 0).then(|| format!("acct-{}", (i / 3 + i % 5) % 3)),
+                    duration_ms: 100 + i % 900,
+                    usage: (i % 17 != 5).then_some((i % 1000, i % 37)),
+                }
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -685,5 +905,117 @@ mod tests {
         let mut got0 = got[0].clone();
         got0.account_rotations = want[0].account_rotations;
         assert_eq!(got0, want[0], "everything else is exact");
+    }
+
+    /// THE data-source switch proof: from N logical requests build both the
+    /// raw-io.jsonl twin (verbatim bodies) and the activity.jsonl twin
+    /// (metadata only, built through the production `from_event` + extractor
+    /// path). Folding the raw-io set with the existing `fold_sessions` and the
+    /// activity set via `from_persisted` must yield the identical timeline —
+    /// every session, every field, same order — one-shot and in the TUI's
+    /// 4096-record batches.
+    #[test]
+    fn from_persisted_folds_identically_to_raw_io_records() {
+        let logical = test_support::logical_requests(3 * 4096 + 517);
+        let raw: Vec<RawIoRecord> = logical.iter().map(|l| l.raw_io()).collect();
+        let persisted: Vec<PersistedRequest> = logical.iter().map(|l| l.persisted()).collect();
+
+        let expected = fold_sessions(&raw);
+        // The fixture must actually exercise the interesting cases.
+        assert!(expected.len() > 20, "many sessions");
+        assert!(expected.iter().any(|s| s.account_rotations > 0));
+        let ungrouped = expected.last().expect("sessions");
+        assert_eq!(ungrouped.user_id, None, "missing-user_id bucket present");
+        assert!(
+            ungrouped.requests >= 3 * 3,
+            "all three missing shapes land there"
+        );
+        assert!(persisted.iter().any(|p| p.tokens.is_none()));
+        assert!(persisted.iter().any(|p| p.account.is_none()));
+        assert!(persisted.iter().any(|p| p.model.is_none()));
+
+        let mut one_shot = SessionFolder::new();
+        one_shot.add_meta(persisted.iter().map(RecordMeta::from_persisted).collect());
+        assert_eq!(one_shot.snapshot(), expected, "one-shot");
+
+        let mut chunked = SessionFolder::new();
+        for chunk in persisted.chunks(4096) {
+            chunked.add_meta(chunk.iter().map(RecordMeta::from_persisted).collect());
+        }
+        assert_eq!(chunked.snapshot(), expected, "4096-record batches");
+    }
+
+    /// The per-record projection agrees field-for-field for every logical
+    /// request (a stronger, per-record form of the fold equality above).
+    #[test]
+    fn from_persisted_matches_from_record_per_record() {
+        for l in test_support::logical_requests(500) {
+            let a = RecordMeta::from_record(&l.raw_io());
+            let b = RecordMeta::from_persisted(&l.persisted());
+            assert_eq!(
+                (a.ts_ms, a.id, &a.user_id, &a.model, &a.account),
+                (b.ts_ms, b.id, &b.user_id, &b.model, &b.account),
+                "id {}",
+                l.id
+            );
+            assert_eq!(
+                (a.tokens_in, a.tokens_out, a.duration_ms),
+                (b.tokens_in, b.tokens_out, b.duration_ms),
+                "id {}",
+                l.id
+            );
+        }
+    }
+
+    /// Documented deliberate difference: a raw-io record written before
+    /// `duration_ms` existed contributes nothing to the timed-rate sums, while
+    /// every activity line carries a duration. Only the three timed fields may
+    /// differ; everything else stays identical.
+    #[test]
+    fn pre_duration_raw_io_differs_only_in_timed_sums() {
+        let logical = test_support::logical_requests(2_000);
+        let raw: Vec<RawIoRecord> = logical
+            .iter()
+            .enumerate()
+            .map(|(i, l)| {
+                let mut r = l.raw_io();
+                if i % 13 == 0 {
+                    r.duration_ms = None;
+                }
+                r
+            })
+            .collect();
+        let mut folder = SessionFolder::new();
+        folder.add_meta(
+            logical
+                .iter()
+                .map(|l| RecordMeta::from_persisted(&l.persisted()))
+                .collect(),
+        );
+        let got = folder.snapshot();
+        let want = fold_sessions(&raw);
+        assert_eq!(got.len(), want.len());
+        let mut any_diff = false;
+        for (g, w) in got.iter().zip(&want) {
+            assert!(g.timed_requests >= w.timed_requests);
+            any_diff |= g.timed_requests != w.timed_requests;
+            let mut g = g.clone();
+            g.duration_ms_sum = w.duration_ms_sum;
+            g.timed_requests = w.timed_requests;
+            g.tokens_out_timed = w.tokens_out_timed;
+            assert_eq!(&g, w);
+        }
+        assert!(any_diff, "fixture exercises pre-field raw-io records");
+    }
+
+    /// A persisted line with no `tokens` (error / pre-usage) folds as 0/0,
+    /// exactly like a raw-io response body with no parseable usage.
+    #[test]
+    fn from_persisted_missing_tokens_fold_as_zero() {
+        let mut l = test_support::logical_requests(1).remove(0);
+        l.usage = None;
+        let m = RecordMeta::from_persisted(&l.persisted());
+        assert_eq!((m.tokens_in, m.tokens_out), (0, 0));
+        assert_eq!(m.duration_ms, Some(l.duration_ms));
     }
 }
