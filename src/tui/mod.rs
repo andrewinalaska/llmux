@@ -33,7 +33,10 @@ mod event;
 // `llmux status` output and the dashboard agree on the display.
 pub(crate) mod format;
 pub(crate) mod logs;
-mod triage;
+// pub(crate): `Chrome` (and `DashboardView::display_order`) carry
+// `triage::AccountSort` across the crate-visible TUI surface, so the enum must
+// be at least as visible as they are.
+pub(crate) mod triage;
 mod ui;
 mod view;
 
@@ -72,6 +75,7 @@ use view::DashboardView;
 /// forwarded upstream VERBATIM rather than rewritten to the configured pin.
 const CODEX_MODELS: &[&str] = &[
     "gpt-6-astra",
+    "gpt-6-sol",
     "gpt-5.6-sol",
     "gpt-5.6-terra",
     "gpt-5.5",
@@ -326,6 +330,72 @@ pub(crate) enum Overlay {
     Keys,
 }
 
+/// Keys-panel state (`docs/keys-history/spec.md` K-0): WHICH durable-usage
+/// question the `K` overlay is asking, and the answer it is showing.
+///
+/// The panel no longer renders the in-memory lifetime aggregates that ride on
+/// the dashboard document — it renders the answer to an explicit
+/// (window, models) query against the durable store, fetched in the
+/// background. That is why `loading`/`error` are first-class here: a pending
+/// or failed query must SAY so, never fall back to unfiltered data wearing a
+/// filtered label.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct KeysPanel {
+    /// Trailing window (`w` cycles); `all` by default — the pre-existing
+    /// behavior.
+    pub window: crate::key_usage::UsageWindow,
+    /// Selected models (`f` picker). EMPTY = every model.
+    pub models: std::collections::BTreeSet<String>,
+    /// Scroll offset in FLATTENED rows (tenant rows + their model rows).
+    pub scroll: usize,
+    /// A query is in flight.
+    pub loading: bool,
+    /// The last query's failure, shown instead of rows.
+    pub error: Option<String>,
+    /// The last successful answer (shared, so a Chrome clone is cheap).
+    /// DROPPED the moment a different question is asked — rows that answered
+    /// the previous window/filter must never sit under the new label.
+    pub doc: Option<std::sync::Arc<crate::key_usage::KeysUsageDoc>>,
+    /// Models observed by the last successful answer, cached SEPARATELY from
+    /// it so dropping stale rows never empties the `f` picker.
+    pub available: Vec<String>,
+    /// The open model picker, if any.
+    pub picker: Option<KeysPicker>,
+    /// Newest dispatched query id — older deliveries are dropped, so a fast
+    /// `w w w` can never render an out-of-order answer.
+    pub generation: u64,
+}
+
+/// The `f` multi-select model picker (keys-history K-0).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct KeysPicker {
+    pub cursor: usize,
+    /// Working selection — applied to the panel only on Enter.
+    pub selected: std::collections::BTreeSet<String>,
+    /// Offered names: the models observed in the current window, UNIONED with
+    /// anything already selected (so a selection made under a wider window
+    /// stays visible and deselectable).
+    pub options: Vec<String>,
+}
+
+/// One dispatched keys-usage query, drained by the event loop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct KeysQuery {
+    pub generation: u64,
+    pub window: crate::key_usage::UsageWindow,
+    pub models: Vec<String>,
+}
+
+/// One keys-usage answer delivered back to the event loop.
+#[derive(Debug)]
+pub(crate) struct KeysLoad {
+    pub generation: u64,
+    pub result: Result<crate::key_usage::KeysUsageDoc, String>,
+}
+
+/// Rows one PageUp/PageDown moves the keys panel.
+const KEYS_PAGE: usize = 10;
+
 /// Sort order of the Sessions overlay (`o` cycles): most-recent first (the
 /// timeline default), most tokens (in+out), or most requests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -395,6 +465,10 @@ pub(crate) struct Chrome {
     /// its OWN detail without the click reading as "collapse the group"
     /// (Z 2026-07-15). Keyed by any member's `ActivityKey`.
     pub expanded_run: Option<activity::ActivityKey>,
+    /// Keys-panel state (keys-history K): window/model filter, scroll, the
+    /// fetched usage document, and the open model picker. The panel renders
+    /// from THIS, not from the dashboard document's lifetime aggregates.
+    pub keys: KeysPanel,
     /// Cursor row in the Stats overlay's model table.
     pub model_cursor: usize,
     /// Trailing window the Stats heatmap aggregates over (issue #23), cycled
@@ -415,6 +489,9 @@ pub(crate) struct Chrome {
     pub session_cursor: usize,
     /// Sessions overlay sort order (`o` cycles).
     pub session_sort: SessionSort,
+    /// Within-group order of the accounts table (`o` toggles it on MAIN and
+    /// the accounts overlay). Drives BOTH the render and the row cursors.
+    pub account_sort: triage::AccountSort,
     /// Config-editor cursor row + the edit/confirm prompt text.
     pub config_cursor: usize,
     pub config_input: String,
@@ -469,6 +546,10 @@ pub(crate) struct Chrome {
     /// closed. Content-owning (cheap to clone — the body lines sit behind an
     /// `Arc`), drawn last like the input modal.
     pub raw_modal: Option<RawModal>,
+    /// The click-opened account detail modal (.prd/19 rules 6–7), or `None`
+    /// when closed. Like the input modal it stores only an identity; the body
+    /// is rebuilt from the snapshot every frame.
+    pub account_modal: Option<AccountModal>,
 }
 
 /// The click-opened full-input modal (UI-6 item 3). Holds only the clicked
@@ -478,6 +559,17 @@ pub(crate) struct Chrome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct InputModal {
     pub key: activity::ActivityKey,
+    pub scroll: u16,
+}
+
+/// The click-opened account detail modal (.prd/19 rules 6–7). Holds the
+/// account's REAL id — never a display index, because the table reorders every
+/// frame (`display_order`) — plus the vertical scroll offset in wrapped lines.
+/// The body is rebuilt from `view.snapshot` each frame, so it never goes stale
+/// and the render pass closes it when the account leaves the pool.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AccountModal {
+    pub account: String,
     pub scroll: u16,
 }
 
@@ -809,6 +901,10 @@ struct App {
     session_cursor: usize,
     /// Sessions overlay sort order (`o` cycles; re-applied on load delivery).
     session_sort: SessionSort,
+    /// Session toggle (`o` on MAIN / the accounts overlay): within-group order
+    /// of the accounts table — name (default) or the scheduler's next-pick
+    /// order. Session-local, never persisted to config.
+    account_sort: triage::AccountSort,
     /// Config-editor cursor + input buffer (Mode::ConfigEdit/-Confirm).
     config_cursor: usize,
     config_input: String,
@@ -849,6 +945,10 @@ struct App {
     input_modal: Option<InputModal>,
     /// The click-opened raw request/response viewer (UI-7); `None` when closed.
     raw_modal: Option<RawModal>,
+    /// The click-opened account detail modal (.prd/19 rule 6); `None` when
+    /// closed. Same post-draw reconcile as `input_modal`: the render pass
+    /// clamps the scroll, or closes the modal when the pinned account is gone.
+    account_modal: Option<AccountModal>,
     /// A queued raw-record fetch, drained by the event loop into a background
     /// task (same pattern as the other `pending_*` remote ops).
     pending_raw: Option<RawFetchReq>,
@@ -884,6 +984,15 @@ struct App {
     /// Closing the confirm dialog does NOT clear it; only a terminal outcome
     /// does.
     pending_redemption: Option<PendingRedemption>,
+    /// Keys panel: the durable-usage query and its answer (keys-history K).
+    keys: KeysPanel,
+    /// A keys-usage query queued by a key press, dispatched by the event loop
+    /// (blocking SQL locally, HTTP when attached) — same pattern as
+    /// `pending_raw`, so neither the DB nor the network is ever touched from a
+    /// key handler.
+    pending_keys: Option<KeysQuery>,
+    /// Sender the background keys-usage query delivers on.
+    keys_tx: Option<mpsc::Sender<KeysLoad>>,
 }
 
 impl App {
@@ -930,6 +1039,7 @@ impl App {
             sessions_tx: None,
             session_cursor: 0,
             session_sort: SessionSort::default(),
+            account_sort: triage::AccountSort::default(),
             config_cursor: 0,
             config_input: String::new(),
             config_pending: None,
@@ -942,6 +1052,7 @@ impl App {
             usage_scroll: 0,
             input_modal: None,
             raw_modal: None,
+            account_modal: None,
             pending_raw: None,
             raw_tx: None,
             raw_generation: 0,
@@ -953,6 +1064,9 @@ impl App {
             control_inflight: false,
             control_tx: None,
             pending_redemption: None,
+            keys: KeysPanel::default(),
+            pending_keys: None,
+            keys_tx: None,
         }
     }
 
@@ -1138,6 +1252,7 @@ impl App {
             activity_scroll: self.activity_scroll,
             expanded_activity: self.expanded_activity.clone(),
             expanded_run: self.expanded_run.clone(),
+            keys: self.keys.clone(),
             model_cursor: self.model_cursor,
             stats_window: self.stats_window,
             sessions: self.sessions.clone(),
@@ -1145,6 +1260,7 @@ impl App {
             sessions_pct: self.sessions_pct,
             session_cursor: self.session_cursor,
             session_sort: self.session_sort,
+            account_sort: self.account_sort,
             config_cursor: self.config_cursor,
             config_input: self.config_input.clone(),
             config_saved: self.config_saved.clone(),
@@ -1167,6 +1283,7 @@ impl App {
                 m.spin = self.frame;
                 m
             }),
+            account_modal: self.account_modal.clone(),
             limits_input: if matches!(self.mode, Mode::EditLimits { .. }) {
                 self.add_input.clone()
             } else {
@@ -1307,6 +1424,12 @@ impl App {
             self.on_key_raw_modal(key.code);
             return;
         }
+        // The account detail modal (.prd/19 rule 6) swallows keys the same way:
+        // `q` scrolls nothing and quits nothing while it is open.
+        if self.account_modal.is_some() {
+            self.on_key_account_modal(key.code);
+            return;
+        }
         // A pending `Mode` interaction (account switch / key entry / remove
         // confirm / login picker) always takes the key first — these run WITHIN
         // the Accounts overlay (issues #3/#4) and must keep working unchanged.
@@ -1338,7 +1461,7 @@ impl App {
             Overlay::Misc => self.on_key_misc(key.code),
             Overlay::Perf => self.on_key_perf(key.code, view),
             Overlay::Config => self.on_key_config(key.code, view),
-            Overlay::Keys => self.on_key_keys(key.code),
+            Overlay::Keys => self.on_key_keys(key.code, view),
         }
     }
 
@@ -1416,6 +1539,17 @@ impl App {
                         }
                     }
                 }
+            }
+            return true;
+        }
+        // The account detail modal (.prd/19 rule 6) owns the mouse the same
+        // way: the wheel scrolls it (clamped after draw), every other event is
+        // swallowed so a click can't reach the row beneath it.
+        if let Some(modal) = self.account_modal.as_mut() {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => modal.scroll = modal.scroll.saturating_sub(3),
+                MouseEventKind::ScrollDown => modal.scroll = modal.scroll.saturating_add(3),
+                _ => {}
             }
             return true;
         }
@@ -1551,7 +1685,7 @@ impl App {
             {
                 // Pin the REAL account id now; display indexes reorder.
                 self.menu_account = view.and_then(|v| {
-                    let order = v.display_order(SystemTime::now());
+                    let order = v.display_order(self.account_sort, SystemTime::now());
                     order
                         .get(idx)
                         .and_then(|&i| v.snapshot.accounts.get(i))
@@ -1562,6 +1696,43 @@ impl App {
                 return true;
             }
             return false;
+        }
+        // Left-click on an accounts row opens the account detail modal
+        // (.prd/19 rule 6). Works on MAIN and on the accounts overlay, which
+        // render the same table; the modal blocks above already returned when
+        // one is open, so no modal can be stacked. Checked BEFORE the MAIN
+        // match because the row rects are their own set — separator drags, the
+        // settings bar and the activity panel occupy different rows and are
+        // untouched.
+        if self.mode == Mode::Normal
+            && matches!(self.overlay, Overlay::None | Overlay::Accounts)
+            && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+        {
+            if let Some(idx) = self
+                .account_row_chrome
+                .iter()
+                .find(|r| {
+                    mouse.row == r.area.y
+                        && mouse.column >= r.area.x
+                        && mouse.column < r.area.right()
+                })
+                .map(|r| r.display_idx)
+            {
+                // Pin the REAL account id now; display indexes reorder.
+                if let Some(id) = view.and_then(|v| {
+                    let order = v.display_order(self.account_sort, SystemTime::now());
+                    order
+                        .get(idx)
+                        .and_then(|&i| v.snapshot.accounts.get(i))
+                        .map(|a| a.id.0.clone())
+                }) {
+                    self.account_modal = Some(AccountModal {
+                        account: id,
+                        scroll: 0,
+                    });
+                }
+                return true;
+            }
         }
         // Otherwise only MAIN (no overlay, no pending mode interaction) gets
         // the mouse.
@@ -1700,6 +1871,26 @@ impl App {
         };
         match code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => self.input_modal = None,
+            KeyCode::Up | KeyCode::Char('k') => modal.scroll = modal.scroll.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => modal.scroll = modal.scroll.saturating_add(1),
+            KeyCode::PageUp => modal.scroll = modal.scroll.saturating_sub(MODAL_PAGE),
+            KeyCode::PageDown => modal.scroll = modal.scroll.saturating_add(MODAL_PAGE),
+            KeyCode::Home => modal.scroll = 0,
+            KeyCode::End => modal.scroll = u16::MAX,
+            _ => {}
+        }
+    }
+
+    /// Key handling while the account detail modal is open (.prd/19 rule 6) —
+    /// the same key set as [`Self::on_key_input_modal`]: Esc/q/Enter close,
+    /// the arrows/PgUp/PgDn/Home/End scroll, everything else is swallowed so
+    /// no key reaches the table beneath.
+    fn on_key_account_modal(&mut self, code: KeyCode) {
+        let Some(modal) = self.account_modal.as_mut() else {
+            return;
+        };
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => self.account_modal = None,
             KeyCode::Up | KeyCode::Char('k') => modal.scroll = modal.scroll.saturating_sub(1),
             KeyCode::Down | KeyCode::Char('j') => modal.scroll = modal.scroll.saturating_add(1),
             KeyCode::PageUp => modal.scroll = modal.scroll.saturating_sub(MODAL_PAGE),
@@ -2012,6 +2203,103 @@ impl App {
     }
 
     /// Spawn the background raw-record fetch for `req` and deliver the result
+    /// Run one queued keys-usage query and deliver the answer on the keys
+    /// channel (keys-history K-5). NEITHER path runs on the event loop: local
+    /// goes to the blocking pool (SQLite), attach spawns an HTTP GET. The
+    /// document is named + priced where the data lives, so both backends
+    /// render byte-identical rows.
+    fn spawn_keys_query(&mut self, req: KeysQuery) {
+        let Some(tx) = self.keys_tx.clone() else {
+            return; // unit tests drive the panel state directly
+        };
+        let KeysQuery {
+            generation,
+            window,
+            models,
+        } = req;
+        let now_ms = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or(0);
+        match &self.backend {
+            Backend::Local(state) => {
+                let query = crate::key_usage::UsageQuery::new(window, now_ms).with_models(models);
+                let Some(store) = state.hub.usage_store() else {
+                    // No durable store on this daemon — say so; do NOT fall
+                    // back to the in-memory lifetime aggregates.
+                    let tx = tx.clone();
+                    tokio::spawn(async move {
+                        let _ = tx
+                            .send(KeysLoad {
+                                generation,
+                                result: Err(
+                                    "durable keys usage is unavailable (no config path or the \
+                                     store failed to open)"
+                                        .to_string(),
+                                ),
+                            })
+                            .await;
+                    });
+                    return;
+                };
+                let keys = crate::dashboard::key_row_docs(state);
+                let overrides = state.config.pricing.clone();
+                tokio::task::spawn_blocking(move || {
+                    let result = store
+                        .query(&query)
+                        .map(|report| {
+                            crate::key_usage::usage_doc(
+                                report,
+                                &keys,
+                                &overrides,
+                                store.health(),
+                                now_ms,
+                            )
+                        })
+                        .map_err(|err| err.to_string());
+                    let _ = tx.blocking_send(KeysLoad { generation, result });
+                });
+            }
+            Backend::Remote(remote) => {
+                let client = remote.client.clone();
+                let api_key = remote.api_key.clone();
+                let url = format!(
+                    "{}/llmux/keys/usage?window={}&models={}",
+                    remote.base_url,
+                    window.as_str(),
+                    models
+                        .iter()
+                        .map(|m| encode_query_value(m))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
+                tokio::spawn(async move {
+                    let mut request = client.get(&url);
+                    if let Some(key) = &api_key {
+                        request = request.header("x-api-key", key);
+                    }
+                    let result = match request.send().await {
+                        Ok(response) if response.status().is_success() => response
+                            .json::<crate::key_usage::KeysUsageDoc>()
+                            .await
+                            .map_err(|err| format!("keys usage decode failed: {err}")),
+                        Ok(response) => {
+                            let status = response.status();
+                            let body = response.text().await.unwrap_or_default();
+                            let detail = serde_json::from_str::<serde_json::Value>(&body)
+                                .ok()
+                                .and_then(|v| v["error"]["message"].as_str().map(str::to_string))
+                                .unwrap_or_else(|| status.to_string());
+                            Err(format!("keys usage failed: {detail}"))
+                        }
+                        Err(err) => Err(format!("keys usage failed: {err}")),
+                    };
+                    let _ = tx.send(KeysLoad { generation, result }).await;
+                });
+            }
+        }
+    }
+
     /// on the raw channel (never blocks the event loop — the local path is a
     /// backwards file scan on the blocking pool, the attach path an HTTP GET to
     /// `GET /llmux/raw-io`). Content lines are built in the task too: a Ready
@@ -2194,7 +2482,7 @@ impl App {
         self.close_menu();
         let idx = match (&pinned, view) {
             (Some(name), Some(v)) => {
-                let order = v.display_order(SystemTime::now());
+                let order = v.display_order(self.account_sort, SystemTime::now());
                 match order
                     .iter()
                     .position(|&i| v.snapshot.accounts.get(i).is_some_and(|a| a.id.0 == *name))
@@ -2279,13 +2567,150 @@ impl App {
         }
     }
 
-    /// Key handling for the Keys overlay (`K`, multi-tenant #22): read-only
-    /// panel — `K`/`Esc` closes, `q` quits. Key MUTATIONS stay in the CLI
-    /// (`llmux key …`), matching the admin-filter decision (option A).
-    fn on_key_keys(&mut self, code: KeyCode) {
+    /// Open the Keys overlay (keys-history K-0) and ask the durable store for
+    /// the CURRENT (window, models) answer. Reopening re-queries — the panel
+    /// is a point-in-time answer, never a stale one wearing a fresh label.
+    fn open_keys(&mut self) {
+        self.overlay = Overlay::Keys;
+        self.keys.scroll = 0;
+        self.keys.picker = None;
+        self.request_keys_usage();
+    }
+
+    /// Queue a keys-usage query for the event loop. Bumps the generation so a
+    /// slower earlier answer can never overwrite a newer one.
+    ///
+    /// If the question CHANGED (window or model filter), the previous answer is
+    /// dropped right here: the title renders the new question immediately, so
+    /// keeping the old rows would label totals with a question they never
+    /// answered. A refresh of the SAME question keeps its rows (the label still
+    /// describes exactly what is drawn).
+    fn request_keys_usage(&mut self) {
+        let models: Vec<String> = self.keys.models.iter().cloned().collect();
+        let answers_this_question = self
+            .keys
+            .doc
+            .as_ref()
+            .is_some_and(|doc| doc.window == self.keys.window.as_str() && doc.models == models);
+        if !answers_this_question {
+            self.keys.doc = None;
+        }
+        self.keys.generation += 1;
+        self.keys.loading = true;
+        self.keys.error = None;
+        self.pending_keys = Some(KeysQuery {
+            generation: self.keys.generation,
+            window: self.keys.window,
+            models,
+        });
+    }
+
+    fn take_pending_keys(&mut self) -> Option<KeysQuery> {
+        self.pending_keys.take()
+    }
+
+    /// Apply one delivered answer. Stale generations are dropped.
+    fn apply_keys_load(&mut self, load: KeysLoad) {
+        if load.generation != self.keys.generation {
+            return;
+        }
+        self.keys.loading = false;
+        match load.result {
+            Ok(doc) => {
+                self.keys.available = doc.available_models.clone();
+                self.keys.doc = Some(std::sync::Arc::new(doc));
+                self.keys.error = None;
+            }
+            // The previous answer is DROPPED on failure: showing older rows
+            // under the new filter label is exactly the lie this panel must
+            // not tell.
+            Err(err) => {
+                self.keys.doc = None;
+                self.keys.error = Some(err);
+            }
+        }
+    }
+
+    /// Open the `f` model picker over the models the current answer observed,
+    /// unioned with the current selection.
+    fn open_keys_picker(&mut self) {
+        let mut options: Vec<String> = self.keys.available.clone();
+        options.extend(self.keys.models.iter().cloned());
+        options.sort();
+        options.dedup();
+        self.keys.picker = Some(KeysPicker {
+            cursor: 0,
+            selected: self.keys.models.clone(),
+            options,
+        });
+    }
+
+    /// Key handling for the Keys overlay (keys-history K-0): `w` cycles the
+    /// window, `f` opens the multi-select model picker, the arrows/Page/Home/
+    /// End scroll EVERY flattened row (key rows and their model rows), `r`
+    /// re-runs the query, `K`/`Esc` closes, `q` quits. Key MUTATIONS stay in
+    /// the CLI (`llmux key …`), matching the admin-filter decision (option A).
+    fn on_key_keys(&mut self, code: KeyCode, view: Option<&DashboardView>) {
+        if self.keys.picker.is_some() {
+            return self.on_key_keys_picker(code);
+        }
+        let rows = view
+            .map(|v| ui::keys_row_count(v, &self.chrome()))
+            .unwrap_or(0);
+        let last = rows.saturating_sub(1);
         match code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('K') | KeyCode::Esc => self.overlay = Overlay::None,
+            KeyCode::Char('w') => {
+                self.keys.window = self.keys.window.next();
+                self.keys.scroll = 0;
+                self.request_keys_usage();
+            }
+            KeyCode::Char('f') => self.open_keys_picker(),
+            KeyCode::Char('r') => self.request_keys_usage(),
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.keys.scroll = self.keys.scroll.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.keys.scroll = (self.keys.scroll + 1).min(last);
+            }
+            KeyCode::PageUp => self.keys.scroll = self.keys.scroll.saturating_sub(KEYS_PAGE),
+            KeyCode::PageDown => self.keys.scroll = (self.keys.scroll + KEYS_PAGE).min(last),
+            KeyCode::Home => self.keys.scroll = 0,
+            KeyCode::End => self.keys.scroll = last,
+            _ => {}
+        }
+    }
+
+    /// Key handling inside the `f` picker: arrows move, Space toggles, `a`
+    /// selects every offered model, `c` clears, Enter applies (and re-queries),
+    /// `Esc`/`f` cancels without touching the active filter.
+    fn on_key_keys_picker(&mut self, code: KeyCode) {
+        let Some(picker) = self.keys.picker.as_mut() else {
+            return;
+        };
+        let last = picker.options.len().saturating_sub(1);
+        match code {
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Esc | KeyCode::Char('f') => self.keys.picker = None,
+            KeyCode::Up | KeyCode::Char('k') => picker.cursor = picker.cursor.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => picker.cursor = (picker.cursor + 1).min(last),
+            KeyCode::Char(' ') => {
+                if let Some(model) = picker.options.get(picker.cursor).cloned() {
+                    if !picker.selected.remove(&model) {
+                        picker.selected.insert(model);
+                    }
+                }
+            }
+            KeyCode::Char('a') => picker.selected = picker.options.iter().cloned().collect(),
+            KeyCode::Char('c') => picker.selected.clear(),
+            KeyCode::Enter => {
+                let selected = picker.selected.clone();
+                self.keys.models = selected;
+                self.keys.picker = None;
+                self.keys.scroll = 0;
+                self.request_keys_usage();
+            }
             _ => {}
         }
     }
@@ -2636,6 +3061,8 @@ impl App {
                 self.usage_scroll = 0;
                 self.overlay = Overlay::Usage;
             }
+            // Same entry behavior as `K`: open AND ask the durable store.
+            Overlay::Keys => self.open_keys(),
             other => self.overlay = other,
         }
     }
@@ -2776,7 +3203,7 @@ impl App {
             KeyCode::Char('?') => self.overlay = Overlay::Misc,
             KeyCode::Char('c') => self.overlay = Overlay::Config,
             // Client keys / tenants (multi-tenant #22).
-            KeyCode::Char('K') => self.overlay = Overlay::Keys,
+            KeyCode::Char('K') => self.open_keys(),
             // Activity-log scrolling (req6): up = into history, down = toward
             // the live tail. Clamped to the number of completed entries.
             KeyCode::Up | KeyCode::Char('k') => self.scroll_activity(1, view),
@@ -2796,6 +3223,8 @@ impl App {
             KeyCode::Char('u') => self.toggle_quota_display(view),
             // Reset display: countdown ↔ absolute UTC stamp in the quota bars.
             KeyCode::Char('t') => self.toggle_reset_display(),
+            // Accounts row order WITHIN each backend group: name ↔ next-pick.
+            KeyCode::Char('o') => self.toggle_account_sort(),
             // Scheduler mode: default (quota-max) ↔ round-robin (min switch).
             KeyCode::Char('S') => self.toggle_scheduler_mode(view),
             _ => {}
@@ -2866,6 +3295,14 @@ impl App {
         );
     }
 
+    /// Flip the accounts table's WITHIN-GROUP order between account name and
+    /// the scheduler's next-pick order. The backend-group blocks never move;
+    /// session-local, like `t`/`u`.
+    fn toggle_account_sort(&mut self) {
+        self.account_sort = self.account_sort.toggle();
+        self.set_status(format!("accounts sorted by {}", self.account_sort.label()));
+    }
+
     /// Flip the quota-gauge fill direction between used% and remaining%
     /// (session-local override of config `quota_display`; the config default
     /// applies until the first press). Color bands stay keyed on USED
@@ -2901,9 +3338,13 @@ impl App {
             // where the gauges live full-width.
             KeyCode::Char('u') => self.toggle_quota_display(view),
             KeyCode::Char('t') => self.toggle_reset_display(),
+            // Same row-order toggle as MAIN — this overlay is the full-width
+            // accounts table, so the order matters most here.
+            KeyCode::Char('o') => self.toggle_account_sort(),
             // Switch the active account (the `s` switcher, now scoped to this
-            // overlay). Rows render in selection order; the current account
-            // (when one exists) is always row 0 — start the cursor there.
+            // overlay). The cursor starts at row 0 — which is the first row of
+            // the first group block under EITHER sort (name order does not put
+            // the current account there), not necessarily the current account.
             KeyCode::Char('s') => {
                 let accounts = view.map_or(0, |v| v.snapshot.accounts.len());
                 if accounts == 0 {
@@ -2959,7 +3400,7 @@ impl App {
     fn open_reset_confirm(&mut self, view: Option<&DashboardView>) {
         let Some(view) = view else { return };
         let now = SystemTime::now();
-        let order = view.display_order(now);
+        let order = view.display_order(self.account_sort, now);
         let Some(pos) = order
             .iter()
             .position(|&i| view.snapshot.accounts[i].credential_kind == "codex")
@@ -2979,7 +3420,7 @@ impl App {
     /// still holding for it (which `y` retries with the SAME id).
     fn set_reset_confirm_status(&mut self, idx: usize, view: &DashboardView) {
         let now = SystemTime::now();
-        let order = view.display_order(now);
+        let order = view.display_order(self.account_sort, now);
         let Some(target) = order.get(idx).and_then(|&i| view.snapshot.accounts.get(i)) else {
             return;
         };
@@ -3055,7 +3496,7 @@ impl App {
     /// (unresolved) key for this account is REUSED rather than replaced.
     fn submit_reset(&mut self, idx: usize, view: &DashboardView) {
         let now = SystemTime::now();
-        let order = view.display_order(now);
+        let order = view.display_order(self.account_sort, now);
         let Some(target) = order.get(idx).and_then(|&i| view.snapshot.accounts.get(i)) else {
             return;
         };
@@ -3385,7 +3826,7 @@ impl App {
     fn open_limits_editor(&mut self, idx: usize, view: Option<&DashboardView>) {
         let Some(view) = view else { return };
         let now = SystemTime::now();
-        let order = view.display_order(now);
+        let order = view.display_order(self.account_sort, now);
         let Some(target) = order.get(idx).and_then(|&i| view.snapshot.accounts.get(i)) else {
             return;
         };
@@ -3451,7 +3892,7 @@ impl App {
     ) {
         let Some(view) = view else { return };
         let now = SystemTime::now();
-        let order = view.display_order(now);
+        let order = view.display_order(self.account_sort, now);
         let Some(target) = order.get(idx).and_then(|&i| view.snapshot.accounts.get(i)) else {
             return;
         };
@@ -3476,7 +3917,7 @@ impl App {
         let Some(view) = view else { return };
         let now = SystemTime::now();
         // The cursor indexes DISPLAY rows (selection order), not config order.
-        let order = view.display_order(now);
+        let order = view.display_order(self.account_sort, now);
         let Some(target) = order.get(idx).and_then(|&i| view.snapshot.accounts.get(i)) else {
             return;
         };
@@ -3592,7 +4033,7 @@ impl App {
     fn refresh_selected(&mut self, idx: usize, view: Option<&DashboardView>) {
         let Some(view) = view else { return };
         let now = SystemTime::now();
-        let order = view.display_order(now);
+        let order = view.display_order(self.account_sort, now);
         let Some(target) = order.get(idx).and_then(|&i| view.snapshot.accounts.get(i)) else {
             return;
         };
@@ -3694,7 +4135,10 @@ impl App {
         match &mut self.backend {
             Backend::Local(state) => match state.add_apikey_account(None, &api_key) {
                 // Status echoes the assigned NAME only — never the key.
-                Ok((name, _outcome)) => self.set_status(format!("added account {name}")),
+                Ok((name, outcome)) => self.set_status(add_account_status(
+                    &name,
+                    matches!(outcome, crate::config::Upsert::Added),
+                )),
                 Err(err) => self.set_status(format!("add account failed: {err}")),
             },
             Backend::Remote(remote) => {
@@ -3743,7 +4187,7 @@ impl App {
         let Some(view) = view else { return };
         let now = SystemTime::now();
         // The cursor indexes DISPLAY rows (selection order), not config order.
-        let order = view.display_order(now);
+        let order = view.display_order(self.account_sort, now);
         let Some(target) = order.get(idx).and_then(|&i| view.snapshot.accounts.get(i)) else {
             return;
         };
@@ -3793,13 +4237,15 @@ impl App {
         }
         let message = match request.send().await {
             Ok(response) if response.status().is_success() => {
-                let name = response
+                let body = response
                     .json::<serde_json::Value>()
                     .await
-                    .ok()
-                    .and_then(|v| v["name"].as_str().map(str::to_string))
+                    .unwrap_or(serde_json::Value::Null);
+                let name = body["name"]
+                    .as_str()
+                    .map(str::to_string)
                     .unwrap_or_else(|| "account".into());
-                format!("added account {name}")
+                add_account_status(&name, response_added(&body))
             }
             Ok(response) => format!("add account failed: {}", response.status()),
             Err(err) => format!("add account failed: {err}"),
@@ -3972,7 +4418,10 @@ impl App {
         // Inject: in-process locally, or relay to the daemon when attached.
         match &mut self.backend {
             Backend::Local(state) => match state.inject_account(account) {
-                Ok((name, _outcome)) => self.set_status(format!("logged in: added {name}")),
+                Ok((name, outcome)) => self.set_status(login_status(
+                    &name,
+                    matches!(outcome, crate::config::Upsert::Added),
+                )),
                 Err(err) => self.set_status(format!("login persist failed: {err}")),
             },
             Backend::Remote(_) => self.perform_remote_inject(account).await,
@@ -3997,13 +4446,15 @@ impl App {
         }
         let message = match request.send().await {
             Ok(response) if response.status().is_success() => {
-                let name = response
+                let body = response
                     .json::<serde_json::Value>()
                     .await
-                    .ok()
-                    .and_then(|v| v["name"].as_str().map(str::to_string))
+                    .unwrap_or(serde_json::Value::Null);
+                let name = body["name"]
+                    .as_str()
+                    .map(str::to_string)
                     .unwrap_or_else(|| account.name.clone());
-                format!("logged in: added {name}")
+                login_status(&name, response_added(&body))
             }
             Ok(response) => {
                 let status = response.status();
@@ -4060,7 +4511,7 @@ impl App {
         let Some(view) = view else { return };
         let now = SystemTime::now();
         // The cursor indexes DISPLAY rows (selection order), not config order.
-        let order = view.display_order(now);
+        let order = view.display_order(self.account_sort, now);
         let Some(target) = order.get(idx).and_then(|&i| view.snapshot.accounts.get(i)) else {
             return;
         };
@@ -4705,6 +5156,11 @@ async fn event_loop(
     // a frozen TUI is exactly how an operator ends up pressing Enter twice.
     let (control_tx, mut control_rx) = mpsc::channel::<ControlResult>(4);
     app.control_tx = Some(control_tx);
+    // Keys panel (keys-history K): the windowed/filtered usage query answers
+    // here — SQLite locally, HTTP when attached — so neither ever blocks this
+    // select or the render tick.
+    let (keys_tx, mut keys_rx) = mpsc::channel::<KeysLoad>(4);
+    app.keys_tx = Some(keys_tx);
     // Input is event-driven, not polled: `EventStream` parks on the terminal fd
     // (mio) and only wakes the task when a real key/mouse/resize/paste arrives.
     // At idle (no input) this contributes zero wakeups, unlike a fixed-interval
@@ -4785,6 +5241,12 @@ async fn event_loop(
                 app.apply_control_result(result);
                 true
             }
+            // A keys-usage query answered (keys-history K): apply it unless a
+            // newer question has already been asked.
+            Some(load) = keys_rx.recv() => {
+                app.apply_keys_load(load);
+                true
+            }
         };
         if let Some(op) = app.take_pending_control() {
             app.spawn_control(op);
@@ -4792,6 +5254,10 @@ async fn event_loop(
         }
         if let Some(req) = app.take_pending_raw() {
             app.spawn_raw_fetch(req);
+            redraw = true;
+        }
+        if let Some(req) = app.take_pending_keys() {
+            app.spawn_keys_query(req);
             redraw = true;
         }
         if let Some(req) = app.next_clip_if_idle() {
@@ -4881,6 +5347,19 @@ async fn event_loop(
                     None => app.input_modal = None,
                 }
             }
+            // Same reconcile for the account detail modal (.prd/19 rule 6):
+            // `Some(max)` clamps the scroll, `None` means the pinned account
+            // is no longer in the snapshot so the modal closes.
+            if app.account_modal.is_some() {
+                match main.account_modal_max_scroll {
+                    Some(max) => {
+                        if let Some(modal) = app.account_modal.as_mut() {
+                            modal.scroll = modal.scroll.min(max);
+                        }
+                    }
+                    None => app.account_modal = None,
+                }
+            }
             // Clamp the raw viewer's scroll offsets against what this frame
             // rendered (UI-7/UI-8). Unlike the input modal, no draw ⇒ no
             // clamp — the modal owns its content and never closes on aging.
@@ -4950,6 +5429,45 @@ const HISTORY_PAGE: usize = 300;
 const HISTORY_CHUNK: usize = 512;
 const HISTORY_GROW_CHUNKS: usize = 4;
 const HISTORY_ARM_MARGIN: i64 = 40;
+
+/// Status wording for an account add (`Upsert::Added` vs `Updated`). A login
+/// or key-add over an EXISTING identity replaces that account's credentials in
+/// place — reporting it as "added" reads like a second account appeared
+/// (`docs/keys-history/spec.md` L-6).
+fn add_account_status(name: &str, added: bool) -> String {
+    let verb = if added { "added" } else { "updated" };
+    format!("{verb} account {name}")
+}
+
+/// Status wording for a completed browser/API login, same distinction.
+fn login_status(name: &str, added: bool) -> String {
+    let verb = if added { "added" } else { "updated" };
+    format!("logged in: {verb} {name}")
+}
+
+/// Read the `added` flag off an add/inject endpoint response. A daemon too old
+/// to send the field keeps the historical "added" wording — never a claim of
+/// an update it did not report.
+fn response_added(value: &serde_json::Value) -> bool {
+    value["added"].as_bool().unwrap_or(true)
+}
+
+/// Percent-encode one query-string VALUE (model names ride in from request
+/// bodies — `anthropic/claude-x`, `gpt-4.1`, anything). Unreserved characters
+/// pass through; everything else becomes `%XX`, so the comma the `models`
+/// parameter separates on can never be forged by a name.
+fn encode_query_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*byte as char)
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
 
 /// Lines the input modal (UI-6 item 3) scrolls per PgUp/PgDn keystroke.
 const MODAL_PAGE: u16 = 10;
@@ -5657,7 +6175,7 @@ mod tests {
         // Newest generation first, and every entry is distinct (a duplicate
         // would make the modulo cycle skip a model forever).
         assert_eq!(CODEX_MODELS[0], "gpt-6-astra");
-        assert_eq!(CODEX_MODELS.len(), 6);
+        assert_eq!(CODEX_MODELS.len(), 7);
         let mut sorted = CODEX_MODELS.to_vec();
         sorted.sort_unstable();
         sorted.dedup();
@@ -5808,9 +6326,16 @@ mod tests {
         assert!(app.on_mouse(rclick, Some(&view)));
         assert_eq!(app.menu_account.as_deref(), Some("claude:a@x.com"));
 
-        // Reorder: `a` moves to display row 1. Running pause (item 1) must
-        // still act on `a`, not on whoever now sits at row 0.
-        view.snapshot.accounts.swap(0, 1);
+        // Reorder: in `next` order a state change still moves rows — `a` goes
+        // auth-broken and sinks below `b`, so display row 0 is now `b`.
+        // Running pause (item 1) must still act on `a`.
+        app.account_sort = triage::AccountSort::Next;
+        view.snapshot.accounts[0].healthy = false;
+        let order = view.display_order(app.account_sort, SystemTime::now());
+        assert_eq!(
+            view.snapshot.accounts[order[0]].id.0, "claude:b@x.com",
+            "the state change really reordered the table"
+        );
         app.on_key(press(KeyCode::Down), Some(&view));
         app.on_key(press(KeyCode::Enter), Some(&view));
         assert_eq!(
@@ -5830,6 +6355,143 @@ mod tests {
             "vanished pin acts on no one"
         );
         assert!(app.status_line().is_some_and(|s| s.contains("gone")));
+    }
+
+    /// Two accounts, so a click on display row 1 has a real id to resolve to.
+    fn two_account_view() -> DashboardView {
+        use crate::routing::BackendGroup;
+        use crate::scheduler::{AccountId, AccountSnapshot};
+        let acct = |name: &str| AccountSnapshot {
+            id: AccountId(name.into()),
+            healthy: true,
+            credential_kind: "oauth",
+            group: BackendGroup::Claude,
+            five_hour: None,
+            seven_day: None,
+            scoped_limits: Vec::new(),
+            scoped_cooldowns: Vec::new(),
+            cooldown_until: None,
+            cooldown_source: None,
+            in_flight: 0,
+            token_expires_at_ms: None,
+            last_refresh_ms: None,
+            paused: false,
+            limits: crate::config::AccountLimits::default(),
+        };
+        let mut view = stats_view_with_account();
+        view.snapshot.accounts = vec![acct("claude:a@x.com"), acct("claude:b@x.com")];
+        view
+    }
+
+    /// .prd/19 rule 6: a left-click on an accounts row opens the detail modal
+    /// pinned to the REAL account id at that display position (never the index
+    /// — the table reorders), on MAIN *and* on the accounts overlay.
+    #[test]
+    fn account_click_opens_detail_modal_pinned_by_id() {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+        let view = two_account_view();
+        // Display row 1 under the active sort — asserted, not assumed.
+        let order = view.display_order(triage::AccountSort::default(), SystemTime::now());
+        let wanted = view.snapshot.accounts[order[1]].id.0.clone();
+        assert_eq!(wanted, "claude:b@x.com");
+        let lclick = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 10,
+            row: 6,
+            modifiers: KeyModifiers::NONE,
+        };
+        for overlay in [Overlay::None, Overlay::Accounts] {
+            let mut app = remote_app();
+            app.overlay = overlay;
+            app.account_row_chrome = vec![ui::AccountRowHit {
+                area: ratatui::layout::Rect {
+                    x: 0,
+                    y: 6,
+                    width: 80,
+                    height: 1,
+                },
+                display_idx: 1,
+            }];
+            assert!(app.on_mouse(lclick, Some(&view)), "{overlay:?}");
+            assert_eq!(
+                app.account_modal.as_ref().map(|m| m.account.as_str()),
+                Some(wanted.as_str()),
+                "{overlay:?}: modal pinned to the real id"
+            );
+            assert_eq!(app.account_modal.as_ref().map(|m| m.scroll), Some(0));
+            assert_eq!(app.mode, Mode::Normal, "{overlay:?}: no row cursor moved");
+            assert_eq!(app.menu_account, None, "{overlay:?}: no context menu");
+        }
+    }
+
+    /// .prd/19 rule 6: while the modal is open every key and click beneath it
+    /// is swallowed — `q` closes the modal instead of quitting, a row click
+    /// neither re-pins nor opens a menu, and Esc closes.
+    #[test]
+    fn account_modal_swallows_keys_and_clicks() {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+        let view = two_account_view();
+        let open = |app: &mut App| {
+            app.account_modal = Some(AccountModal {
+                account: "claude:a@x.com".into(),
+                scroll: 0,
+            });
+        };
+        let mut app = remote_app();
+        app.account_row_chrome = vec![ui::AccountRowHit {
+            area: ratatui::layout::Rect {
+                x: 0,
+                y: 6,
+                width: 80,
+                height: 1,
+            },
+            display_idx: 1,
+        }];
+        open(&mut app);
+        // `q` never reaches the quit handler beneath the modal.
+        app.on_key(press(KeyCode::Char('q')), Some(&view));
+        assert!(!app.should_quit, "q does not quit while the modal is open");
+        assert!(app.account_modal.is_none(), "q closes the modal itself");
+
+        open(&mut app);
+        // An unbound key is swallowed: MAIN's activity scroll must not move.
+        let before = app.activity_scroll;
+        app.on_key(press(KeyCode::Char('x')), Some(&view));
+        assert_eq!(app.activity_scroll, before, "keys don't leak beneath");
+        assert!(app.account_modal.is_some());
+        // Arrows scroll the modal, PgDn pages it.
+        app.on_key(press(KeyCode::Down), Some(&view));
+        assert_eq!(app.account_modal.as_ref().unwrap().scroll, 1);
+        app.on_key(press(KeyCode::PageDown), Some(&view));
+        assert_eq!(app.account_modal.as_ref().unwrap().scroll, 1 + MODAL_PAGE);
+
+        // A left-click on a row is consumed: the pin does not move, no menu
+        // opens, the mode stays Normal.
+        let lclick = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 10,
+            row: 6,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(
+            app.on_mouse(lclick, Some(&view)),
+            "the modal eats the click"
+        );
+        assert_eq!(
+            app.account_modal.as_ref().map(|m| m.account.as_str()),
+            Some("claude:a@x.com"),
+            "the click did not re-pin the modal"
+        );
+        assert_eq!(app.menu_account, None);
+        assert_eq!(app.mode, Mode::Normal);
+        // The wheel scrolls it instead of the activity panel.
+        let before = app.account_modal.as_ref().unwrap().scroll;
+        app.on_mouse(mouse(MouseEventKind::ScrollDown, 10, 6), Some(&view));
+        assert_eq!(app.account_modal.as_ref().unwrap().scroll, before + 3);
+        assert_eq!(app.activity_scroll, 0, "the wheel did not reach MAIN");
+
+        app.on_key(press(KeyCode::Esc), Some(&view));
+        assert!(app.account_modal.is_none(), "esc closes the modal");
     }
 
     /// `?`/`c` open the Misc/Config overlays from MAIN; Esc returns.
@@ -5868,6 +6530,39 @@ mod tests {
         assert_eq!(app.sessions[0].user_id.as_deref(), Some("a"), "requests");
         app.on_key_sessions(KeyCode::Char('o'));
         assert_eq!(app.session_sort, SessionSort::Recent, "cycle wraps");
+    }
+
+    /// `o` toggles the accounts row order on MAIN *and* on the accounts
+    /// overlay (the one session toggle both surfaces share), names the new
+    /// mode in the status line, and starts on `name`.
+    #[test]
+    fn sort_key_toggles_mode() {
+        let view = control_view();
+        let mut app = remote_app();
+        assert_eq!(
+            app.account_sort,
+            triage::AccountSort::Name,
+            "name order is the default"
+        );
+        app.on_key_main(KeyCode::Char('o'), Some(&view));
+        assert_eq!(app.account_sort, triage::AccountSort::Next);
+        assert!(
+            app.status_line()
+                .is_some_and(|s| s.contains("accounts sorted by next")),
+            "{:?}",
+            app.status_line()
+        );
+        app.on_key_main(KeyCode::Char('o'), Some(&view));
+        assert_eq!(app.account_sort, triage::AccountSort::Name, "toggles back");
+        assert!(app
+            .status_line()
+            .is_some_and(|s| s.contains("accounts sorted by name")));
+        // Same key, same state, from the accounts overlay.
+        app.overlay = Overlay::Accounts;
+        app.on_key_accounts(KeyCode::Char('o'), Some(&view));
+        assert_eq!(app.account_sort, triage::AccountSort::Next);
+        app.on_key_accounts(KeyCode::Char('o'), Some(&view));
+        assert_eq!(app.account_sort, triage::AccountSort::Name);
     }
 
     #[test]
@@ -6249,6 +6944,334 @@ mod tests {
         // Still loading; the early-return guard ran AFTER resetting the cursor.
         assert!(app.sessions_loading);
         assert_eq!(app.overlay, Overlay::Sessions);
+    }
+
+    // --- account upsert wording (re-login over an existing account) --------
+
+    /// L-6: a login/add over an EXISTING identity replaces its credentials —
+    /// the status must say `updated`, not `added`, or an operator re-logging
+    /// in reads it as a duplicate account having appeared.
+    #[test]
+    fn account_upsert_status_distinguishes_updated_from_added() {
+        assert_eq!(add_account_status("acme", true), "added account acme");
+        assert_eq!(add_account_status("acme", false), "updated account acme");
+        assert_eq!(login_status("acme", true), "logged in: added acme");
+        assert_eq!(login_status("acme", false), "logged in: updated acme");
+        assert!(
+            !login_status("acme", false).contains("added"),
+            "an update never reads as an add"
+        );
+    }
+
+    /// The remote paths read the endpoint's `added` flag. A daemon too old to
+    /// send it keeps the historical wording rather than claiming an update it
+    /// cannot know about.
+    #[test]
+    fn remote_upsert_flag_defaults_to_added_when_absent() {
+        assert!(!response_added(&serde_json::json!({ "added": false })));
+        assert!(response_added(&serde_json::json!({ "added": true })));
+        assert!(response_added(&serde_json::json!({ "ok": true })));
+    }
+
+    // --- keys panel (keys-history K) ---------------------------------------
+
+    /// A view with one issued key, and a panel document giving it usage plus a
+    /// builtin bucket — the panel's two data sources.
+    fn keys_view_and_doc() -> (DashboardView, crate::key_usage::KeysUsageDoc) {
+        let mut view = empty_view();
+        view.client_keys = vec![crate::dashboard::KeyRowDoc {
+            id: "k-aaaa".into(),
+            name: "pc-b".into(),
+            email: None,
+            kind: "default".into(),
+            key_prefix: "lmk-b1b2".into(),
+            suspended: false,
+            created_at_ms: 1,
+            revoked_at_ms: None,
+        }];
+        let doc = crate::key_usage::KeysUsageDoc {
+            window: "all".into(),
+            available_models: vec!["model-a".into(), "model-b".into()],
+            rows: 3,
+            tenants: vec![crate::dashboard::TenantUsageDoc {
+                tenant: "k-aaaa".into(),
+                name: "pc-b".into(),
+                email: None,
+                requests: 3,
+                ok: 3,
+                errors: 0,
+                tokens_in: 1,
+                tokens_out: 1,
+                cost_usd: 0.0,
+                first_ms: 1,
+                last_ms: 2,
+                models: vec![crate::dashboard::TenantModelDoc {
+                    group: "claude".into(),
+                    model: "model-a".into(),
+                    requests: 3,
+                    tokens_in: 1,
+                    tokens_out: 1,
+                    cache_read: 0,
+                    cache_creation: 0,
+                    cost_usd: 0.0,
+                }],
+            }],
+            ..Default::default()
+        };
+        (view, doc)
+    }
+
+    /// K-0: opening the panel asks the durable store — the overlay never
+    /// renders whatever happened to be in memory from a previous question.
+    #[test]
+    fn opening_the_keys_overlay_dispatches_a_usage_query() {
+        let mut app = remote_app();
+        app.on_key_main(KeyCode::Char('K'), None);
+        assert_eq!(app.overlay, Overlay::Keys);
+        assert!(app.keys.loading, "the panel enters the loading state");
+        let query = app.take_pending_keys().expect("a query was queued");
+        assert_eq!(query.window, crate::key_usage::UsageWindow::All);
+        assert!(query.models.is_empty(), "no filter by default");
+        assert_eq!(query.generation, app.keys.generation);
+    }
+
+    /// K-2 `w`: the window cycles through the offered set and each press asks
+    /// the store again (a window change is a NEW question, not a re-label).
+    #[test]
+    fn w_cycles_the_keys_window_and_requeries() {
+        let mut app = remote_app();
+        app.on_key_main(KeyCode::Char('K'), None);
+        app.take_pending_keys();
+        app.keys.scroll = 7;
+
+        app.on_key_keys(KeyCode::Char('w'), None);
+        assert_eq!(app.keys.window, crate::key_usage::UsageWindow::H1);
+        assert_eq!(app.keys.scroll, 0, "a new window starts at the top");
+        let query = app.take_pending_keys().expect("re-queried");
+        assert_eq!(query.window, crate::key_usage::UsageWindow::H1);
+
+        for want in [
+            crate::key_usage::UsageWindow::H24,
+            crate::key_usage::UsageWindow::D7,
+            crate::key_usage::UsageWindow::D14,
+            crate::key_usage::UsageWindow::D30,
+            crate::key_usage::UsageWindow::D90,
+            crate::key_usage::UsageWindow::All,
+        ] {
+            app.on_key_keys(KeyCode::Char('w'), None);
+            assert_eq!(app.keys.window, want, "cycle wraps back to all");
+        }
+    }
+
+    /// K-0 `위아래 키로`: Down/PageDown/End reach the LAST flattened row and
+    /// clamp there; Home/Up return to the top.
+    #[test]
+    fn keys_scrolling_covers_every_row_and_clamps_at_both_ends() {
+        let (view, doc) = keys_view_and_doc();
+        let mut app = remote_app();
+        app.overlay = Overlay::Keys;
+        app.keys.doc = Some(std::sync::Arc::new(doc));
+        // 1 key row + 1 model row = 2 rows → last index 1.
+        assert_eq!(ui::keys_row_count(&view, &app.chrome()), 2);
+
+        app.on_key_keys(KeyCode::Down, Some(&view));
+        assert_eq!(app.keys.scroll, 1);
+        app.on_key_keys(KeyCode::Down, Some(&view));
+        assert_eq!(app.keys.scroll, 1, "clamped at the last row");
+        app.on_key_keys(KeyCode::PageDown, Some(&view));
+        assert_eq!(app.keys.scroll, 1, "a page past the end still clamps");
+        app.on_key_keys(KeyCode::Home, Some(&view));
+        assert_eq!(app.keys.scroll, 0);
+        app.on_key_keys(KeyCode::End, Some(&view));
+        assert_eq!(app.keys.scroll, 1, "End lands on the final row");
+        app.on_key_keys(KeyCode::Up, Some(&view));
+        assert_eq!(app.keys.scroll, 0);
+        app.on_key_keys(KeyCode::PageUp, Some(&view));
+        assert_eq!(app.keys.scroll, 0, "PageUp at the top stays put");
+    }
+
+    /// K-3 `f`: Space toggles, Enter applies the selection AND re-queries;
+    /// the picker offers the observed models unioned with the live selection.
+    #[test]
+    fn f_picker_toggles_models_and_enter_applies_the_filter() {
+        let (_, doc) = keys_view_and_doc();
+        let mut app = remote_app();
+        app.open_keys();
+        app.apply_keys_load(KeysLoad {
+            generation: app.keys.generation,
+            result: Ok(doc),
+        });
+        app.take_pending_keys();
+
+        app.on_key_keys(KeyCode::Char('f'), None);
+        let picker = app.keys.picker.as_ref().expect("picker opened");
+        assert_eq!(picker.options, vec!["model-a", "model-b"]);
+        assert!(picker.selected.is_empty(), "starts from the live filter");
+
+        app.on_key_keys(KeyCode::Char(' '), None); // select model-a
+        app.on_key_keys(KeyCode::Down, None);
+        app.on_key_keys(KeyCode::Char(' '), None); // select model-b
+        app.on_key_keys(KeyCode::Char(' '), None); // …and unselect it again
+        assert!(
+            app.pending_keys.is_none(),
+            "nothing is applied before Enter"
+        );
+
+        app.on_key_keys(KeyCode::Enter, None);
+        assert!(app.keys.picker.is_none(), "Enter closes the picker");
+        assert_eq!(
+            app.keys.models.iter().cloned().collect::<Vec<_>>(),
+            vec!["model-a".to_string()]
+        );
+        let query = app.take_pending_keys().expect("applied filter re-queries");
+        assert_eq!(query.models, vec!["model-a".to_string()]);
+    }
+
+    /// K-3: `a` selects every offered model, `c` clears — and Esc abandons the
+    /// working selection without touching the active filter.
+    #[test]
+    fn picker_all_clear_and_escape_leave_the_active_filter_alone() {
+        let (_, doc) = keys_view_and_doc();
+        let mut app = remote_app();
+        app.open_keys();
+        app.apply_keys_load(KeysLoad {
+            generation: app.keys.generation,
+            result: Ok(doc),
+        });
+        app.take_pending_keys();
+        app.keys.models = ["model-a".to_string()].into_iter().collect();
+
+        app.on_key_keys(KeyCode::Char('f'), None);
+        app.on_key_keys(KeyCode::Char('a'), None);
+        assert_eq!(app.keys.picker.as_ref().unwrap().selected.len(), 2, "all");
+        app.on_key_keys(KeyCode::Char('c'), None);
+        assert!(
+            app.keys.picker.as_ref().unwrap().selected.is_empty(),
+            "clear"
+        );
+
+        app.on_key_keys(KeyCode::Esc, None);
+        assert!(app.keys.picker.is_none(), "Esc closes the picker…");
+        assert_eq!(app.overlay, Overlay::Keys, "…not the overlay");
+        assert_eq!(
+            app.keys.models.iter().cloned().collect::<Vec<_>>(),
+            vec!["model-a".to_string()],
+            "the abandoned selection never applied"
+        );
+        assert!(app.pending_keys.is_none(), "cancel does not re-query");
+    }
+
+    /// K-5: while a CHANGED question is in flight the old answer is dropped —
+    /// the title already says the new window/filter, so leaving the previous
+    /// totals on screen would label them with a question they never answered.
+    #[test]
+    fn changing_the_question_drops_the_previous_answer_immediately() {
+        let (_, doc) = keys_view_and_doc();
+        let mut app = remote_app();
+        app.open_keys();
+        app.apply_keys_load(KeysLoad {
+            generation: app.keys.generation,
+            result: Ok(doc),
+        });
+        assert!(app.keys.doc.is_some());
+
+        app.on_key_keys(KeyCode::Char('w'), None); // all → 1h
+        assert!(
+            app.keys.doc.is_none(),
+            "the 24h-labelled frame must not render the all-time rows"
+        );
+        assert!(app.keys.loading);
+    }
+
+    /// …but a plain refresh (`r`, same window and filter) keeps the rows on
+    /// screen: the label still describes exactly what is drawn, so blanking
+    /// the table would only flicker.
+    #[test]
+    fn refreshing_the_same_question_keeps_the_rows_on_screen() {
+        let (_, doc) = keys_view_and_doc();
+        let mut app = remote_app();
+        app.open_keys();
+        app.apply_keys_load(KeysLoad {
+            generation: app.keys.generation,
+            result: Ok(doc),
+        });
+        app.on_key_keys(KeyCode::Char('r'), None);
+        assert!(app.keys.doc.is_some(), "same question → same rows stay");
+        assert!(app.keys.loading, "and a refresh is still in flight");
+    }
+
+    /// The picker keeps offering the observed models while a query is in
+    /// flight: the option list is cached separately from the answer, so
+    /// dropping stale rows cannot empty `f`.
+    #[test]
+    fn the_model_picker_still_offers_options_while_a_query_is_in_flight() {
+        let (_, doc) = keys_view_and_doc();
+        let mut app = remote_app();
+        app.open_keys();
+        app.apply_keys_load(KeysLoad {
+            generation: app.keys.generation,
+            result: Ok(doc),
+        });
+        app.on_key_keys(KeyCode::Char('w'), None); // in-flight, rows dropped
+        assert!(app.keys.doc.is_none());
+
+        app.on_key_keys(KeyCode::Char('f'), None);
+        let picker = app.keys.picker.as_ref().expect("picker opened");
+        assert_eq!(
+            picker.options,
+            vec!["model-a".to_string(), "model-b".to_string()],
+            "cached options survive the in-flight query"
+        );
+    }
+
+    /// K-5: a late answer to a superseded question is dropped — a fast
+    /// `w w` can never leave the panel showing the older window's rows.
+    #[test]
+    fn a_stale_keys_answer_is_ignored() {
+        let (_, doc) = keys_view_and_doc();
+        let mut app = remote_app();
+        app.open_keys(); // generation 1
+        app.on_key_keys(KeyCode::Char('w'), None); // generation 2
+        app.apply_keys_load(KeysLoad {
+            generation: 1,
+            result: Ok(doc),
+        });
+        assert!(app.keys.doc.is_none(), "the superseded answer is dropped");
+        assert!(app.keys.loading, "still waiting for the current one");
+    }
+
+    /// K-5: a failed query drops the previous document — stale rows must never
+    /// sit under a label describing a different question.
+    #[test]
+    fn a_failed_keys_query_replaces_the_rows_with_the_failure() {
+        let (_, doc) = keys_view_and_doc();
+        let mut app = remote_app();
+        app.open_keys();
+        app.apply_keys_load(KeysLoad {
+            generation: app.keys.generation,
+            result: Ok(doc),
+        });
+        assert!(app.keys.doc.is_some());
+
+        app.on_key_keys(KeyCode::Char('w'), None);
+        app.apply_keys_load(KeysLoad {
+            generation: app.keys.generation,
+            result: Err("database is locked".into()),
+        });
+        assert!(app.keys.doc.is_none(), "no rows under a failed query");
+        assert_eq!(app.keys.error.as_deref(), Some("database is locked"));
+        assert!(!app.keys.loading);
+    }
+
+    /// The `models` query parameter is percent-encoded, so a model name with a
+    /// separator or a space cannot forge extra filter entries.
+    #[test]
+    fn model_names_are_percent_encoded_for_the_query_string() {
+        assert_eq!(encode_query_value("claude-opus-4-8"), "claude-opus-4-8");
+        assert_eq!(
+            encode_query_value("anthropic/claude,x y"),
+            "anthropic%2Fclaude%2Cx%20y"
+        );
     }
 
     /// `g` opens the Stats overlay only when model usage exists; `g`/`Esc`
@@ -7215,7 +8238,6 @@ mod tests {
             logs: Vec::new(),
             model_usage: Vec::new(),
             client_usage: Vec::new(),
-            tenant_usage: Vec::new(),
             client_keys: Vec::new(),
             windowed: Vec::new(),
             codex: crate::dashboard::CodexSettingsDoc::default(),
@@ -7309,7 +8331,7 @@ mod tests {
         let mut app = remote_app();
         app.overlay = Overlay::Accounts;
         let codex_pos = view
-            .display_order(SystemTime::now())
+            .display_order(Default::default(), SystemTime::now())
             .iter()
             .position(|&i| view.snapshot.accounts[i].credential_kind == "codex")
             .expect("codex row");
@@ -7410,7 +8432,7 @@ mod tests {
             fetched_at: now,
             source: WindowSource::UsagePoll,
         });
-        let order = view.display_order(now);
+        let order = view.display_order(Default::default(), now);
         let codex_pos = order
             .iter()
             .position(|&i| view.snapshot.accounts[i].credential_kind == "codex")
@@ -7432,7 +8454,7 @@ mod tests {
             crate::routing::BackendGroup::Codex,
             crate::scheduler::AccountId("codex:c@x.com".into()),
         );
-        let order = view.display_order(now);
+        let order = view.display_order(Default::default(), now);
         let codex_pos = order
             .iter()
             .position(|&i| view.snapshot.accounts[i].credential_kind == "codex")
@@ -7466,7 +8488,7 @@ mod tests {
         let Mode::ConfirmReset { idx } = app.mode else {
             panic!("expected the reset gate, got {:?}", app.mode);
         };
-        let order = view.display_order(SystemTime::now());
+        let order = view.display_order(Default::default(), SystemTime::now());
         assert_eq!(
             view.snapshot.accounts[order[idx]].credential_kind, "codex",
             "the gate opens on an account that HAS resets"
@@ -7506,21 +8528,33 @@ mod tests {
     #[test]
     fn reset_confirm_follows_the_row_under_the_cursor_after_a_reorder() {
         let mut view = control_view();
+        // A SECOND codex account, so the codex block can actually reorder
+        // (the backend-group blocks themselves never move).
+        let mut spare = view.snapshot.accounts[1].clone();
+        spare.id = crate::scheduler::AccountId("codex:z@x.com".into());
+        view.snapshot.accounts.push(spare);
         let mut app = remote_app();
+        // `next` is the mode where a state change reorders rows.
+        app.account_sort = triage::AccountSort::Next;
         app.overlay = Overlay::Accounts;
         app.on_key_accounts(KeyCode::Char('R'), Some(&view));
         let Mode::ConfirmReset { idx } = app.mode else {
             panic!("expected the reset gate");
         };
-        // The roster reorders (the codex account moves to the other row).
-        view.snapshot.accounts.swap(0, 1);
+        // The roster reorders: the account the gate opened on goes
+        // auth-broken and sinks below its sibling, so row `idx` now holds a
+        // DIFFERENT account.
+        view.snapshot.accounts[1].healthy = false;
+        let order = view.display_order(app.account_sort, SystemTime::now());
+        assert_ne!(
+            view.snapshot.accounts[order[idx]].id.0, "codex:c@x.com",
+            "the state change really reordered the codex block"
+        );
         // Move the cursor onto the codex row and confirm.
-        let order = view.display_order(SystemTime::now());
         let codex_pos = order
             .iter()
-            .position(|&i| view.snapshot.accounts[i].credential_kind == "codex")
+            .position(|&i| view.snapshot.accounts[i].id.0 == "codex:c@x.com")
             .expect("codex row");
-        let _ = idx;
         app.on_key_confirm_reset(KeyCode::Char('y'), codex_pos, Some(&view));
         match app.pending_control.as_ref().expect("queued redemption") {
             ControlOp::Reset { account, .. } => assert_eq!(account, "codex:c@x.com"),
@@ -7528,6 +8562,7 @@ mod tests {
         }
         // Confirming on the CLAUDE row instead redeems nothing.
         let mut app = remote_app();
+        app.account_sort = triage::AccountSort::Next;
         let claude_pos = order
             .iter()
             .position(|&i| view.snapshot.accounts[i].credential_kind == "oauth")
@@ -7545,7 +8580,7 @@ mod tests {
     #[test]
     fn redemption_reuses_the_held_request_id_on_retry() {
         let view = control_view();
-        let order = view.display_order(SystemTime::now());
+        let order = view.display_order(Default::default(), SystemTime::now());
         let codex_pos = order
             .iter()
             .position(|&i| view.snapshot.accounts[i].credential_kind == "codex")
@@ -7604,7 +8639,7 @@ mod tests {
     #[test]
     fn a_busy_queue_creates_no_phantom_pending_redemption() {
         let view = control_view();
-        let order = view.display_order(SystemTime::now());
+        let order = view.display_order(Default::default(), SystemTime::now());
         let codex_pos = order
             .iter()
             .position(|&i| view.snapshot.accounts[i].credential_kind == "codex")
@@ -7695,7 +8730,7 @@ mod tests {
     #[test]
     fn closing_the_dialog_keeps_the_pending_redemption() {
         let view = control_view();
-        let order = view.display_order(SystemTime::now());
+        let order = view.display_order(Default::default(), SystemTime::now());
         let codex_pos = order
             .iter()
             .position(|&i| view.snapshot.accounts[i].credential_kind == "codex")

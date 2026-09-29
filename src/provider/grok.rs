@@ -17,7 +17,7 @@ use crate::config::AccountCredential;
 
 /// Fallback model slug when none is configured; the configurable default
 /// lives in `config.grok.default_model`.
-pub const GROK_MODEL: &str = "grok-4.6";
+pub const GROK_MODEL: &str = "grok-4.7";
 
 /// Official Grok-CLI chat-proxy base URL (the subscription chat path,
 /// CLIProxyAPI `internal/auth/xai/types.go:13`). The identity trio below is
@@ -27,19 +27,28 @@ pub const GROK_CHAT_PROXY_UPSTREAM: &str = "https://cli-chat-proxy.grok.com/v1";
 /// Grok-CLI identity headers the official cli-chat-proxy expects
 /// (CLIProxyAPI xai_executor.go:66-69). The client version ages with the
 /// Grok CLI; bump when upstream starts rejecting it.
-const GROK_TOKEN_AUTH_HEADER: &str = "x-xai-token-auth";
-const GROK_TOKEN_AUTH_VALUE: &str = "xai-grok-cli";
-const GROK_CLIENT_VERSION_HEADER: &str = "x-grok-client-version";
-const GROK_CLIENT_VERSION_VALUE: &str = "0.2.93";
+///
+/// Crate-visible because the billing/usage read
+/// ([`crate::auth::grok_usage`]) carries the SAME identity trio — one
+/// definition, so a version bump cannot drift between the two callers.
+pub(crate) const GROK_TOKEN_AUTH_HEADER: &str = "x-xai-token-auth";
+pub(crate) const GROK_TOKEN_AUTH_VALUE: &str = "xai-grok-cli";
+pub(crate) const GROK_CLIENT_VERSION_HEADER: &str = "x-grok-client-version";
+pub(crate) const GROK_CLIENT_VERSION_VALUE: &str = "0.2.93";
 
 /// Per-model thinking levels (docs/grok/spec.md §R1; source for
 /// grok-4.5/4.3/3-mini: CLIProxyAPI registry models.json:2411-2520; source
 /// for `grok-4.6`: the live cli-chat-proxy `GET /v1/models` response
 /// (2026-08-13), which lists reasoning_efforts xhigh/high/medium/low and
-/// context_window 500000 — note NO `none`). Models NOT listed here get no
+/// context_window 500000 — note NO `none`; source for `grok-4.7` /
+/// `grok-4.7-build-fast`: the live cli-chat-proxy `GET /v1/models` response
+/// (2026-09-23), reasoning_efforts xhigh/high/medium/low, default high,
+/// context_window 500000 — again NO `none`). Models NOT listed here get no
 /// `reasoning` field at all — omission is the only universally-accepted
 /// wire form (e.g. `grok-build-0.1` has no thinking support).
 const GROK_THINKING_LEVELS: &[(&str, &[&str])] = &[
+    ("grok-4.7", &["low", "medium", "high", "xhigh"]),
+    ("grok-4.7-build-fast", &["low", "medium", "high", "xhigh"]),
     ("grok-4.6", &["low", "medium", "high", "xhigh"]),
     ("grok-4.5", &["low", "medium", "high"]),
     ("grok-4.3", &["none", "low", "medium", "high"]),
@@ -103,7 +112,7 @@ pub struct GrokProvider {
 }
 
 impl GrokProvider {
-    /// Construct with the default request shape (pinned `grok-4.6`).
+    /// Construct with the default request shape (pinned `grok-4.7`).
     pub fn new(base_url: impl Into<String>) -> Self {
         Self::with_shape(base_url, GrokShape::default())
     }
@@ -227,16 +236,54 @@ fn normalize_base_url(url: &str) -> String {
     url.trim().trim_end_matches('/').to_ascii_lowercase()
 }
 
-/// Resolve the model slug requested upstream: grok-shaped requests
-/// (`grok-` prefix / bare `grok`) pass through VERBATIM — the client's
-/// choice is honored, `/model grok-4.5` from Claude Code works with no
-/// config change (spec §R4); everything else (Anthropic default models on
-/// fallback, model-less requests) keeps the configured pin.
+/// The client-side context-window suffix (`grok-4.7[1m]`), mirroring codex
+/// (`super::codex`'s `CLIENT_CONTEXT_SUFFIX`) and claude
+/// (`super::anthropic`'s `strip_client_context_suffix`). It is display
+/// metadata Claude Code parses out of the model string; upstream never sees
+/// it. Clients that send the id VERBATIM (curl, SDKs, a routing rule that
+/// forwards `grok-4.7[1m]`) would otherwise reach the backend with a slug
+/// that is in NO thinking-level table, silently dropping `reasoning`.
+const CLIENT_CONTEXT_SUFFIX: &str = "[1m]";
+
+/// One trailing [`CLIENT_CONTEXT_SUFFIX`] off `model` (case-insensitively,
+/// after trimming), or `model` unchanged. Upstream never accepts the suffix,
+/// so every slug that can reach the wire passes through here.
+fn strip_client_context_suffix(model: &str) -> &str {
+    let model = model.trim();
+    match model.len().checked_sub(CLIENT_CONTEXT_SUFFIX.len()) {
+        Some(cut)
+            if model.is_char_boundary(cut)
+                && model[cut..].eq_ignore_ascii_case(CLIENT_CONTEXT_SUFFIX) =>
+        {
+            &model[..cut]
+        }
+        _ => model,
+    }
+}
+
+/// Resolve the model slug requested upstream: one trailing
+/// [`CLIENT_CONTEXT_SUFFIX`] is stripped first, so every rule below sees the
+/// base slug; grok-shaped requests (`grok-` prefix / bare `grok`) then pass
+/// through VERBATIM — the client's choice is honored, `/model grok-4.5` from
+/// Claude Code works with no config change (spec §R4); everything else
+/// (Anthropic default models on fallback, model-less requests) keeps the
+/// configured pin.
+///
+/// The PIN gets the same strip, on every path that returns it (model-less
+/// request, bare `grok`, non-grok-shaped fallback). A config may legitimately
+/// carry the picker's spelling — `config.grok.default_model = "grok-4.7[1m]"`
+/// is how an operator makes the 1M-denominated row the advertised family
+/// default — and without this the suffix rode the pin all the way to xAI as
+/// an unknown slug that also missed the thinking-level table (dropping
+/// `reasoning` silently). The suffix is client-side display metadata on BOTH
+/// sides of the resolution.
 fn resolve_upstream_model(requested: Option<&str>, pinned: &str) -> String {
+    let pinned = strip_client_context_suffix(pinned);
     let Some(req) = requested else {
         return pinned.to_string();
     };
     let req = req.trim().to_ascii_lowercase();
+    let req = strip_client_context_suffix(&req).to_string();
     if req == "grok" {
         // Bare family alias → the configured pin (routing classifies it
         // here; there is no upstream model literally named "grok").
@@ -271,8 +318,9 @@ fn thinking_levels(model: &str) -> Option<&'static [&'static str]> {
 /// [`GROK_THINKING_LEVELS`] always yield `None` (omit `reasoning`). A
 /// clamped result of `none` also yields `None` — omission is the only
 /// universally-accepted zero form. Above-`high` inputs (`xhigh|max|ultra`)
-/// stay at `xhigh` when the effective model's level set has it (grok-4.6,
-/// live `/v1/models` 2026-08-13) and otherwise degrade to `high`.
+/// stay at `xhigh` when the effective model's level set has it (grok-4.7,
+/// live `/v1/models` 2026-09-23; grok-4.6, live `/v1/models` 2026-08-13)
+/// and otherwise degrade to `high`.
 /// Precedence flipped 2026-07-15 (was request-wins — codex parity): Claude
 /// Code always sends an effort, so a configured override could never apply.
 fn resolve_reasoning_effort(
@@ -479,8 +527,8 @@ mod tests {
     }
 
     /// The grok side of the compatibility contract: the cap IS forwarded
-    /// (live receipt: cap 16 → `incomplete`/`max_output_tokens`) where codex
-    /// must omit it, and a tool-less body sends none of the tool trio (xAI
+    /// (live receipt: cap 16 → `incomplete`/`max_output_tokens`), down to a
+    /// cap of 1, and a tool-less body sends none of the tool trio (xAI
     /// rejects a `tool_choice` without tools). Exhaustive cases live in
     /// `provider::responses_request::tests`.
     #[test]
@@ -490,6 +538,14 @@ mod tests {
         let (upstream, _) =
             translate_request_with(&b, "s", &shape("grok-4.6", None)).expect("translate");
         assert_eq!(upstream["max_output_tokens"], 1024);
+        b["max_tokens"] = json!(1);
+        let (capped, _) =
+            translate_request_with(&b, "s", &shape("grok-4.6", None)).expect("translate");
+        assert_eq!(
+            capped["max_output_tokens"].as_u64(),
+            Some(1),
+            "a one-token cap is forwarded as one: {capped}"
+        );
         for field in ["tools", "tool_choice", "parallel_tool_calls"] {
             assert!(upstream.get(field).is_none(), "{field}: {upstream}");
         }
@@ -726,6 +782,87 @@ mod tests {
         assert_eq!(resolve_upstream_model(None, "grok-4.5"), "grok-4.5");
     }
 
+    /// Claude Code parses `[1m]` out of the model string client-side, but a
+    /// raw client (curl/SDK) — and any routing rule that forwards the catalog
+    /// id verbatim — sends it as-is. Stripping it first keeps BOTH the
+    /// passthrough and the pin path working, and (the actual regression) keeps
+    /// the resolved slug findable in [`GROK_THINKING_LEVELS`], so `reasoning`
+    /// is not silently dropped. Codex precedent: `codex.rs`
+    /// `client_context_suffix_is_stripped_before_resolution`.
+    #[test]
+    fn client_context_suffix_is_stripped_before_resolution() {
+        for (requested, expected) in [
+            ("grok-4.7[1m]", "grok-4.7"),
+            ("grok-4.6[1m]", "grok-4.6"),
+            ("GROK[1m]", "grok-4.6"),
+            ("  Grok-4.7[1M]  ", "grok-4.7"),
+            // Only ONE suffix is stripped, and only a trailing one.
+            ("grok-4.7[1m][1m]", "grok-4.7[1m]"),
+        ] {
+            assert_eq!(
+                resolve_upstream_model(Some(requested), "grok-4.6"),
+                expected,
+                "{requested} → {expected}"
+            );
+        }
+    }
+
+    /// The PIN side of the same strip. A config may legitimately carry the
+    /// picker's `[1m]` spelling (that is how an operator makes the
+    /// 1M-denominated row the advertised family default — see
+    /// `catalog::GROK_MODELS`), and before this fix the suffix rode the pin to
+    /// xAI on every path that returns it: a model-less request, a bare `grok`,
+    /// and a non-grok-shaped body on fallback. `grok-4.7[1m]` is not an
+    /// upstream slug and is in no thinking-level table.
+    #[test]
+    fn pinned_context_suffix_is_stripped_on_every_path() {
+        // (a) model-less request, (b) bare family alias.
+        assert_eq!(resolve_upstream_model(None, "grok-4.7[1m]"), "grok-4.7");
+        assert_eq!(
+            resolve_upstream_model(Some("grok"), "grok-4.7[1m]"),
+            "grok-4.7"
+        );
+        // Non-grok-shaped request (Anthropic default model on fallback) also
+        // falls back to the pin — same strip.
+        assert_eq!(
+            resolve_upstream_model(Some("claude-sonnet-5"), "grok-4.7[1m]"),
+            "grok-4.7"
+        );
+        // Case and padding follow the requested side; only ONE trailing
+        // suffix goes, and a suffix-free pin is untouched.
+        assert_eq!(resolve_upstream_model(None, " grok-4.7[1M] "), "grok-4.7");
+        assert_eq!(
+            resolve_upstream_model(None, "grok-4.7[1m][1m]"),
+            "grok-4.7[1m]"
+        );
+        assert_eq!(resolve_upstream_model(None, "grok-4.7"), "grok-4.7");
+        // A requested grok id still wins over the pin, suffix or not.
+        assert_eq!(
+            resolve_upstream_model(Some("grok-4.5"), "grok-4.7[1m]"),
+            "grok-4.5"
+        );
+    }
+
+    /// End to end through the translator, which is where the regression bit:
+    /// a suffixed PIN plus a body Claude sent to the grok fallback must reach
+    /// the wire as the base slug AND still find its thinking levels, so the
+    /// configured effort survives instead of being silently dropped.
+    #[test]
+    fn suffixed_pin_reaches_the_wire_as_the_base_slug_with_effort() {
+        let b = body("claude-sonnet-5");
+        let (upstream, _) = translate_request_with(&b, "s", &shape("grok-4.7[1m]", Some("xhigh")))
+            .expect("translate");
+        assert_eq!(upstream["model"], "grok-4.7", "the suffix never ships");
+        assert_eq!(
+            upstream["reasoning"]["effort"], "xhigh",
+            "the stripped slug is in the thinking-level table, so effort survives"
+        );
+        // The activity log reads the same resolution.
+        let (model, effort) = effective_request_meta(&b, &shape("grok-4.7[1m]", Some("xhigh")));
+        assert_eq!(model, "grok-4.7");
+        assert_eq!(effort.as_deref(), Some("xhigh"));
+    }
+
     #[test]
     fn config_effort_validation_superset() {
         for ok in ["none", "low", "medium", "high", "xhigh"] {
@@ -772,6 +909,66 @@ mod tests {
         assert_eq!(
             upstream["reasoning"]["effort"], "low",
             "grok-4.6 level set lacks none"
+        );
+    }
+
+    // ---- grok-4.7 (live /v1/models 2026-09-23: low|medium|high|xhigh) ----
+    #[test]
+    fn grok_47_keeps_xhigh_on_the_wire() {
+        let mut b = body("grok-4.7");
+        b["output_config"] = json!({"effort": "xhigh"});
+        let (upstream, _) =
+            translate_request_with(&b, "s", &shape("grok-4.7", None)).expect("translate");
+        assert_eq!(upstream["model"], "grok-4.7");
+        assert_eq!(
+            upstream["reasoning"]["effort"], "xhigh",
+            "grok-4.7 level set has xhigh — no downgrade"
+        );
+    }
+
+    #[test]
+    fn grok_47_none_clamps_to_low() {
+        // Both 4.7 rows share the same level set (live /v1/models 2026-09-23),
+        // and NEITHER lists `none` — the clamp must land on `low` for both.
+        for model in ["grok-4.7", "grok-4.7-build-fast"] {
+            let mut b = body(model);
+            b["output_config"] = json!({"effort": "none"});
+            let (upstream, _) =
+                translate_request_with(&b, "s", &shape("grok-4.7", None)).expect("translate");
+            assert_eq!(upstream["model"], model);
+            assert_eq!(
+                upstream["reasoning"]["effort"], "low",
+                "{model} level set lacks none"
+            );
+        }
+    }
+
+    #[test]
+    fn grok_47_build_fast_keeps_xhigh_on_the_wire() {
+        let mut b = body("grok-4.7-build-fast");
+        b["output_config"] = json!({"effort": "xhigh"});
+        let (upstream, _) =
+            translate_request_with(&b, "s", &shape("grok-4.7", None)).expect("translate");
+        assert_eq!(upstream["model"], "grok-4.7-build-fast");
+        assert_eq!(
+            upstream["reasoning"]["effort"], "xhigh",
+            "grok-4.7-build-fast level set has xhigh — no downgrade"
+        );
+    }
+
+    /// The regression the `[1m]` strip exists for: a client sending the
+    /// catalog id VERBATIM used to reach upstream as `grok-4.7[1m]`, which is
+    /// in no thinking-level table, so `reasoning` was dropped entirely
+    /// (observed live: `model="grok-4.7[1m]" effort="-"`).
+    #[test]
+    fn grok_47_with_context_suffix_keeps_model_and_effort() {
+        let b = body("grok-4.7[1m]");
+        let (upstream, _) =
+            translate_request_with(&b, "s", &shape("grok-4.7", Some("xhigh"))).expect("translate");
+        assert_eq!(upstream["model"], "grok-4.7", "`[1m]` never reaches xAI");
+        assert_eq!(
+            upstream["reasoning"]["effort"], "xhigh",
+            "the stripped slug is findable in the thinking-level table"
         );
     }
 }

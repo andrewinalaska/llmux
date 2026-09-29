@@ -8,10 +8,12 @@
 //!    ([`HealthCounts`]), poller staleness, and account states. Dominance:
 //!    poller-stale / auth-broken, then 429·5xx storm, then exhausted, then
 //!    healthy.
-//! 2. [`intervention_order`] — the accounts table sorted by what the operator
-//!    should act on, NOT registration/scheduler-preference order. in-flight is
-//!    deliberately NOT a sort key (it toggles per request and would destroy
-//!    the row-position memory a glance table exists for).
+//! 2. [`display_order`] — the accounts table in backend-group blocks (Claude,
+//!    Codex, Grok, OpenRouter), ordered within a block by [`AccountSort`]:
+//!    account name in natural order ([`natural_key`], the default) or the
+//!    scheduler's own next-pick order. in-flight
+//!    is deliberately NOT a sort key anywhere (it toggles per request and
+//!    would destroy the row-position memory a glance table exists for).
 //! 3. [`collapse_completed`] — folds runs of at least [`FOLD_MIN`] CONSECUTIVE
 //!    completed-2xx entries with an identical (method, path, account, group,
 //!    model) key into one counted row. Non-2xx, in-flight, notes and control
@@ -20,9 +22,9 @@
 //!
 //! No persistence, no config surface: thresholds are the named constants below.
 
-use std::cmp::Reverse;
 use std::time::{Duration, SystemTime};
 
+use crate::routing::BackendGroup;
 use crate::scheduler::select::{self, IneligibleReason, SelectParams};
 use crate::scheduler::{AccountSnapshot, PoolSnapshot};
 
@@ -217,10 +219,12 @@ pub(crate) fn health_verdict(view: &DashboardView, now: SystemTime) -> Verdict {
 }
 
 // ---------------------------------------------------------------------------
-// Accounts intervention order
+// Accounts display order
 // ---------------------------------------------------------------------------
 
-/// Urgency tier of one account row: lower renders higher. in-flight is NOT a
+/// Urgency tier of one account row: lower = more urgent. It no longer drives
+/// render order (that is [`display_order`]'s group blocks + [`AccountSort`]);
+/// its only consumer is [`urgent`], the leading `!` marker. in-flight is NOT a
 /// key anywhere here (MUST-FIX 4 — row jitter would destroy position memory).
 fn tier(account: &AccountSnapshot, gate: Option<IneligibleReason>) -> u8 {
     match gate {
@@ -247,34 +251,133 @@ pub(crate) fn urgent(account: &AccountSnapshot, gate: Option<IneligibleReason>) 
     tier(account, gate) <= 1
 }
 
-/// Indices into `snapshot.accounts`, exhausted → auth-broken → known 5h desc
-/// (cooldowns included) → ready → paused → cold/unknown; stable (config
-/// index) within a tier so rows never swap without a state change.
-pub(crate) fn intervention_order(
+/// Within-group order of the accounts table. The group blocks themselves are
+/// fixed in BOTH modes; this only picks the key used inside a block. Session
+/// local (`o` toggles it), never persisted to config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum AccountSort {
+    /// Account name ascending, case-insensitive and NATURAL ([`natural_key`]:
+    /// digit runs compare as numbers, so `ai` < `ai1` < `ai2` < `ai10`), with
+    /// the lowercased name and then the config index as the stable tiebreak.
+    /// The default: a name order never moves under live usage.
+    #[default]
+    Name,
+    /// The scheduler's literal next-pick order for the group
+    /// ([`select::group_selection_order`]).
+    Next,
+}
+
+impl AccountSort {
+    /// Short label for the pane title / status line.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Name => "name",
+            Self::Next => "next",
+        }
+    }
+
+    pub(crate) fn toggle(self) -> Self {
+        match self {
+            Self::Name => Self::Next,
+            Self::Next => Self::Name,
+        }
+    }
+}
+
+/// One comparable piece of a [`natural_key`]: a separator character, a whole
+/// run of digits taken as the number it spells, or a letter.
+///
+/// The declaration order IS the rule — the derived `Ord` orders variants by
+/// declaration, so at one position `Sep` < `Num` < `Alpha`:
+///
+/// - a separator beats a number, which is the owner's picture of the fix
+///   (Z 2026-09-18): the number is a right-aligned padded slot and the name
+///   whose slot is EMPTY comes first, so `ai@…` < `ai1@…`;
+/// - a number beats a letter, which is Finder / `sort -V` order, so
+///   `dev1@…` < `devteam@…` and `codex:2@…` < `codex:backup@…`.
+///
+/// ```text
+/// ai[    ]@iq.io
+/// ai[   1]@iq.io
+/// ai[  10]@iq.io
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum NatChunk {
+    /// One non-alphanumeric character (`@`, `.`, `:`, `-`, `_`, `+` …) — the
+    /// boundary an empty number slot falls on.
+    Sep(char),
+    /// A digit run read as a number. Saturating: a run too long for `u128`
+    /// keeps the ceiling instead of panicking (ids are operator input).
+    Num(u128),
+    /// One lowercased alphanumeric non-digit character.
+    Alpha(char),
+}
+
+/// The human ("natural") sort key for an account name: lowercased, with every
+/// digit run compared as a NUMBER rather than character by character, so a
+/// block reads `ai`, `ai1`, `ai2`, … `ai10` instead of `ai10, ai1, ai2, ai`.
+///
+/// Per-character (rather than per-word) chunks are what makes the comparison
+/// land on the divergence itself, where [`NatChunk`]'s three kinds decide:
+/// separator < number < letter. Hence `ai@iq.io` < `ai1@iq.io` (empty slot
+/// first) and `dev1@iq.io` < `devteam@iq.io` / `codex:2@x` < `codex:backup@x`
+/// (a number is not a letter, and does not sort as one).
+///
+/// Digit runs that spell the same number (`ai01` vs `ai1`) tie here; callers
+/// break the tie with the lowercased name and then the config index.
+pub(crate) fn natural_key(name: &str) -> Vec<NatChunk> {
+    let mut key = Vec::with_capacity(name.len());
+    let mut chars = name.chars().peekable();
+    while let Some(c) = chars.next() {
+        let Some(digit) = c.to_digit(10) else {
+            key.push(if c.is_alphanumeric() {
+                NatChunk::Alpha(c.to_ascii_lowercase())
+            } else {
+                NatChunk::Sep(c)
+            });
+            continue;
+        };
+        let mut value = u128::from(digit);
+        while let Some(next) = chars.peek().and_then(|c| c.to_digit(10)) {
+            value = value.saturating_mul(10).saturating_add(u128::from(next));
+            chars.next();
+        }
+        key.push(NatChunk::Num(value));
+    }
+    key
+}
+
+/// THE display order: indices into `snapshot.accounts` in backend-group blocks
+/// ([`BackendGroup::ALL`] — Claude, Codex, Grok, OpenRouter) as the primary
+/// key in both modes, ordered within each block by `sort`. The old
+/// intervention order is retired (it reshuffled rows as usage moved); the `!`
+/// urgency marker ([`urgent`]) carries the "act on this" signal instead.
+pub(crate) fn display_order(
     snapshot: &PoolSnapshot,
     params: &SelectParams,
+    sort: AccountSort,
     now: SystemTime,
 ) -> Vec<usize> {
-    let headers_only = select::headers_only_mode(snapshot, params, None, now);
-    let mut order: Vec<usize> = (0..snapshot.accounts.len()).collect();
-    order.sort_by_key(|&idx| {
-        let account = &snapshot.accounts[idx];
-        let gate = select::eligibility(account, params, now, headers_only);
-        let tier = tier(account, gate);
-        // Within the usage tier, higher 5h utilization = closer to the top
-        // (permille avoids float keys). Other tiers keep config order.
-        let usage_rank = if tier == 2 {
-            let permille = account
-                .five_hour
-                .as_ref()
-                .map(|w| (w.utilization.clamp(0.0, 1.0) * 1000.0) as u32)
-                .unwrap_or(0);
-            Reverse(permille)
-        } else {
-            Reverse(0)
-        };
-        (tier, usage_rank, idx)
-    });
+    let mut order: Vec<usize> = Vec::with_capacity(snapshot.accounts.len());
+    for &group in BackendGroup::ALL {
+        match sort {
+            AccountSort::Name => {
+                let mut block: Vec<usize> = (0..snapshot.accounts.len())
+                    .filter(|&idx| snapshot.accounts[idx].group == group)
+                    .collect();
+                block.sort_by_key(|&idx| {
+                    let id = &snapshot.accounts[idx].id.0;
+                    (natural_key(id), id.to_ascii_lowercase(), idx)
+                });
+                order.extend(block);
+            }
+            // Delegated to the selector itself, so the table can never
+            // disagree with what the daemon would serve for this group.
+            AccountSort::Next => {
+                order.extend(select::group_selection_order(snapshot, params, group, now));
+            }
+        }
+    }
     order
 }
 
@@ -443,58 +546,217 @@ mod tests {
         }
     }
 
-    fn ordered_ids(snapshot: &PoolSnapshot) -> Vec<String> {
-        intervention_order(snapshot, &params(), now())
+    fn ordered_ids(snapshot: &PoolSnapshot, sort: AccountSort) -> Vec<String> {
+        display_order(snapshot, &params(), sort, now())
             .into_iter()
             .map(|i| snapshot.accounts[i].id.0.clone())
             .collect()
     }
 
-    // ---- intervention order ----
+    /// An account in an explicit backend group (the credential kind the group
+    /// is derived from, so the eligibility gates behave like production).
+    fn grouped(id: &str, group: BackendGroup) -> AccountSnapshot {
+        let mut a = account(id);
+        a.credential_kind = match group {
+            BackendGroup::Claude => "oauth",
+            BackendGroup::Codex => "codex",
+            BackendGroup::Grok => "grok",
+            BackendGroup::OpenRouter => "openrouter",
+        };
+        a.group = group;
+        a
+    }
+
+    // ---- natural name key ----
 
     #[test]
-    fn exhausted_pins_top_then_auth_then_usage_desc() {
-        let mut low = account("low");
-        low.five_hour = Some(window(0.08));
-        let mut high = account("high");
-        high.five_hour = Some(window(0.30));
-        let mut broken = account("broken");
-        broken.healthy = false;
-        let mut exhausted = account("exhausted");
-        exhausted.five_hour = Some(window(0.97));
-        // Registration order buries the urgent rows at the END on purpose.
-        let snapshot = pool(vec![low, high, broken, exhausted]);
+    fn natural_key_orders_like_a_human() {
+        let mut names = vec![
+            "ai10", "ai1", "ai", "ai2", "ai01", "AI3", "dev1", "dev", "icedac", "info", "notify",
+        ];
+        names.sort_by_key(|name| (natural_key(name), name.to_ascii_lowercase()));
         assert_eq!(
-            ordered_ids(&snapshot),
-            vec!["exhausted", "broken", "high", "low"]
+            names,
+            vec![
+                "ai", "ai01", "ai1", "ai2", "AI3", "ai10", "dev", "dev1", "icedac", "info",
+                "notify",
+            ],
+            "empty slot first, digit runs numeric, spelling as the tiebreak"
+        );
+
+        // At a divergence: separator < number < letter. The empty number slot
+        // still sorts first (the owner's TO-BE), but a number now beats a
+        // letter — Finder / `sort -V` order, so `devteam` no longer jumps
+        // ahead of `dev1`.
+        let mut ids = vec![
+            "devteam@x",
+            "ai2@x",
+            "codex:backup@x",
+            "ai@x",
+            "dev1@x",
+            "codex:2@x",
+            "ai10@x",
+            "ai1@x",
+        ];
+        ids.sort_by_key(|id| (natural_key(id), id.to_ascii_lowercase()));
+        assert_eq!(
+            ids,
+            vec![
+                "ai@x",
+                "ai1@x",
+                "ai2@x",
+                "ai10@x",
+                "codex:2@x",
+                "codex:backup@x",
+                "dev1@x",
+                "devteam@x",
+            ],
+            "separator (the empty number slot) < number < letter"
+        );
+
+        // A digit run far past u128 saturates instead of panicking.
+        let huge = format!("a{}", "9".repeat(60));
+        assert_eq!(
+            natural_key(&huge),
+            vec![NatChunk::Alpha('a'), NatChunk::Num(u128::MAX)]
+        );
+    }
+
+    // ---- display order ----
+
+    #[test]
+    fn display_order_groups_claude_codex_grok_openrouter() {
+        // Registration order deliberately interleaves the groups.
+        let snapshot = pool(vec![
+            grouped("or-1", BackendGroup::OpenRouter),
+            grouped("cx-1", BackendGroup::Codex),
+            grouped("cl-1", BackendGroup::Claude),
+            grouped("gk-1", BackendGroup::Grok),
+            grouped("cx-2", BackendGroup::Codex),
+            grouped("cl-2", BackendGroup::Claude),
+        ]);
+        // The group blocks are the PRIMARY key in BOTH modes.
+        for sort in [AccountSort::Name, AccountSort::Next] {
+            let ids = ordered_ids(&snapshot, sort);
+            let groups: Vec<BackendGroup> = display_order(&snapshot, &params(), sort, now())
+                .into_iter()
+                .map(|i| snapshot.accounts[i].group)
+                .collect();
+            assert_eq!(
+                groups,
+                vec![
+                    BackendGroup::Claude,
+                    BackendGroup::Claude,
+                    BackendGroup::Codex,
+                    BackendGroup::Codex,
+                    BackendGroup::Grok,
+                    BackendGroup::OpenRouter,
+                ],
+                "{sort:?} blocks: {ids:?}"
+            );
+            assert_eq!(ids.len(), snapshot.accounts.len(), "{sort:?} drops no row");
+        }
+    }
+
+    #[test]
+    fn display_order_by_name_sorts_within_group() {
+        // Case-insensitive ascending within a group; equal names keep config
+        // order (stable), and in-flight/usage never move a row.
+        let mut busy = grouped("Alpha", BackendGroup::Claude);
+        busy.in_flight = 7;
+        busy.five_hour = Some(window(0.80));
+        let snapshot = pool(vec![
+            grouped("zeta", BackendGroup::Claude),
+            grouped("Beta", BackendGroup::Claude),
+            busy,
+            grouped("beta", BackendGroup::Claude),
+            grouped("cx", BackendGroup::Codex),
+        ]);
+        assert_eq!(
+            ordered_ids(&snapshot, AccountSort::Name),
+            vec!["Alpha", "Beta", "beta", "zeta", "cx"],
+            "case-insensitive, config index as the stable tiebreak"
         );
     }
 
     #[test]
-    fn in_flight_is_not_a_sort_key() {
-        let mut idle_high = account("idle-high");
-        idle_high.five_hour = Some(window(0.50));
-        let mut busy_low = account("busy-low");
-        busy_low.five_hour = Some(window(0.10));
-        busy_low.in_flight = 3;
-        let snapshot = pool(vec![idle_high, busy_low]);
-        // Higher usage outranks in-flight activity; toggling in_flight can
-        // never reorder rows.
-        assert_eq!(ordered_ids(&snapshot), vec!["idle-high", "busy-low"]);
+    fn display_order_by_name_is_natural_for_numbered_accounts() {
+        // Z 2026-09-18: "ai, ai1, ai2 ... ai10 이거 정렬하면 실제 무낵이랑
+        // 정렬이 병신이잖아" — the plain lexicographic key read ai10, ai1, ai;
+        // the number slot has to compare as a NUMBER.
+        let snapshot = pool(vec![
+            grouped("ai10@insightquest.io", BackendGroup::Claude),
+            grouped("ai2@insightquest.io", BackendGroup::Claude),
+            grouped("ai@insightquest.io", BackendGroup::Claude),
+            grouped("ai1@insightquest.io", BackendGroup::Claude),
+            grouped("devteam@insightquest.io", BackendGroup::Claude),
+            grouped("dev1@insightquest.io", BackendGroup::Claude),
+            grouped("icedac@gmail.com", BackendGroup::Claude),
+            grouped("notify@insightquest.io", BackendGroup::Claude),
+        ]);
+        assert_eq!(
+            ordered_ids(&snapshot, AccountSort::Name),
+            vec![
+                "ai@insightquest.io",
+                "ai1@insightquest.io",
+                "ai2@insightquest.io",
+                "ai10@insightquest.io",
+                "dev1@insightquest.io",
+                "devteam@insightquest.io",
+                "icedac@gmail.com",
+                "notify@insightquest.io",
+            ],
+            "digit runs compare numerically; empty slot first, number before letter"
+        );
+    }
+
+    #[test]
+    fn display_order_by_next_follows_group_selection_order() {
+        // Within the Claude block: the group's current first even though its
+        // name sorts last, then the eligible account, then the exhausted one.
+        // The current is only the head while the SELECTOR keeps it (the order
+        // is `pick`'s decision, not "current first"): at 5% it beats the cold
+        // ready account by less than SWITCH_MARGIN, so pick stays on it.
+        let mut current = grouped("z-current", BackendGroup::Claude);
+        current.five_hour = Some(window(0.05));
+        let ready = grouped("a-ready", BackendGroup::Claude);
+        let mut exhausted = grouped("m-exhausted", BackendGroup::Claude);
+        exhausted.five_hour = Some(window(0.97));
+        let mut snapshot = pool(vec![
+            ready,
+            exhausted,
+            current,
+            grouped("cx", BackendGroup::Codex),
+        ]);
+        snapshot
+            .current
+            .insert(BackendGroup::Claude, AccountId("z-current".into()));
+        assert_eq!(
+            ordered_ids(&snapshot, AccountSort::Next),
+            vec!["z-current", "a-ready", "m-exhausted", "cx"],
+            "current → eligible → ineligible, and the codex block stays last"
+        );
+        // Name mode is unaffected by who is current.
+        assert_eq!(
+            ordered_ids(&snapshot, AccountSort::Name),
+            vec!["a-ready", "m-exhausted", "z-current", "cx"]
+        );
     }
 
     #[test]
     fn ties_are_stable_by_config_index() {
-        let a = account("first");
-        let b = account("second");
-        let snapshot = pool(vec![a, b]);
-        assert_eq!(ordered_ids(&snapshot), vec!["first", "second"]);
+        let snapshot = pool(vec![account("same"), account("same")]);
+        assert_eq!(
+            display_order(&snapshot, &params(), AccountSort::Name, now()),
+            vec![0, 1]
+        );
     }
 
     #[test]
-    fn cold_unknown_sorts_below_ready_and_paused() {
+    fn cold_unknown_still_earns_no_urgency_marker() {
         // cold = an oauth account whose usage sample went STALE (UsageStale
-        // gate) — distinct from "ready" (eligible, just no 5h sample yet).
+        // gate). It is NOT urgent (tiers 0–1 only), unlike an exhausted or
+        // auth-broken account — the marker survived the order change.
         let mut cold = account("cold");
         cold.five_hour = Some(QuotaWindow {
             utilization: 0.10,
@@ -503,22 +765,21 @@ mod tests {
             source: WindowSource::UsagePoll,
         });
         cold.seven_day = None;
-        let ready = {
-            let mut a = account("ready");
-            a.five_hour = None;
-            a.seven_day = None;
-            a.credential_kind = "apikey";
-            a
-        };
+        let mut exhausted = account("exhausted");
+        exhausted.five_hour = Some(window(0.97));
+        let mut broken = account("broken");
+        broken.healthy = false;
         let mut paused = account("paused");
         paused.paused = true;
-        let known = account("known");
-        let snapshot = pool(vec![cold, ready, paused, known]);
-        assert_eq!(
-            ordered_ids(&snapshot),
-            vec!["known", "ready", "paused", "cold"],
-            "known usage > ready > paused > cold/stale, each its own tier"
-        );
+        for (acct, want) in [
+            (&cold, false),
+            (&exhausted, true),
+            (&broken, true),
+            (&paused, false),
+        ] {
+            let gate = select::eligibility(acct, &params(), now(), false);
+            assert_eq!(urgent(acct, gate), want, "{}", acct.id.0);
+        }
     }
 
     // ---- verdict ----
@@ -567,7 +828,6 @@ mod tests {
             logs: Vec::new(),
             model_usage: Vec::new(),
             client_usage: Vec::new(),
-            tenant_usage: Vec::new(),
             client_keys: Vec::new(),
             windowed: Vec::new(),
             codex: Default::default(),

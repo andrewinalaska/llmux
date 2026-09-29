@@ -60,6 +60,11 @@ struct HubState {
     /// `serve`), so folding events through the hub never touches the real state
     /// dir during tests.
     persist_path: Option<std::path::PathBuf>,
+    /// Durable keys-usage store (`docs/keys-history/spec.md` K). `None` until
+    /// `serve` arms it ([`DashboardHub::arm_usage_store`]) — same test-isolation
+    /// rule as `persist_path`: a hub built with `default()` opens no database,
+    /// so unit tests can never touch the user's real `usage.sqlite3`.
+    usage_store: Option<std::sync::Arc<crate::key_usage::KeyUsageStore>>,
 }
 
 impl Default for DashboardHub {
@@ -75,6 +80,7 @@ impl Default for DashboardHub {
                 poll_health: HashMap::new(),
                 console: LogConsole::new(crate::tui::logs::LOG_CONSOLE_CAPACITY),
                 persist_path: None,
+                usage_store: None,
             }),
         }
     }
@@ -160,6 +166,23 @@ impl DashboardHub {
         }
     }
 
+    /// Arm the durable keys-usage store (`docs/keys-history/spec.md` K): every
+    /// subsequent finished request is ALSO queued into SQLite, which is what
+    /// makes the keys panel windowed, filterable and restart-proof.
+    ///
+    /// Called once from `serve` — never from `Default` — so unit tests that
+    /// build the hub via `default()` and fold events stay isolated (their
+    /// store is `None` and no database file is ever opened).
+    pub fn arm_usage_store(&self, store: Option<std::sync::Arc<crate::key_usage::KeyUsageStore>>) {
+        self.lock().usage_store = store;
+    }
+
+    /// The armed keys-usage store, if any. `None` means "no durable metering
+    /// on this daemon" — the surface must say so, never render zeros.
+    pub fn usage_store(&self) -> Option<std::sync::Arc<crate::key_usage::KeyUsageStore>> {
+        self.lock().usage_store.clone()
+    }
+
     /// Fold one proxy/scheduler event: last-switch + poller-health pane
     /// state, then the activity log itself.
     pub fn apply_event(&self, event: ActivityEvent, now: SystemTime) {
@@ -203,6 +226,14 @@ impl DashboardHub {
         // `persist_request`).
         if let Some(path) = state.persist_path.clone() {
             crate::tui::activity::persist_request(Some(&path), &event, now);
+        }
+        // Durable keys metering (keys-history K-3/K-4). `record` is a queue
+        // push handled by the store's own writer thread — NO disk IO here, so
+        // the hub lock is never held across database work.
+        if let Some(store) = state.usage_store.as_ref() {
+            if let Some(row) = crate::key_usage::UsageRow::from_event(&event, now) {
+                store.record(row);
+            }
         }
         state.log.apply(event, now);
     }
@@ -331,6 +362,20 @@ pub async fn fold(
     }
 }
 
+/// Resolve a tenant attribution id to its display name: the key's name for
+/// `k-…` ids, the bucket id itself for builtins (`local`/`legacy`). `None`
+/// (unattributed / pre-tenant history) stays `None` — never coerced into
+/// `local`. Shared by the completed AND in-flight row builders so the Name
+/// column cannot drift between a running request and the row it becomes.
+fn resolve_client_name(tenant: Option<&String>, keys: &[KeyRowDoc]) -> Option<String> {
+    tenant.map(|id| {
+        keys.iter()
+            .find(|k| &k.id == id)
+            .map(|k| k.name.clone())
+            .unwrap_or_else(|| id.clone())
+    })
+}
+
 /// Render one activity event as a tracing log line (daemon mode parity with
 /// the old non-TTY event drain).
 fn trace_event(event: &ActivityEvent) {
@@ -340,6 +385,7 @@ fn trace_event(event: &ActivityEvent) {
             method,
             path,
             kind,
+            ..
         } => {
             tracing::debug!(
                 id,
@@ -1152,7 +1198,7 @@ pub struct ClientUsageDoc {
 /// One per-tenant attribution row (multi-tenant #22): the stable tenant id,
 /// its display name resolved at build time (key name; the id itself for the
 /// builtin `local`/`legacy`/`unknown` buckets), and its lifetime counts.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TenantUsageDoc {
     /// Stable attribution id: `k-…` / `legacy` / `local` / `unknown`.
     pub tenant: String,
@@ -1180,7 +1226,7 @@ pub struct TenantUsageDoc {
 }
 
 /// One tenant's usage of one served model (multi-tenant #22).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TenantModelDoc {
     pub group: String,
     pub model: String,
@@ -1277,6 +1323,19 @@ pub struct InFlightDoc {
     /// row. Additive: absent in docs written before this field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
+    /// Client identity / tenant attribution / input excerpt, known at start
+    /// time, plus the tenant's display name resolved HERE (the fold cannot —
+    /// key metadata lives in config), so the running row renders the same
+    /// Name column and session/input text as its completed row. Additive:
+    /// absent in docs written before these fields existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub excerpt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_name: Option<String>,
 }
 
 // Request dwarfs Note by design (see `tui::activity::CompletedBody`): almost
@@ -1779,6 +1838,15 @@ pub(crate) fn dashboard_doc(
                 effort: r.effort.clone(),
                 fast: r.fast,
                 kind: r.kind.clone(),
+                // Identity + input, known since the start event, so the
+                // RUNNING row renders the same Name / session / input cells
+                // as the completed row it becomes (activity in-flight
+                // identity). The name join happens HERE for the same reason
+                // it does for completed rows: key metadata lives in config.
+                user_id: r.user_id.clone(),
+                tenant: r.tenant.clone(),
+                excerpt: r.excerpt.clone(),
+                client_name: resolve_client_name(r.tenant.as_ref(), &meta.client_keys),
             })
             .collect(),
         completed: hub
@@ -1843,18 +1911,10 @@ pub(crate) fn dashboard_doc(
                     msg_kind: kind.clone(),
                     excerpt: excerpt.clone(),
                     tenant: tenant.clone(),
-                    // Per-row client name (activity Name column): key name
-                    // for `k-…` ids, the id itself for builtin buckets
-                    // (`local`/`legacy`) — the same join as `tenant_usage`
-                    // below. `None` tenant (pre-field history) stays `None`,
-                    // never coerced into `local`.
-                    client_name: tenant.as_ref().map(|id| {
-                        meta.client_keys
-                            .iter()
-                            .find(|k| &k.id == id)
-                            .map(|k| k.name.clone())
-                            .unwrap_or_else(|| id.clone())
-                    }),
+                    // Per-row client name (activity Name column) — the same
+                    // join as `tenant_usage` below and as the in-flight rows
+                    // above.
+                    client_name: resolve_client_name(tenant.as_ref(), &meta.client_keys),
                 },
                 CompletedBody::Note { text, error } => CompletedDoc::Note {
                     at_ms: epoch_ms(entry.at),
@@ -2056,6 +2116,30 @@ pub(crate) fn dashboard_doc(
 
 /// Build the document from live server state — what `GET /llmux/dashboard`
 /// serves and what the local TUI renders each frame.
+/// Display metadata for every issued client key — NEVER the secret or digest.
+/// Shared by the dashboard document and the keys-usage endpoint so both render
+/// the same names/emails against the same attribution ids.
+pub fn key_row_docs(state: &AppState) -> Vec<KeyRowDoc> {
+    state
+        .keys
+        .list()
+        .iter()
+        .map(|k| KeyRowDoc {
+            id: k.id.clone(),
+            name: k.name.clone(),
+            email: k.email.clone(),
+            kind: match k.kind {
+                crate::config::ClientKeyKind::Admin => "admin".to_string(),
+                crate::config::ClientKeyKind::Default => "default".to_string(),
+            },
+            key_prefix: k.key_prefix.clone(),
+            suspended: k.suspended,
+            created_at_ms: k.created_at_ms,
+            revoked_at_ms: k.revoked_at_ms,
+        })
+        .collect()
+}
+
 pub(crate) fn build_doc(state: &AppState, now: SystemTime) -> DashboardDoc {
     let snapshot = state.pool.snapshot();
     let params = state.select_params();
@@ -2064,24 +2148,7 @@ pub(crate) fn build_doc(state: &AppState, now: SystemTime) -> DashboardDoc {
     let grok_shape = state.grok.shape();
     let meta = DocMeta {
         pid: std::process::id(),
-        client_keys: state
-            .keys
-            .list()
-            .iter()
-            .map(|k| KeyRowDoc {
-                id: k.id.clone(),
-                name: k.name.clone(),
-                email: k.email.clone(),
-                kind: match k.kind {
-                    crate::config::ClientKeyKind::Admin => "admin".to_string(),
-                    crate::config::ClientKeyKind::Default => "default".to_string(),
-                },
-                key_prefix: k.key_prefix.clone(),
-                suspended: k.suspended,
-                created_at_ms: k.created_at_ms,
-                revoked_at_ms: k.revoked_at_ms,
-            })
-            .collect(),
+        client_keys: key_row_docs(state),
         uptime_secs: state.started.elapsed().as_secs(),
         port: state.bound_port.load(std::sync::atomic::Ordering::Relaxed),
         upstream: state.config.upstream.clone(),
@@ -2325,6 +2392,9 @@ mod tests {
                 method: "POST".into(),
                 path: "/v1/messages".into(),
                 kind: None,
+                user_id: None,
+                tenant: None,
+                excerpt: None,
             },
             now() - Duration::from_secs(60),
         );
@@ -2363,6 +2433,9 @@ mod tests {
                 method: "POST".into(),
                 path: "/v1/messages".into(),
                 kind: None,
+                user_id: None,
+                tenant: None,
+                excerpt: None,
             },
             now() - Duration::from_secs(3),
         );
@@ -2606,6 +2679,65 @@ mod tests {
         );
         // Additive wire shape: the pre-tenant row omits both keys entirely.
         let json = serde_json::to_value(&doc.activity.completed[0]).expect("json");
+        assert!(json.get("tenant").is_none());
+        assert!(json.get("client_name").is_none());
+    }
+
+    /// activity in-flight identity: a RUNNING row carries the same tenant +
+    /// resolved display name a completed row does, so the Name column is
+    /// populated while the request is still in flight instead of only after
+    /// it finishes. Same join, same `None`-stays-`None` rule, same additive
+    /// wire shape.
+    #[test]
+    fn doc_in_flight_rows_carry_tenant_and_resolved_client_name() {
+        let hub = DashboardHub::default();
+        let started = |id: u64, tenant: Option<&str>| ActivityEvent::RequestStarted {
+            id,
+            method: "POST".into(),
+            path: "/v1/messages".into(),
+            kind: Some("user".into()),
+            user_id: Some("u1".into()),
+            tenant: tenant.map(str::to_string),
+            excerpt: Some("hello world".into()),
+        };
+        hub.apply_event(started(1, Some("k-t1")), now() - Duration::from_secs(3));
+        hub.apply_event(started(2, None), now() - Duration::from_secs(2));
+
+        let mut meta = meta();
+        meta.client_keys.push(KeyRowDoc {
+            id: "k-t1".into(),
+            name: "Z (U09F1M5MML1)".into(),
+            email: None,
+            kind: "default".into(),
+            key_prefix: "lmk-aaaa".into(),
+            suspended: false,
+            created_at_ms: 1,
+            revoked_at_ms: None,
+        });
+        let pool = AccountPool::new(&[oauth_account("a")]);
+        let doc = dashboard_doc(
+            &pool.snapshot(),
+            &hub.view(now()),
+            &UsageTotals::default(),
+            &params(),
+            now(),
+            &meta,
+        );
+
+        let keyed = &doc.activity.in_flight[0];
+        assert_eq!(keyed.tenant.as_deref(), Some("k-t1"));
+        assert_eq!(keyed.client_name.as_deref(), Some("Z (U09F1M5MML1)"));
+        assert_eq!(keyed.user_id.as_deref(), Some("u1"));
+        assert_eq!(keyed.excerpt.as_deref(), Some("hello world"));
+
+        let unattributed = &doc.activity.in_flight[1];
+        assert_eq!(unattributed.tenant, None);
+        assert_eq!(
+            unattributed.client_name, None,
+            "None stays None, never coerced into `local`"
+        );
+        // Additive wire shape: the unattributed row omits the keys entirely.
+        let json = serde_json::to_value(unattributed).expect("json");
         assert!(json.get("tenant").is_none());
         assert!(json.get("client_name").is_none());
     }

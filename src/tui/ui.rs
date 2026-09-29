@@ -32,7 +32,7 @@ use super::event::TokenCounts;
 use super::format::{self, GaugeLevel};
 use super::triage::{self, ActivityRow, VerdictLevel};
 use super::view::DashboardView;
-use super::{anim, Chrome, InputModal, Mode, Overlay, RawModal, RawModalState};
+use super::{anim, AccountModal, Chrome, InputModal, Mode, Overlay, RawModal, RawModalState};
 
 /// Total width of one quota gauge cell in the accounts table: a reverse-video
 /// bar (fill = utilization, reset countdown / absolute stamp overlaid inside),
@@ -60,10 +60,29 @@ const WIDE_TABLE_AT: u16 = 150;
 /// leftover-space allocation made it too wide). Longer names are clipped by the
 /// cell.
 const NAME_COL_MAX: u16 = 20;
+/// Floor of the accounts-table name column (.prd/18): the header word
+/// `account`. The name column is the LAST column to give way — after `status`
+/// has shrunk to [`STATUS_COL_MIN`] and the `5h` stub has dropped — because a
+/// clipped name still identifies the row (the full id is in the detail pane),
+/// while a table ratatui shaves column-by-column reads `gr`/`CO`.
+const NAME_COL_MIN: u16 = 7;
 /// Width of the reset-inventory column (.prd/16): 3 columns hold the header
 /// (`rst`) and every realistic cell — `?`, `—`, `3`, `3*`, `12` — so the
 /// column survives the narrow layout, where the width budget is tight.
 const RESET_COL_WIDTH: u16 = 3;
+/// Width of the `5h` column (.prd/18): a fixed 8-cell stub, never a stretchy
+/// gauge. The 5h limit is a Claude-only concept and carries the least
+/// scheduling signal, so it gets the minimum that holds every cell state —
+/// the widest is `◑ 100%!` (7) — and one cell of slack. Non-Claude rows render
+/// a dim `-` here.
+const FIVE_H_COL_WIDTH: u16 = 8;
+/// The `status` column is the width sponge (.prd/18 rule 4): it renders at
+/// [`STATUS_COL_MAX`] whenever the row fits, and absorbs the whole deficit
+/// down to [`STATUS_COL_MIN`] before any other column gives way. Below that
+/// floor the reason text ("cooldown 3m12s") stops being readable at all, so
+/// the `5h` column drops instead.
+const STATUS_COL_MAX: usize = 20;
+const STATUS_COL_MIN: usize = 8;
 /// Width at/above which the middle row fits summary + detail side by side.
 const SIDE_BY_SIDE_AT: u16 = 110;
 /// Default rows shown in the always-visible compact model strip (req12; Z
@@ -201,7 +220,7 @@ pub(crate) fn draw(
     let ctx = FrameCtx {
         now,
         tz_offset: format::local_offset_secs(now),
-        order: view.display_order(now),
+        order: view.display_order(chrome.account_sort, now),
         headers_only: select::headers_only_mode(&view.snapshot, &view.select_params, None, now),
         frame: chrome.frame,
         mask: view.email_anonymous,
@@ -222,7 +241,15 @@ pub(crate) fn draw(
     let overlay_area = overlay_rect(frame.area(), event_banner_line(&view.events, now).is_some());
     match chrome.overlay {
         Overlay::None => {}
-        Overlay::Accounts => draw_accounts_overlay(frame, overlay_area, view, &ctx, chrome),
+        // The overlay draws the SAME accounts table as MAIN over the top of
+        // it, so its row rects replace MAIN's as this frame's click targets
+        // (.prd/19 rule 6 — a row click must work on both surfaces).
+        Overlay::Accounts => {
+            let rows = draw_accounts_overlay(frame, overlay_area, view, &ctx, chrome);
+            if let Some(hits) = hits.as_mut() {
+                hits.account_rows = rows;
+            }
+        }
         Overlay::Stats => draw_stats_overlay(frame, overlay_area, view, &ctx, chrome),
         Overlay::Usage => draw_usage_overlay(frame, overlay_area, view, chrome),
         Overlay::Logs => draw_logs_overlay(frame, overlay_area, view),
@@ -230,7 +257,7 @@ pub(crate) fn draw(
         Overlay::Misc => draw_misc_overlay(frame, overlay_area, view),
         Overlay::Perf => draw_perf_overlay(frame, overlay_area, view, &ctx, chrome),
         Overlay::Config => draw_config_overlay(frame, overlay_area, view, chrome, hits),
-        Overlay::Keys => draw_keys_overlay(frame, overlay_area, view),
+        Overlay::Keys => draw_keys_overlay(frame, overlay_area, view, chrome),
     }
 
     // The input modal (UI-6 item 3) draws LAST over MAIN + any overlay: a
@@ -251,6 +278,17 @@ pub(crate) fn draw(
         let raw_chrome = draw_raw_modal(frame, modal);
         if let Some(hits) = hits.as_mut() {
             hits.raw_modal = Some(raw_chrome);
+        }
+    }
+
+    // The account detail modal (.prd/19 rules 6–7) layers exactly like the
+    // input modal: over MAIN and any overlay, under the footer, with its
+    // max-scroll (or the close signal for a vanished account) riding back on
+    // the hit record.
+    if let Some(modal) = &chrome.account_modal {
+        let max_scroll = draw_account_modal(frame, view, &ctx, chrome, modal);
+        if let Some(hits) = hits.as_mut() {
+            hits.account_modal_max_scroll = max_scroll;
         }
     }
 
@@ -423,6 +461,7 @@ fn draw_main(
         settings,
         // Filled in by `draw` after the modal (if any) renders over MAIN.
         input_modal_max_scroll: None,
+        account_modal_max_scroll: None,
         raw_modal: None,
     });
     // Footer slot reserved in the layout; the real footer is drawn by `draw`
@@ -601,13 +640,13 @@ fn draw_accounts_overlay(
     view: &DashboardView,
     ctx: &FrameCtx,
     chrome: &Chrome,
-) {
+) -> Vec<AccountRowHit> {
     frame.render_widget(Clear, area);
     let snapshot = &view.snapshot;
     let table_height = (snapshot.accounts.len().max(1) as u16).saturating_add(2);
     let [table_area, detail_area] =
         Layout::vertical([Constraint::Length(table_height), Constraint::Min(3)]).areas(area);
-    let _ = draw_accounts(frame, table_area, view, ctx, chrome);
+    let account_rows = draw_accounts(frame, table_area, view, ctx, chrome);
     if snapshot.accounts.is_empty() {
         let empty = Paragraph::new(Line::from(Span::styled(
             "no accounts — press a to add an API key, n to start a browser login",
@@ -618,6 +657,7 @@ fn draw_accounts_overlay(
     } else {
         draw_detail(frame, detail_area, view, ctx, chrome);
     }
+    account_rows
 }
 
 /// Stats overlay (`g`): the detailed per-model usage table + drill-down (req13;
@@ -1999,21 +2039,180 @@ fn draw_perf_table(frame: &mut Frame, area: Rect, series: &[PerfAgg], cursor: us
 
 /// Misc overlay (`?`, UI-3 U6 "기타"): the everything-else surface —
 /// keybindings and build/daemon facts. Read-only.
-/// Client-key panel (multi-tenant #22, `K` / the "keys" tab): every issued
-/// key joined with its tenant usage — name, email, kind, state, requests,
-/// ok/err, tokens, API-equivalent cost, and the used-from → used-to span —
-/// followed by dim per-model breakdown rows. Builtin buckets (`local` /
-/// `legacy` / `unknown`) render when they carry usage, so the admin's view
-/// accounts for EVERY request, keyed or not. Read-only: mutations stay in
-/// the CLI/API (admin-gated), so the attach-mode panel is safe everywhere.
-fn draw_keys_overlay(frame: &mut Frame, area: Rect, view: &DashboardView) {
-    frame.render_widget(Clear, area);
-    let header = [
-        "key", "name", "kind", "state", "req", "ok/err", "in", "out", "cost", "used",
-    ];
-    let mut rows: Vec<Row> = Vec::new();
-    // Issued keys first (usage joined by id), then builtin buckets with usage.
-    let usage_of = |id: &str| view.tenant_usage.iter().find(|t| t.tenant == id);
+/// One flattened row of the keys panel (keys-history K-0): either an issued
+/// key / builtin bucket, or one of its per-model breakdown rows. Built ONCE
+/// per frame and shared by the renderer and the scroll handler, so "how many
+/// rows can I scroll through" and "what is drawn" can never disagree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct KeysRow {
+    /// Display cells, in header order.
+    pub cells: Vec<String>,
+    pub kind: KeysRowKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeysRowKind {
+    /// An issued key, with the state its row is colored by.
+    Key(KeyState),
+    /// A builtin attribution bucket (`local`/`legacy`/`unknown`).
+    Builtin,
+    /// A per-model breakdown row under the row above it.
+    Model,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeyState {
+    Active,
+    Suspended,
+    Revoked,
+}
+
+impl KeyState {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Suspended => "suspended",
+            Self::Revoked => "revoked",
+        }
+    }
+
+    fn color(self) -> Color {
+        match self {
+            Self::Active => Color::Green,
+            Self::Suspended => Color::Yellow,
+            Self::Revoked => Color::Red,
+        }
+    }
+}
+
+/// One column of the keys table. NAME is first (the operator identifies a
+/// tenant by person/machine, not by an opaque id) and is the only flexible
+/// column; the rest are fixed-width and are shed — widest-and-least-valuable
+/// first — when the frame cannot hold them all.
+pub(crate) struct KeysColumn {
+    pub header: &'static str,
+    /// Fixed width in display cells (ignored for the name column, which fills).
+    pub width: u16,
+    /// Shed order when the frame is too narrow: HIGHER goes first. `0` = never
+    /// dropped (the name column).
+    pub shed: u8,
+}
+
+/// The table's columns in render order. Shed ranks encode the user's own
+/// priorities: the name must survive (`docs/keys-history/spec.md` K-6), then
+/// the identifying key cell and the counts; the wide `used` span and the
+/// low-entropy `kind`/`state` words go first.
+pub(crate) const KEYS_COLUMNS: [KeysColumn; 10] = [
+    KeysColumn {
+        header: "name",
+        width: 0,
+        shed: 0,
+    },
+    KeysColumn {
+        header: "key",
+        width: KEY_CELL_WIDTH as u16,
+        shed: 2,
+    },
+    KeysColumn {
+        header: "kind",
+        width: 7,
+        shed: 8,
+    },
+    KeysColumn {
+        header: "state",
+        width: 9,
+        shed: 7,
+    },
+    KeysColumn {
+        header: "req",
+        width: 7,
+        shed: 1,
+    },
+    KeysColumn {
+        header: "ok/err",
+        width: 9,
+        shed: 6,
+    },
+    KeysColumn {
+        header: "in",
+        width: 8,
+        shed: 3,
+    },
+    KeysColumn {
+        header: "out",
+        width: 8,
+        shed: 4,
+    },
+    KeysColumn {
+        header: "cost",
+        width: 9,
+        shed: 5,
+    },
+    KeysColumn {
+        header: "used",
+        width: 23,
+        shed: 9,
+    },
+];
+
+/// Display cells the name column is never squeezed below. A 100-cell terminal
+/// used to starve `Fill(1)` to ZERO — the name header, every tenant name and
+/// every `└ group/model` label simply vanished (live capture, 2026-09-14).
+const NAME_MIN_WIDTH: u16 = 20;
+
+/// Display-cell budget of the `key` column — id + issued prefix, `…`-clipped.
+/// NEVER the secret: only the immutable attribution id and the display prefix
+/// the issuance already printed.
+const KEY_CELL_WIDTH: usize = 16;
+
+/// Which columns fit in `width` display cells, in render order. Always keeps
+/// the name column with at least [`NAME_MIN_WIDTH`] cells, shedding the rest
+/// by descending [`KeysColumn::shed`] until the budget fits. Derived, not a
+/// per-width lookup table, so any terminal size lands somewhere sensible.
+pub(crate) fn keys_visible_columns(width: u16) -> Vec<usize> {
+    let mut kept: Vec<usize> = (0..KEYS_COLUMNS.len()).collect();
+    // Fixed widths + one cell of spacing between columns (ratatui's default).
+    let budget = |kept: &Vec<usize>| -> u16 {
+        let fixed: u16 = kept.iter().skip(1).map(|&i| KEYS_COLUMNS[i].width).sum();
+        fixed + kept.len().saturating_sub(1) as u16
+    };
+    let shed_one = |kept: &mut Vec<usize>| {
+        if let Some(victim) = kept
+            .iter()
+            .copied()
+            .skip(1)
+            .max_by_key(|&i| KEYS_COLUMNS[i].shed)
+        {
+            kept.retain(|&i| i != victim);
+        }
+    };
+    while kept.len() > 1 && budget(&kept) + NAME_MIN_WIDTH > width {
+        shed_one(&mut kept);
+    }
+    // A frame too narrow even for the name minimum still renders the NAME: the
+    // other columns are gone and the name takes whatever is left.
+    while kept.len() > 1 && budget(&kept) > width {
+        shed_one(&mut kept);
+    }
+    kept
+}
+
+/// Flatten the keys panel into scrollable rows: every issued key (usage joined
+/// from the fetched document by attribution id) followed by its per-model
+/// rows, then every builtin bucket that carries usage in the current window.
+///
+/// The roster comes from the dashboard document (`client_keys` — metadata, no
+/// secrets); the NUMBERS come exclusively from the keys-usage answer, so a
+/// window/model filter applies to every figure on screen.
+pub(crate) fn keys_rows(view: &DashboardView, chrome: &Chrome) -> Vec<KeysRow> {
+    let empty = Vec::new();
+    let tenants = chrome
+        .keys
+        .doc
+        .as_ref()
+        .map(|d| &d.tenants)
+        .unwrap_or(&empty);
+    let mut rows: Vec<KeysRow> = Vec::new();
     let span_label = |first_ms: u64, last_ms: u64| {
         if first_ms == 0 {
             "never".to_string()
@@ -2025,118 +2224,271 @@ fn draw_keys_overlay(frame: &mut Frame, area: Rect, view: &DashboardView) {
             format!("{} → {}", stamp(first_ms), stamp(last_ms))
         }
     };
-    let push_models = |rows: &mut Vec<Row>, tenant: Option<&crate::dashboard::TenantUsageDoc>| {
-        if let Some(t) = tenant {
-            for m in &t.models {
-                rows.push(
-                    Row::new(vec![
-                        Cell::from(""),
-                        Cell::from(format!("  └ {}/{}", m.group, m.model)),
-                        Cell::from(""),
-                        Cell::from(""),
-                        Cell::from(format::human_count(m.requests)),
-                        Cell::from(""),
-                        Cell::from(format::human_count(m.tokens_in)),
-                        Cell::from(format::human_count(m.tokens_out)),
-                        Cell::from(format!("${:.2}", m.cost_usd)),
-                        Cell::from(""),
-                    ])
-                    .style(dim()),
-                );
-            }
+    let push_models = |rows: &mut Vec<KeysRow>,
+                       usage: Option<&crate::dashboard::TenantUsageDoc>| {
+        for m in usage.iter().flat_map(|t| t.models.iter()) {
+            rows.push(KeysRow {
+                cells: vec![
+                    format!("  └ {}/{}", m.group, m.model),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    format::human_count(m.requests),
+                    String::new(),
+                    format::human_count(m.tokens_in),
+                    format::human_count(m.tokens_out),
+                    format!("${:.2}", m.cost_usd),
+                    String::new(),
+                ],
+                kind: KeysRowKind::Model,
+            });
         }
     };
+
     for key in &view.client_keys {
-        let usage = usage_of(&key.id);
+        let usage = tenants.iter().find(|t| t.tenant == key.id);
         let state = if key.revoked_at_ms.is_some() {
-            Span::styled("revoked", Style::new().fg(Color::Red))
+            KeyState::Revoked
         } else if key.suspended {
-            Span::styled("suspended", Style::new().fg(Color::Yellow))
+            KeyState::Suspended
         } else {
-            Span::styled("active", Style::new().fg(Color::Green))
+            KeyState::Active
         };
         let name = match &key.email {
             Some(email) => format!("{} <{email}>", key.name),
             None => key.name.clone(),
         };
-        rows.push(Row::new(vec![
-            Cell::from(format!("{} ({}…)", key.id, key.key_prefix)),
-            Cell::from(name),
-            Cell::from(key.kind.clone()),
-            Cell::from(Line::from(state)),
-            Cell::from(format::human_count(usage.map(|t| t.requests).unwrap_or(0))),
-            Cell::from(match usage {
-                Some(t) => format!("{}/{}", t.ok, t.errors),
-                None => "—".into(),
-            }),
-            Cell::from(format::human_count(usage.map(|t| t.tokens_in).unwrap_or(0))),
-            Cell::from(format::human_count(
-                usage.map(|t| t.tokens_out).unwrap_or(0),
-            )),
-            Cell::from(match usage {
-                Some(t) => format!("${:.2}", t.cost_usd),
-                None => "—".into(),
-            }),
-            Cell::from(match usage {
-                Some(t) => span_label(t.first_ms, t.last_ms),
-                None => "never".into(),
-            }),
-        ]));
+        rows.push(KeysRow {
+            cells: vec![
+                name,
+                truncate_cells(&format!("{}·{}", key.id, key.key_prefix), KEY_CELL_WIDTH),
+                key.kind.clone(),
+                state.label().to_string(),
+                format::human_count(usage.map(|t| t.requests).unwrap_or(0)),
+                match usage {
+                    Some(t) => format!("{}/{}", t.ok, t.errors),
+                    None => "—".into(),
+                },
+                format::human_count(usage.map(|t| t.tokens_in).unwrap_or(0)),
+                format::human_count(usage.map(|t| t.tokens_out).unwrap_or(0)),
+                match usage {
+                    Some(t) => format!("${:.2}", t.cost_usd),
+                    None => "—".into(),
+                },
+                match usage {
+                    Some(t) => span_label(t.first_ms, t.last_ms),
+                    None => "never".into(),
+                },
+            ],
+            kind: KeysRowKind::Key(state),
+        });
         push_models(&mut rows, usage);
     }
-    for t in &view.tenant_usage {
+
+    for t in tenants {
         // Builtin buckets — anything not matching an issued key row above.
         if view.client_keys.iter().any(|k| k.id == t.tenant) {
             continue;
         }
-        rows.push(Row::new(vec![
-            Cell::from(t.tenant.clone()),
-            Cell::from(t.name.clone()),
-            Cell::from("builtin".to_string()),
-            Cell::from(""),
-            Cell::from(format::human_count(t.requests)),
-            Cell::from(format!("{}/{}", t.ok, t.errors)),
-            Cell::from(format::human_count(t.tokens_in)),
-            Cell::from(format::human_count(t.tokens_out)),
-            Cell::from(format!("${:.2}", t.cost_usd)),
-            Cell::from(span_label(t.first_ms, t.last_ms)),
-        ]));
+        rows.push(KeysRow {
+            cells: vec![
+                t.name.clone(),
+                truncate_cells(&t.tenant, KEY_CELL_WIDTH),
+                "builtin".to_string(),
+                String::new(),
+                format::human_count(t.requests),
+                format!("{}/{}", t.ok, t.errors),
+                format::human_count(t.tokens_in),
+                format::human_count(t.tokens_out),
+                format!("${:.2}", t.cost_usd),
+                span_label(t.first_ms, t.last_ms),
+            ],
+            kind: KeysRowKind::Builtin,
+        });
         push_models(&mut rows, Some(t));
     }
-    if rows.is_empty() {
-        let empty = Paragraph::new(vec![
+    rows
+}
+
+/// How many flattened rows the keys panel has this frame — the scroll
+/// handler's clamp (Up/Down/Page/Home/End must reach the LAST row).
+pub(crate) fn keys_row_count(view: &DashboardView, chrome: &Chrome) -> usize {
+    keys_rows(view, chrome).len()
+}
+
+/// Client-key panel (multi-tenant #22 + keys-history K, `K` / the "keys"
+/// tab): every issued key joined with its DURABLE per-tenant usage for the
+/// selected window and model filter — name first, then capped key metadata,
+/// kind, state, requests, ok/err, tokens, API-equivalent cost, and the
+/// used-from → used-to span — followed by dim per-model breakdown rows.
+/// Builtin buckets (`local` / `legacy` / `unknown`) render when they carry
+/// usage, so the admin's view accounts for EVERY request, keyed or not.
+///
+/// The table is scrolled by the panel's own offset (rows are sliced here, not
+/// clipped by the widget), so the final rows are reachable on any terminal
+/// height. Read-only: mutations stay in the CLI/API (admin-gated).
+fn draw_keys_overlay(frame: &mut Frame, area: Rect, view: &DashboardView, chrome: &Chrome) {
+    frame.render_widget(Clear, area);
+    let panel = &chrome.keys;
+    let rows = keys_rows(view, chrome);
+    let issued = view.client_keys.len();
+    let filter = if panel.models.is_empty() {
+        "all models".to_string()
+    } else {
+        format!("{} model(s)", panel.models.len())
+    };
+    let matched = panel.doc.as_ref().map(|d| d.rows).unwrap_or(0);
+    // While the legacy history is still migrating, every total on screen is a
+    // PARTIAL sum — say so in the title rather than let it read as final.
+    let importing = panel
+        .doc
+        .as_ref()
+        .filter(|d| d.health.importing)
+        .map(|d| format!(" · importing history {}%", d.health.import_pct))
+        .unwrap_or_default();
+    let title = format!(
+        " keys — {issued} issued · window {} · {filter} · {matched} requests{}{importing} ",
+        panel.window.as_str(),
+        if panel.loading { " · loading…" } else { "" }
+    );
+
+    // A failed or missing query NEVER renders as zeros: the panel says what it
+    // could not answer (keys-history K-5).
+    if let Some(err) = &panel.error {
+        let body = Paragraph::new(vec![
             Line::default(),
-            Line::from("  No client keys issued and no tenant usage yet."),
-            Line::from(
-                "  Issue one on the server:  llmux key new --name <pc> [--email addr] [--admin]",
-            ),
-            Line::from(
-                "  Then on the client PC set  remote.host + remote.api_key  and `llmux run`.",
-            ),
+            Line::from(Span::styled(
+                format!("  keys usage unavailable: {err}"),
+                Style::new().fg(Color::Red),
+            )),
+            Line::from("  press r to retry · w to change the window · K/Esc to go back"),
         ])
-        .block(Block::bordered().title(" keys — multi-tenant "));
-        frame.render_widget(empty, area);
+        .block(Block::bordered().title(title));
+        frame.render_widget(body, area);
+        draw_keys_picker(frame, area, panel);
         return;
     }
-    let constraints = [
-        Constraint::Length(22),
-        Constraint::Fill(1),
-        Constraint::Length(7),
-        Constraint::Length(9),
-        Constraint::Length(7),
-        Constraint::Length(9),
-        Constraint::Length(8),
-        Constraint::Length(8),
-        Constraint::Length(9),
-        Constraint::Length(23),
-    ];
-    let issued = view.client_keys.len();
-    let table = Table::new(rows, constraints)
+    if rows.is_empty() {
+        let body = if panel.doc.is_none() {
+            Paragraph::new(vec![
+                Line::default(),
+                Line::from("  loading keys usage…"),
+            ])
+        } else {
+            Paragraph::new(vec![
+                Line::default(),
+                Line::from("  No client keys issued and no tenant usage in this window."),
+                Line::from(
+                    "  Issue one on the server:  llmux key new --name <pc> [--email addr] [--admin]",
+                ),
+                Line::from(
+                    "  Then on the client PC set  remote.host + remote.api_key  and `llmux run`.",
+                ),
+            ])
+        }
+        .block(Block::bordered().title(title));
+        frame.render_widget(body, area);
+        draw_keys_picker(frame, area, panel);
+        return;
+    }
+
+    // Only the columns this frame can hold — the name is never one of the
+    // casualties (the `Fill(1)`-starved-to-zero bug).
+    let columns = keys_visible_columns(area.width.saturating_sub(2));
+    // Scrolling stops at the last FULL page: "End" means the end of the list,
+    // not one row floating over a blank screen. Every row stays reachable —
+    // the final page contains the final row.
+    let visible = (area.height.saturating_sub(3) as usize).max(1); // borders + header
+    let scroll = panel.scroll.min(rows.len().saturating_sub(visible));
+    let table_rows: Vec<Row> =
+        rows.iter()
+            .skip(scroll)
+            .map(|row| {
+                let cells: Vec<Cell> = columns
+                    .iter()
+                    .map(|&i| {
+                        let text = row.cells.get(i).cloned().unwrap_or_default();
+                        match (row.kind, KEYS_COLUMNS[i].header) {
+                            // The state column carries the key's live color.
+                            (KeysRowKind::Key(state), "state") => Cell::from(Line::from(
+                                Span::styled(text, Style::new().fg(state.color())),
+                            )),
+                            _ => Cell::from(text),
+                        }
+                    })
+                    .collect();
+                match row.kind {
+                    KeysRowKind::Model => Row::new(cells).style(dim()),
+                    _ => Row::new(cells),
+                }
+            })
+            .collect();
+    let constraints: Vec<Constraint> = columns
+        .iter()
+        .map(|&i| match i {
+            0 => Constraint::Fill(1),
+            _ => Constraint::Length(KEYS_COLUMNS[i].width),
+        })
+        .collect();
+    let header: Vec<&str> = columns.iter().map(|&i| KEYS_COLUMNS[i].header).collect();
+    let scrolled = if scroll > 0 {
+        format!(
+            "· rows {}-{}/{} ",
+            scroll + 1,
+            (scroll + visible).min(rows.len()),
+            rows.len()
+        )
+    } else {
+        String::new()
+    };
+    let table = Table::new(table_rows, constraints)
         .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)))
-        .block(Block::bordered().title(format!(
-            " keys — {issued} issued · per-tenant usage (admin view) "
-        )));
+        .block(Block::bordered().title(format!("{title}{scrolled}")));
     frame.render_widget(table, area);
+    draw_keys_picker(frame, area, panel);
+}
+
+/// The `f` multi-select model picker (keys-history K-0), drawn over the panel
+/// while open. Space toggles, `a` selects every offered model, `c` clears,
+/// Enter applies, Esc cancels.
+fn draw_keys_picker(frame: &mut Frame, area: Rect, panel: &crate::tui::KeysPanel) {
+    let Some(picker) = &panel.picker else {
+        return;
+    };
+    // Half the frame on a wide terminal, most of it on a narrow one: the key
+    // legend below is ~57 cells and must not be clipped at 80 columns.
+    let popup = centered_rect(area, if area.width < 130 { 80 } else { 50 }, 70);
+    frame.render_widget(Clear, popup);
+    let mut lines: Vec<Line> = Vec::new();
+    if picker.options.is_empty() {
+        lines.push(Line::from("  no models observed in this window"));
+    }
+    // Keep the cursor in view on a short popup: scroll by whole rows.
+    let visible = popup.height.saturating_sub(4) as usize;
+    let first = picker.cursor.saturating_sub(visible.saturating_sub(1));
+    for (i, model) in picker.options.iter().enumerate().skip(first) {
+        let marker = if picker.selected.contains(model) {
+            "[x]"
+        } else {
+            "[ ]"
+        };
+        let line = Line::from(format!(" {marker} {model}"));
+        lines.push(if i == picker.cursor {
+            line.style(Style::new().fg(Color::Black).bg(Color::Cyan))
+        } else {
+            line
+        });
+    }
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled(
+        " Space toggle · a all · c clear · Enter apply · Esc cancel",
+        dim(),
+    )));
+    let title = format!(" models — {} selected ", picker.selected.len());
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::bordered().title(title)),
+        popup,
+    );
 }
 
 fn draw_misc_overlay(frame: &mut Frame, area: Rect, view: &DashboardView) {
@@ -3093,6 +3445,501 @@ fn draw_input_modal(frame: &mut Frame, view: &DashboardView, modal: &InputModal)
     Some(max_scroll)
 }
 
+/// One section header inside the account modal: dim + bold, flush left, so the
+/// dense body reads as blocks without spending a row on a blank separator (the
+/// full dump does not fit an 80×24 modal as it is).
+fn modal_section(name: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        name.to_string(),
+        dim().add_modifier(Modifier::BOLD),
+    ))
+}
+
+/// One `label  value` row inside the account modal. Unknown/absent values are
+/// the caller's `—`, never an invented zero.
+fn modal_row(label: &str, value: String) -> Line<'static> {
+    modal_row_spans(label, vec![Span::raw(value)])
+}
+
+/// [`modal_row`] with a pre-styled value (status verdicts, token health).
+fn modal_row_spans(label: &str, value: Vec<Span<'static>>) -> Line<'static> {
+    let mut spans = vec![Span::styled(format!(" {label:<10}"), dim())];
+    spans.extend(value);
+    Line::from(spans)
+}
+
+/// Body of the account detail modal (.prd/19 rule 7): EVERY per-account datum
+/// the view holds, in labeled sections. Split out of [`draw_account_modal`] so
+/// the assembly stays testable as data and the draw function stays layout-only.
+fn account_modal_lines(
+    view: &DashboardView,
+    ctx: &FrameCtx,
+    chrome: &Chrome,
+    account: &AccountSnapshot,
+) -> Vec<Line<'static>> {
+    let snapshot = &view.snapshot;
+    let params = &view.select_params;
+    let now = ctx.now;
+    // BOTH degraded-mode flags are decided PER GROUP by the selector
+    // (`headers_only_mode`/`heuristic_degraded_mode` with `Some(group)`), while
+    // `ctx.headers_only` is the frame-wide, group-less flag. In a mixed pool
+    // (every claude account usage-stale or heuristic-parked, one codex account
+    // eligible) the global flags are false while the claude group's are true —
+    // so this modal asks the account's OWN group and gates exactly as
+    // `pick_scoped` does for a NonFable request (`gate_scoped` with both flags),
+    // or it prints a blocked state the claude selector does not believe.
+    let headers_only = select::headers_only_mode(snapshot, params, Some(account.group), now);
+    let heuristic_degraded =
+        select::heuristic_degraded_mode(snapshot, params, Some(account.group), now);
+    let gate = select::gate_scoped(
+        account,
+        params,
+        now,
+        headers_only,
+        heuristic_degraded,
+        select::RequestScope::NonFable,
+    );
+    let dash = "—".to_string();
+    let abs = |at: SystemTime| format::absolute_label(at, now, ctx.tz_offset);
+    // A future instant as "countdown (absolute)"; a past one says so rather
+    // than rendering a bogus countdown.
+    let until = |at: SystemTime| match at.duration_since(now) {
+        Ok(left) => format!("{} ({})", select::compact_duration(left), abs(at)),
+        Err(_) => format!("elapsed ({})", abs(at)),
+    };
+    let ago = |at: SystemTime| match now.duration_since(at) {
+        Ok(age) => format!("{} ago ({})", select::compact_duration(age), abs(at)),
+        Err(_) => format!("ahead ({})", abs(at)),
+    };
+    let yes_no = |b: bool| if b { "yes" } else { "no" };
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    // --- identity ----------------------------------------------------------
+    let pos = ctx
+        .order
+        .iter()
+        .position(|&i| snapshot.accounts[i].id == account.id);
+    lines.push(modal_section("identity"));
+    lines.push(modal_row("name", masked_name(&account.id.0, ctx.mask)));
+    lines.push(modal_row(
+        "auth",
+        format!(
+            "{} · group {} · healthy {} · paused {} · urgent {}",
+            account.credential_kind,
+            account.group.as_str(),
+            yes_no(account.healthy),
+            yes_no(account.paused),
+            yes_no(triage::urgent(account, gate)),
+        ),
+    ));
+    lines.push(modal_row(
+        "order",
+        match pos {
+            Some(pos) => format!(
+                "#{} of {} · sort {}",
+                pos + 1,
+                ctx.order.len(),
+                chrome.account_sort.label()
+            ),
+            None => format!("— · sort {}", chrome.account_sort.label()),
+        },
+    ));
+
+    // --- status / gate -----------------------------------------------------
+    lines.push(modal_section("status"));
+    lines.push(modal_row_spans(
+        "gate",
+        vec![status_span(
+            account,
+            gate,
+            snapshot.is_current(&account.id),
+            params,
+            now,
+            ctx.frame,
+        )],
+    ));
+    if let Some(reason) = gate {
+        lines.push(modal_row(
+            "blocked",
+            select::blocking_reason(account, reason, params, now),
+        ));
+    }
+    if heuristic_degraded {
+        // Why a heuristic-parked account above still reads `ready`: the whole
+        // group is heuristic-locked, so the selector drops that cooldown gate.
+        // The `cooldown` section below still prints the park itself.
+        lines.push(modal_row(
+            "degraded",
+            "group heuristic lockout — cooldown gate dropped for this group".to_string(),
+        ));
+    }
+    let groups_for =
+        |map: &std::collections::BTreeMap<BackendGroup, crate::scheduler::AccountId>| {
+            let names: Vec<&str> = map
+                .iter()
+                .filter(|(_, id)| **id == account.id)
+                .map(|(group, _)| group.as_str())
+                .collect();
+            if names.is_empty() {
+                dash.clone()
+            } else {
+                names.join("+")
+            }
+        };
+    let pin = snapshot
+        .manual_pin
+        .iter()
+        .find(|(_, pin)| pin.account == account.id)
+        .map(|(group, pin)| format!("{} {}", group.as_str(), until(pin.until)))
+        .unwrap_or_else(|| dash.clone());
+    lines.push(modal_row(
+        "current",
+        format!(
+            "{} · fable {} · pin {pin}",
+            groups_for(&snapshot.current),
+            groups_for(&snapshot.fable_current),
+        ),
+    ));
+    lines.push(modal_row("in-flight", account.in_flight.to_string()));
+
+    // --- token -------------------------------------------------------------
+    // Timestamps and counts only: no credential byte ever reaches this modal.
+    lines.push(modal_section("token"));
+    lines.push(modal_row_spans(
+        "token",
+        token_detail_spans(account, view.refresh_ahead, now, ctx.tz_offset),
+    ));
+    lines.push(modal_row(
+        "stamps",
+        format!(
+            "expires_at {} · last_refresh {}",
+            account
+                .token_expires_at_ms
+                .map(|ms| format!("{ms} ({})", abs(UNIX_EPOCH + Duration::from_millis(ms))))
+                .unwrap_or_else(|| dash.clone()),
+            account
+                .last_refresh_ms
+                .map(|ms| format!("{ms} ({})", abs(UNIX_EPOCH + Duration::from_millis(ms))))
+                .unwrap_or_else(|| dash.clone()),
+        ),
+    ));
+
+    // --- 5h / 7d windows ---------------------------------------------------
+    let consecutive_failures = view
+        .poll_health
+        .get(&account.id.0)
+        .map_or(0, |h| h.consecutive_failures);
+    let max_age = params.usage_max_age;
+    let raw_window = |window: &Option<QuotaWindow>| match window {
+        None => format!(
+            "{dash} · state {}",
+            classify_window_display(window, now, max_age, consecutive_failures).label()
+        ),
+        Some(w) => format!(
+            "util {:.3} · eff {:.3} · resets {} · fetched {} · {} · expired {} · state {}",
+            w.utilization,
+            w.effective_utilization(now),
+            abs(w.resets_at),
+            ago(w.fetched_at),
+            match w.source {
+                crate::scheduler::window::WindowSource::Headers => "headers",
+                crate::scheduler::window::WindowSource::UsagePoll => "poll",
+            },
+            yes_no(w.is_expired(now)),
+            classify_window_display(window, now, max_age, consecutive_failures).label(),
+        ),
+    };
+    // The detail pane's own window line, re-labeled to the modal's wider label
+    // column (its first span IS the label — dropped here, never re-formatted),
+    // so `5h` and `5h raw` line their values up.
+    let window_line = |name: &'static str, window: &Option<QuotaWindow>| {
+        modal_row_spans(
+            name,
+            window_detail_line(name, window, ctx, max_age, consecutive_failures)
+                .spans
+                .into_iter()
+                .skip(1)
+                .collect(),
+        )
+    };
+    lines.push(modal_section("windows"));
+    lines.push(window_line("5h", &account.five_hour));
+    lines.push(modal_row("5h raw", raw_window(&account.five_hour)));
+    lines.push(window_line("7d", &account.seven_day));
+    lines.push(modal_row("7d raw", raw_window(&account.seven_day)));
+
+    // --- model-scoped limits ----------------------------------------------
+    let fable_ceiling = select::effective_limits(account, params).2;
+    lines.push(modal_section("scoped"));
+    if account.scoped_limits.is_empty() {
+        lines.push(modal_row("scope", format!("{dash} (none recorded)")));
+    }
+    for scoped in &account.scoped_limits {
+        let window = &scoped.window;
+        lines.push(modal_row(
+            &scoped.scope_label,
+            format!(
+                "{} · resets {} · severity {} · active {}",
+                format::percent(window.effective_utilization(now)),
+                until(window.resets_at),
+                scoped.severity.label(),
+                yes_no(scoped.is_active),
+            ),
+        ));
+        lines.push(modal_row(
+            &format!("{} raw", scoped.scope_label),
+            format!(
+                "util {:.3} · constraining {} (ceiling {}) · fetched {}",
+                window.utilization,
+                yes_no(scoped.is_constraining(now, fable_ceiling)),
+                format::percent(fable_ceiling),
+                ago(window.fetched_at),
+            ),
+        ));
+    }
+
+    // --- cooldowns ---------------------------------------------------------
+    lines.push(modal_section("cooldown"));
+    lines.push(modal_row(
+        "account",
+        match account.cooldown_until {
+            None => format!("none · source {dash}"),
+            Some(at) => format!(
+                "until {} · source {}",
+                until(at),
+                match account.cooldown_source {
+                    Some(crate::scheduler::CooldownSource::RetryAfter) => "retry-after",
+                    Some(crate::scheduler::CooldownSource::Heuristic) => "heuristic",
+                    None => "—",
+                }
+            ),
+        },
+    ));
+    if account.scoped_cooldowns.is_empty() {
+        lines.push(modal_row("scoped", format!("{dash} (none parked)")));
+    }
+    for cooldown in &account.scoped_cooldowns {
+        lines.push(modal_row(
+            cooldown.scope.label().unwrap_or("account-wide"),
+            format!(
+                "until {} · set {} · reason {:?}",
+                until(cooldown.until),
+                ago(cooldown.set_at),
+                cooldown.reason,
+            ),
+        ));
+    }
+
+    // --- ceilings ----------------------------------------------------------
+    let (five_max, seven_max, fable_max) = select::effective_limits(account, params);
+    let override_of = |value: Option<f64>, global: f64| match value {
+        Some(v) => format!("{} (override)", format::percent(v)),
+        None => format!("{dash} (global {})", format::percent(global)),
+    };
+    lines.push(modal_section("limits"));
+    lines.push(modal_row(
+        "override",
+        format!(
+            "5h {} · 7d {} · fbl {}",
+            override_of(account.limits.five_hour_max, params.five_hour_max),
+            override_of(account.limits.seven_day_max, params.seven_day_max),
+            override_of(account.limits.fable_weekly_max, params.fable_weekly_max),
+        ),
+    ));
+    lines.push(modal_row(
+        "effective",
+        format!(
+            "5h {} · 7d {} · fbl {}",
+            format::percent(five_max),
+            format::percent(seven_max),
+            format::percent(fable_max),
+        ),
+    ));
+
+    // --- lifetime totals ---------------------------------------------------
+    let totals = view.totals_for(&account.id.0);
+    lines.push(modal_section("lifetime"));
+    lines.push(modal_row(
+        "requests",
+        format!(
+            "{} req · {} ok · {} err",
+            format::human_count(totals.requests),
+            format::human_count(totals.ok),
+            format::human_count(totals.errors),
+        ),
+    ));
+    lines.push(modal_row(
+        "tokens",
+        format!(
+            "in {} · out {} · total {}",
+            format::human_count(totals.tokens_in),
+            format::human_count(totals.tokens_out),
+            format::human_count(totals.tokens_in.saturating_add(totals.tokens_out)),
+        ),
+    ));
+
+    // --- usage poller health ----------------------------------------------
+    lines.push(modal_section("poll"));
+    match view.poll_health(&account.id.0) {
+        Some(health) => {
+            lines.push(modal_row(
+                "health",
+                format!(
+                    "{} · failures {}",
+                    health
+                        .last_ok
+                        .map(|at| format!("ok {}", ago(at)))
+                        .unwrap_or_else(|| "no success yet".into()),
+                    health.consecutive_failures,
+                ),
+            ));
+            lines.push(modal_row("next", until(health.next_at)));
+        }
+        None if account.credential_kind == "oauth" => {
+            lines.push(modal_row("health", "not polled yet".into()))
+        }
+        // apikey/codex accounts have no Anthropic usage endpoint to poll.
+        None => lines.push(modal_row(
+            "health",
+            format!("n/a ({})", account.credential_kind),
+        )),
+    }
+
+    // --- usage controls (.prd/16) ------------------------------------------
+    lines.push(modal_section("resets"));
+    match view.usage_control(&account.id.0) {
+        None => lines.push(modal_row(
+            "control",
+            super::view::reset_detail(None, account.credential_kind, now),
+        )),
+        Some(control) => {
+            lines.push(modal_row(
+                "counts",
+                format!(
+                    "available {} · applicable {}",
+                    control
+                        .available_resets
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|| dash.clone()),
+                    control
+                        .applicable_resets
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|| dash.clone()),
+                ),
+            ));
+            lines.push(modal_row(
+                "credits",
+                if control.credits.is_empty() {
+                    format!("{dash} (none listed)")
+                } else {
+                    format!("{} listed", control.credits.len())
+                },
+            ));
+            for (i, credit) in control.credits.iter().enumerate() {
+                let field = |value: &Option<String>| value.clone().unwrap_or_else(|| dash.clone());
+                lines.push(modal_row(
+                    &format!("#{}", i + 1),
+                    format!(
+                        "id {} · type {} · status {} · granted {} · expires {} · title {} · desc {}",
+                        field(&credit.id),
+                        field(&credit.reset_type),
+                        field(&credit.status),
+                        field(&credit.granted_at),
+                        field(&credit.expires_at),
+                        field(&credit.title),
+                        field(&credit.description),
+                    ),
+                ));
+            }
+            let stamp = |ms: Option<u64>| {
+                ms.map(|ms| ago(UNIX_EPOCH + Duration::from_millis(ms)))
+                    .unwrap_or_else(|| dash.clone())
+            };
+            lines.push(modal_row(
+                "last",
+                format!(
+                    "refresh {} · reset {} · error {} ({})",
+                    stamp(control.last_refresh_ms),
+                    stamp(control.last_reset_ms),
+                    control.last_error.clone().unwrap_or_else(|| dash.clone()),
+                    stamp(control.last_error_ms),
+                ),
+            ));
+            lines.push(modal_row(
+                "pending",
+                format!(
+                    "request {} · credit {}",
+                    control
+                        .pending_request_id
+                        .clone()
+                        .unwrap_or_else(|| dash.clone()),
+                    control
+                        .pending_credit_id
+                        .clone()
+                        .unwrap_or_else(|| dash.clone()),
+                ),
+            ));
+        }
+    }
+    lines
+}
+
+/// The account detail modal (.prd/19 rules 6–7): everything the view records
+/// about ONE account, opened by a left-click on its table row and pinned to
+/// the account's REAL id. `None` = that id is no longer in the snapshot, the
+/// runtime's signal to close the modal (same contract as the input modal's
+/// aged-out entry).
+fn draw_account_modal(
+    frame: &mut Frame,
+    view: &DashboardView,
+    ctx: &FrameCtx,
+    chrome: &Chrome,
+    modal: &AccountModal,
+) -> Option<u16> {
+    let account = view
+        .snapshot
+        .accounts
+        .iter()
+        .find(|a| a.id.0 == modal.account)?;
+
+    let area = centered_rect(frame.area(), 80, 85);
+    frame.render_widget(Clear, area);
+
+    let title = format!(
+        " 🔍 account — {} · {} · {} ",
+        masked_name(&account.id.0, ctx.mask),
+        account.credential_kind,
+        account.group.as_str().to_uppercase(),
+    );
+    let block = Block::new()
+        .borders(Borders::ALL)
+        .border_style(dim())
+        .title(Span::styled(
+            title,
+            Style::new().add_modifier(Modifier::BOLD),
+        ))
+        .title_bottom(Line::from(Span::styled(" ↑↓ scroll · esc close ", dim())).centered());
+    let inner = block.inner(area);
+
+    let lines = account_modal_lines(view, ctx, chrome, account);
+    let total: usize = lines
+        .iter()
+        .map(|line| {
+            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            wrapped_line_count(&text, inner.width)
+        })
+        .sum();
+    let max_scroll = (total as u16).saturating_sub(inner.height);
+    let scroll = modal.scroll.min(max_scroll);
+
+    let para = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false })
+        .scroll((scroll, 0));
+    frame.render_widget(para, area);
+    Some(max_scroll)
+}
+
 // ---------------------------------------------------------------------------
 // Raw request/response viewer (UI-7): a CDT-style modal over MAIN with
 // Request/Response tabs — general metadata, headers, and the FULL captured
@@ -3919,7 +4766,11 @@ fn draw_accounts(
     chrome: &Chrome,
 ) -> Vec<AccountRowHit> {
     let snapshot = &view.snapshot;
-    let block = Block::new().borders(Borders::TOP).title(" accounts ");
+    // The title carries the active within-group order (`o` toggles it), so the
+    // operator never has to guess why two rows swapped.
+    let block = Block::new()
+        .borders(Borders::TOP)
+        .title(format!(" accounts · sort {} ", chrome.account_sort.label()));
     if snapshot.accounts.is_empty() {
         let empty = Paragraph::new(Line::from(Span::styled(
             "no accounts — run `llmux login` or `llmux import`, then press R",
@@ -3929,25 +4780,22 @@ fn draw_accounts(
         frame.render_widget(empty, area);
         return Vec::new();
     }
-    let mut show_fable = view.show_fable_weekly;
+    let show_fable = view.show_fable_weekly;
     // Reset-inventory column (.prd/16): shown only when the daemon reports
     // usage-control metadata at all, so an older daemon's table is
     // byte-identical to before. Compact by design — `3`, `3*`, `?`, `—` all fit
     // in 3 cells, so the column survives the narrow layout where a gauge
     // would not.
     let show_resets = !view.usage_controls.is_empty();
-    let reset_extra = if show_resets {
-        RESET_COL_WIDTH as usize + 1
-    } else {
-        0
-    };
     // The account column is a fixed `Length(name_width)` that fits the widest
     // display name up to NAME_COL_MAX (floor = the header word "account").
     // Because it is Length, not Min, leftover width after the fixed data
     // columns is NO LONGER poured into it (Z 2026-07-13: supersedes the
     // 2026-07-09 "남는 공간을 account에 최대 할당" directive — that made the
     // column too wide). Names longer than the cap are clipped by the cell.
-    let name_width = (ctx
+    // This is the width the CONTENT wants; a tight terminal shaves it down to
+    // NAME_COL_MIN as the last give-way step below.
+    let name_wanted = (ctx
         .order
         .iter()
         .map(|&idx| {
@@ -3959,87 +4807,85 @@ fn draw_accounts(
         .unwrap_or(0)
         .max("account".len()) as u16)
         .min(NAME_COL_MAX);
-    // The wide column set is used whenever it actually FITS (Z 2026-07-13:
-    // the fixed 150 threshold predated the NAME_COL_MAX cap — at ~149 cols it
-    // hid req/tok and poured the width into fat bars instead). Minimum wide
-    // width = the wide fixed columns + minimum-size gauges + column spacing,
-    // mirroring the bar_width math below. WIDE_TABLE_AT now governs only the
-    // models table.
-    let wide = {
-        let n_gauges = 2 + show_fable as usize;
-        let min_wide = 47
-            + name_width as usize
+    // Minimum width of the whole row (.prd/18): every column at its floor —
+    // the stretchy gauges at QUOTA_CELL_WIDTH, the `5h` stub at
+    // FIVE_H_COL_WIDTH, `status` and `account` at whatever width is being
+    // tried — plus the one-column gap between each pair of columns. Single
+    // source for the four decisions below (wide set / 5h drop / name width /
+    // status width) and for the leftover poured into the bars, so those can
+    // never disagree about a column sum.
+    //
+    // Column sums (load-bearing, pinned by the tests):
+    //   wide   = marker 2 + group 7 + # 2 + status + account + 5h + gauges +
+    //            rst + if 3 + req 6 + tok 7  → 27 fixed, 8 non-gauge columns
+    //   narrow = the same minus req/tok      → 14 fixed, 6 non-gauge columns
+    // `n_gauges` is the count of STRETCHY gauge columns: `7d`, plus `7d Fbl`
+    // when the toggle is on. The Fbl gauge is a full gauge in BOTH sets and
+    // never gives way (.prd/18 rule 3 — the old compact `F 22h!` marker and
+    // its narrow drop are gone).
+    let n_gauges = 1 + show_fable as usize;
+    let row_min = |wide: bool, status_w: usize, with_five_h: bool, name_w: usize| -> usize {
+        let (fixed, base_cols) = if wide { (27, 8) } else { (14, 6) };
+        let width = fixed
+            + status_w
+            + name_w
             + n_gauges * QUOTA_CELL_WIDTH
-            + (8 + n_gauges - 1)
-            + reset_extra;
-        area.width as usize >= min_wide
-    };
-    // Narrow + reset column: if the row STILL does not fit, the compact Fbl
-    // marker is the one column that gives way. Without this the table overflows
-    // and ratatui shaves every column instead — the 100-col frame rendered
-    // `gr`/`CO` for group and squeezed the status/gauges (runtime QA). Priority
-    // at a tight width is identity first (group + account), then the quota
-    // gauges, then `rst`; the Fable percent is one keystroke away in the detail
-    // pane and returns as soon as the terminal is wide enough.
-    if !wide && show_fable {
-        // The same sum the narrow branch of `bar_width` builds below, with the
-        // Fbl column included: 34 fixed + name + the two gauge cells + Fbl 7 +
-        // `rst`, plus one space between each pair of columns.
-        let ncols = 9 + show_resets as usize;
-        let fixed = 34
-            + name_width as usize
-            + 2 * QUOTA_CELL_WIDTH
-            + 7
+            + if with_five_h {
+                FIVE_H_COL_WIDTH as usize
+            } else {
+                0
+            }
             + if show_resets {
                 RESET_COL_WIDTH as usize
             } else {
                 0
             };
-        show_fable = fixed + (ncols - 1) <= area.width as usize;
-    }
-    // Leftover terminal width — everything past the FIXED columns and the 1-col
-    // inter-column spacing — is poured into the quota gauge BARS instead of
-    // dying as dead space on the right (Z 2026-07-13, follow-up to the
-    // NAME_COL_MAX cap: every column is a fixed `Length` now, so without this
-    // the table packs left and wastes the right edge). Each STRETCHY gauge
-    // column grows its bar by an equal share of the leftover; the compact
-    // narrow Fbl marker never stretches. Floor = QUOTA_BAR_WIDTH (leftover 0 →
+        let ncols = base_cols + n_gauges + with_five_h as usize + show_resets as usize;
+        width + (ncols - 1)
+    };
+    let avail = area.width as usize;
+    // The wide column set is used whenever it actually FITS (Z 2026-07-13:
+    // the fixed 150 threshold predated the NAME_COL_MAX cap — at ~149 cols it
+    // hid req/tok and poured the width into fat bars instead). "Fits" is judged
+    // at the same minimums the constraints use — status at its floor, the 5h
+    // stub present, the name at the width its content wants — so the set flips
+    // only when req/tok genuinely have no room, and the wide set never buys
+    // itself room by clipping names. WIDE_TABLE_AT now governs only the models
+    // table.
+    let wide = row_min(true, STATUS_COL_MIN, true, name_wanted as usize) <= avail;
+    // Give-way order (.prd/18 rule 4, owner 2026-09-18 "status 창부터 줄여줘
+    // (최소칸 8칸)"), each step taken only when the one before it was not
+    // enough:
+    //   1. `status` shrinks 20 → 8,
+    //   2. the `5h` stub drops whole (header, constraint and cell together),
+    //   3. the `account` column shrinks to NAME_COL_MIN (names clip; the full
+    //      id stays in the detail pane),
+    //   4. below that the table clips as it always did — ratatui shaves the
+    //      columns. Narrow minimum with Fbl + `rst` on = 74 cols (14 + 8 + 7 +
+    //      2×17 + 3 + 8 spaces), 70 without `rst`.
+    // The gauges never give way: `7d` and `7d Fbl` keep QUOTA_CELL_WIDTH at
+    // every width.
+    let show_five_h = row_min(wide, STATUS_COL_MIN, true, name_wanted as usize) <= avail;
+    let name_width = (avail.saturating_sub(row_min(wide, STATUS_COL_MIN, show_five_h, 0)) as u16)
+        .clamp(NAME_COL_MIN, name_wanted);
+    let status_width = avail
+        .saturating_sub(row_min(wide, 0, show_five_h, name_width as usize))
+        .clamp(STATUS_COL_MIN, STATUS_COL_MAX) as u16;
+    // Leftover terminal width — everything past the FIXED columns, the gauge
+    // minimums and the 1-col inter-column spacing — is poured into the quota
+    // gauge BARS instead of dying as dead space on the right (Z 2026-07-13,
+    // follow-up to the NAME_COL_MAX cap: every column is a fixed `Length` now,
+    // so without this the table packs left and wastes the right edge). Each
+    // stretchy gauge column grows its bar by an equal share; the fixed `5h`
+    // stub and `rst` never stretch. Floor = QUOTA_BAR_WIDTH (leftover 0 →
     // today's exact layout), ceiling = GAUGE_BAR_MAX.
     let bar_width = {
-        // `fixed_total` sums the constraint Lengths exactly as built below
-        // (name + the base QUOTA_CELL_WIDTH gauge cells + the conditional
-        // compact-7 Fbl marker) plus the (ncols - 1) inter-column spaces; the
-        // `n_gauges` stretchy gauge columns share whatever width is left.
-        let n_gauges = if wide { 2 + show_fable as usize } else { 2 };
-        let (fixed_total, ncols) = if wide {
-            // marker 2 + group 7 + # 2 + status 20 + if 3 + req 6 + tok 7 = 47,
-            // plus the compact reset column when shown (it does NOT stretch).
-            let ncols = 8 + n_gauges + show_resets as usize;
-            let fixed = 47
-                + name_width as usize
-                + n_gauges * QUOTA_CELL_WIDTH
-                + if show_resets {
-                    RESET_COL_WIDTH as usize
-                } else {
-                    0
-                };
-            (fixed, ncols)
-        } else {
-            // marker 2 + group 7 + # 2 + status 20 + if 3 = 34, + the compact
-            // 7-wide Fbl marker when shown (it does NOT stretch), + `rst`.
-            let ncols = 8 + show_fable as usize + show_resets as usize;
-            let fixed = 34
-                + name_width as usize
-                + 2 * QUOTA_CELL_WIDTH
-                + if show_fable { 7 } else { 0 }
-                + if show_resets {
-                    RESET_COL_WIDTH as usize
-                } else {
-                    0
-                };
-            (fixed, ncols)
-        };
-        let leftover = (area.width as usize).saturating_sub(fixed_total + (ncols - 1));
+        let leftover = avail.saturating_sub(row_min(
+            wide,
+            status_width as usize,
+            show_five_h,
+            name_width as usize,
+        ));
         (QUOTA_BAR_WIDTH + leftover / n_gauges).min(GAUGE_BAR_MAX)
     };
     let gauge_cell = (bar_width + 1 + QUOTA_LABEL_WIDTH) as u16;
@@ -4061,7 +4907,17 @@ fn draw_accounts(
     let rows = ctx.order.iter().enumerate().map(|(pos, &account_idx)| {
         let account = &snapshot.accounts[account_idx];
         let cursor = selected == Some(pos);
-        let row = account_row(account, view, ctx, pos, wide, cursor, bar_width, show_fable);
+        let row = account_row(
+            account,
+            view,
+            ctx,
+            pos,
+            wide,
+            cursor,
+            bar_width,
+            show_fable,
+            show_five_h,
+        );
         if cursor {
             row.style(Style::new().add_modifier(Modifier::REVERSED))
         } else {
@@ -4071,7 +4927,7 @@ fn draw_accounts(
 
     // "group" (claude/codex — the model group, colored + prominent) leads the
     // data columns. Issue #70: the default row is the COMPRESSED set — group,
-    // #, account, status, the three gauges, if (+ lifetime req/tok in wide).
+    // #, account, status, the 5h stub, the gauges, if (+ req/tok in wide).
     // The `auth` type, the per-window reset times, and the token expiry/refresh
     // cluster moved to the selected-account detail pane (`draw_detail`, on MAIN
     // beside the summary and full-width in the Accounts overlay) — relocated,
@@ -4079,19 +4935,24 @@ fn draw_accounts(
     //
     // The `Fbl` gauge (fable-usage U9a) is inserted AFTER the `7d` gauge, and
     // ONLY when `show_fable_weekly` is on — off renders the table with no
-    // column, no width taken. Wide gets a full gauge column; narrow gets a
-    // compact marker column (the width budget is tight there).
-    let (header, constraints): (Vec<&'static str>, Vec<Constraint>) = if wide {
-        let mut header = vec!["", "group", "#", "account", "status", "5h", "7d"];
+    // column, no width taken. It is a FULL gauge column in both sets (.prd/18
+    // rule 3). The `5h` stub (.prd/18 rules 1–2) is a fixed 8-wide column that
+    // never stretches and is the first column to drop when the row overflows.
+    let (header, constraints): (Vec<&'static str>, Vec<Constraint>) = {
+        let mut header = vec!["", "group", "#", "account", "status"];
         let mut constraints = vec![
             Constraint::Length(2),
             Constraint::Length(7),
             Constraint::Length(2),
             Constraint::Length(name_width),
-            Constraint::Length(20),
-            Constraint::Length(gauge_cell),
-            Constraint::Length(gauge_cell),
+            Constraint::Length(status_width),
         ];
+        if show_five_h {
+            header.push("5h");
+            constraints.push(Constraint::Length(FIVE_H_COL_WIDTH));
+        }
+        header.push("7d");
+        constraints.push(Constraint::Length(gauge_cell));
         if show_fable {
             header.push("7d Fbl");
             constraints.push(Constraint::Length(gauge_cell));
@@ -4100,35 +4961,12 @@ fn draw_accounts(
             header.push("rst");
             constraints.push(Constraint::Length(RESET_COL_WIDTH));
         }
-        header.extend(["if", "req", "tok"]);
-        constraints.extend([
-            Constraint::Length(3),
-            Constraint::Length(6),
-            Constraint::Length(7),
-        ]);
-        (header, constraints)
-    } else {
-        let mut header = vec!["", "group", "#", "account", "status", "5h", "7d"];
-        let mut constraints = vec![
-            Constraint::Length(2),
-            Constraint::Length(7),
-            Constraint::Length(2),
-            Constraint::Length(name_width),
-            Constraint::Length(20),
-            Constraint::Length(gauge_cell),
-            Constraint::Length(gauge_cell),
-        ];
-        if show_fable {
-            header.push("7d Fbl");
-            // Compact marker column ("F 100%!" fits in 7): no bar, no stretch.
-            constraints.push(Constraint::Length(7));
+        header.push("if");
+        constraints.push(Constraint::Length(3));
+        if wide {
+            header.extend(["req", "tok"]);
+            constraints.extend([Constraint::Length(6), Constraint::Length(7)]);
         }
-        if show_resets {
-            header.push("rst");
-            constraints.push(Constraint::Length(RESET_COL_WIDTH));
-        }
-        header.extend(["if"]);
-        constraints.extend([Constraint::Length(3)]);
         (header, constraints)
     };
 
@@ -4164,10 +5002,13 @@ fn account_row<'a>(
     wide: bool,
     cursor: bool,
     bar_width: usize,
-    // The EFFECTIVE Fable-column flag from `draw_accounts` (the config toggle,
-    // minus the narrow-width drop) — reading `view.show_fable_weekly` here
-    // would push a cell into a column the header/constraints did not reserve.
+    // The Fable-column toggle, and the EFFECTIVE `5h` flag from
+    // [`draw_accounts`] (the column drops whole at a width where even a
+    // floor-width status cannot make the row fit) — reading the view/config
+    // here would push a cell into a column the header/constraints did not
+    // reserve.
     show_fable: bool,
+    show_five_h: bool,
 ) -> Row<'a> {
     let snapshot = &view.snapshot;
     let params = &view.select_params;
@@ -4227,17 +5068,6 @@ fn account_row<'a>(
         .get(&account.id.0)
         .map_or(0, |h| h.consecutive_failures);
     let max_age = params.usage_max_age;
-    let five_gauge = window_gauge_cell(
-        &account.five_hour,
-        params.five_hour_max,
-        parked,
-        now,
-        max_age,
-        consecutive_failures,
-        ctx.quota_display,
-        ctx.reset_absolute,
-        bar_width,
-    );
     let seven_gauge = window_gauge_cell(
         &account.seven_day,
         params.seven_day_max,
@@ -4264,15 +5094,32 @@ fn account_row<'a>(
     cells.push(Cell::from(status_span(
         account, gate, is_current, params, now, ctx.frame,
     )));
-    cells.extend([five_gauge, seven_gauge]);
+    // The `5h` stub (.prd/18): Claude-only, fixed 8 cells, dropped whole at a
+    // width where the row cannot hold it — the header/constraints make the same
+    // call above, so the cells stay column-aligned.
+    if show_five_h {
+        cells.push(five_hour_cell(
+            account.group,
+            &account.five_hour,
+            params.five_hour_max,
+            parked,
+            now,
+            max_age,
+            consecutive_failures,
+            ctx.quota_display,
+        ));
+    }
+    cells.push(seven_gauge);
     // Fbl gauge (fable-usage U9a): rendered only when the toggle is on, in the
     // same slot (after 7d) as the header/constraints reserve above, so the
-    // cells stay column-aligned. Absent-window → the same cold state 5h/7d use.
+    // cells stay column-aligned. Claude-only, like the 5h stub: a non-Claude
+    // row reads `-`, a Claude row with an absent window keeps the cold state
+    // 7d uses.
     if show_fable {
         cells.push(fable_gauge_cell(
+            account.group,
             account.fable_weekly(),
             now,
-            wide,
             max_age,
             consecutive_failures,
             ctx.quota_display,
@@ -4572,15 +5419,94 @@ fn window_gauge_cell(
     ))
 }
 
+/// The `5h` cell (.prd/18, owner 2026-09-18): a Claude-only compact stub that
+/// always fits [`FIVE_H_COL_WIDTH`], returned as `(text, style)` so the width
+/// contract is unit-testable without a terminal.
+///
+/// - Non-Claude group → a dim `-`: Codex has no 5h window source at all and the
+///   owner's rule is that the 5h limit is a Claude-only concept, so `cold` on
+///   a Codex row was a lie about a gauge that will never populate, and on a
+///   Grok row it is a burst window the owner does not want in this table
+///   (still recorded and shown in the detail pane — `.prd/18` §Tension).
+/// - Claude with no window → `{glyph} cold`, the same never-seen signal the 7d
+///   gauge carries. The `poll-degraded` LABEL does not fit 8 cells, so with an
+///   absent window the glyph alone carries the poller state and the word stays
+///   the honest `cold` (no live window has ever been seen).
+/// - Claude with a window → the percent of the FILL fraction (same
+///   `quota_display` direction as the 7d gauge), a trailing `!` when parked or
+///   past the threshold, and the display glyph prefixed when the value is not
+///   fresh: `68%`, `68%!`, `◑ 68%`, `! 68%!`. No bar, no countdown — the
+///   countdown lives in the detail pane; the widest state is `◑ 100%!` (7).
+#[allow(clippy::too_many_arguments)]
+fn five_hour_text(
+    group: crate::routing::BackendGroup,
+    window: &Option<QuotaWindow>,
+    threshold: f64,
+    parked: bool,
+    now: SystemTime,
+    max_age: Duration,
+    consecutive_failures: u32,
+    mode: crate::config::QuotaDisplay,
+) -> (String, Style) {
+    if group != crate::routing::BackendGroup::Claude {
+        return ("-".to_string(), dim());
+    }
+    let display = classify_window_display(window, now, max_age, consecutive_failures);
+    let Some(window) = window else {
+        return (format!("{} cold", display.glyph()), dim());
+    };
+    let utilization = window.effective_utilization(now);
+    let color = level_color(format::gauge_level(utilization));
+    let fill = match mode {
+        crate::config::QuotaDisplay::Used => utilization,
+        crate::config::QuotaDisplay::Remaining => 1.0 - utilization,
+    };
+    let mut text = format::percent(fill);
+    if parked || utilization > threshold {
+        text.push('!');
+    }
+    if !matches!(display, WindowDisplayState::Populated) {
+        text.insert_str(0, &format!("{} ", display.glyph()));
+    }
+    (text, Style::new().fg(color))
+}
+
+/// [`five_hour_text`] as a table cell.
+#[allow(clippy::too_many_arguments)]
+fn five_hour_cell(
+    group: crate::routing::BackendGroup,
+    window: &Option<QuotaWindow>,
+    threshold: f64,
+    parked: bool,
+    now: SystemTime,
+    max_age: Duration,
+    consecutive_failures: u32,
+    mode: crate::config::QuotaDisplay,
+) -> Cell<'static> {
+    let (text, style) = five_hour_text(
+        group,
+        window,
+        threshold,
+        parked,
+        now,
+        max_age,
+        consecutive_failures,
+        mode,
+    );
+    Cell::from(Span::styled(text, style))
+}
+
 /// The model-scoped "Fable" weekly gauge cell (fable-usage U9a, W0 Q3),
 /// following the same pattern as [`window_cells`] but as a single cell (no
 /// paired reset column — W0 keeps the Fbl slot light) and with scope-aware
 /// critical coloring:
 ///
-/// - Present window: the same in-bar countdown gauge as 5h/7d
-///   ([`quota_bar_line`]) in wide mode, a compact `F 7d!` countdown marker in
-///   narrow mode. Colored by fill level through the SAME [`format::gauge_level`]
-///   / [`level_color`] palette as 5h/7d, EXCEPT the scope's own signal wins —
+/// - Present window: the same in-bar countdown gauge as the 7d window
+///   ([`quota_bar_line`]) at EVERY width (.prd/18 rule 3 — the compact narrow
+///   `F 22h!` marker is gone; the Fbl gauge never gives way, the `status` and
+///   `5h` columns absorb a tight width instead). Colored by fill level through
+///   the SAME [`format::gauge_level`] / [`level_color`] palette, EXCEPT the
+///   scope's own signal wins —
 ///   a *constraining* Fable limit reads red regardless of the raw percent (the
 ///   limit is engaged upstream even if the number looks calm). "Constraining"
 ///   is [`ScopedQuotaWindow::is_constraining`], so the red is **reset-aware**:
@@ -4594,14 +5520,19 @@ fn window_gauge_cell(
 ///   normal utilization-based hue (also via `is_constraining`).
 ///   A trailing `!` flags the red state, mirroring the over-threshold marker on
 ///   the account windows.
-/// - Absent window (no Fable scope on this account): the same cold/stale/
-///   poll-degraded state 5h/7d show for an absent window, via
-///   [`classify_window_display`] — never a crash or blank.
+/// - Non-Claude group → a dim `-`, the same n/a semantics [`five_hour_text`]
+///   carries for the `5h` column (.prd/18 rule 1, extended by the owner
+///   2026-09-18: "7d fable도 코덱스 그록등 사용량 없는 열에 cold가 아니라 `-`로
+///   비워줘"). A Fable scope is a Claude-only concept, so `cold` on a Codex or
+///   Grok row was a lie about a gauge that will never populate.
+/// - Absent window on a CLAUDE row: the same cold/stale/poll-degraded state the
+///   7d gauge shows for an absent window, via [`classify_window_display`] —
+///   never a crash or blank.
 #[allow(clippy::too_many_arguments)]
 fn fable_gauge_cell(
+    group: crate::routing::BackendGroup,
     scoped: Option<&ScopedQuotaWindow>,
     now: SystemTime,
-    wide: bool,
     max_age: Duration,
     consecutive_failures: u32,
     mode: crate::config::QuotaDisplay,
@@ -4609,20 +5540,21 @@ fn fable_gauge_cell(
     fable_max: f64,
     bar_width: usize,
 ) -> Cell<'static> {
+    // Claude-only, decided before any classification: a non-Claude row has no
+    // Fable scope to ever populate, so it reads n/a rather than a cold gauge.
+    if group != crate::routing::BackendGroup::Claude {
+        return Cell::from(Span::styled("-", dim()));
+    }
     let window = scoped.map(|s| s.window);
     let display = classify_window_display(&window, now, max_age, consecutive_failures);
     let Some(scoped) = scoped else {
         // Cold / absent: mirror the `window_cells` absent branch — the glyph +
-        // label in wide mode, a compact `F ○`-style marker in narrow mode — so
-        // a never-seen Fable window reads distinctly from an honest 0%.
-        return if wide {
-            Cell::from(Span::styled(
-                format!("{} {}", display.glyph(), display.label()),
-                dim(),
-            ))
-        } else {
-            Cell::from(Span::styled(format!("F {}", display.glyph()), dim()))
-        };
+        // label — so a never-seen Fable window reads distinctly from an honest
+        // 0%.
+        return Cell::from(Span::styled(
+            format!("{} {}", display.glyph(), display.label()),
+            dim(),
+        ));
     };
     let utilization = scoped.window.effective_utilization(now);
     // Scope signal wins: a *constraining* Fable limit is red no matter the
@@ -4641,38 +5573,16 @@ fn fable_gauge_cell(
     // `!` on the red-critical read, same signal window_cells carries with its
     // over-threshold `!`.
     let over = matches!(level, GaugeLevel::Red);
-    if wide {
-        // Same in-bar countdown gauge as the 5h/7d cells; the critical
-        // override only changes the color/`!`, never the fill math.
-        let fill = match mode {
-            crate::config::QuotaDisplay::Used => utilization,
-            crate::config::QuotaDisplay::Remaining => 1.0 - utilization,
-        };
-        let (text, bold_chars, marker) =
-            quota_bar_text(&scoped.window, now, display, reset_absolute);
-        Cell::from(quota_cell_line(
-            fill, color, &text, bold_chars, over, bar_width, marker,
-        ))
-    } else {
-        // Compact narrow marker: `F` + the top countdown unit + critical `!`
-        // (`F 7d!`), colored. No bar — the narrow width budget has no room for
-        // one. An expired window (no live reset) falls back to the mode-flipped
-        // percent so the marker never reads as a live countdown to a past
-        // reset (just-reset in `remaining` mode = `F 100%`, full quota back).
-        let label = match scoped.window.resets_at.duration_since(now) {
-            Ok(rem) if !rem.is_zero() => format::countdown_units(rem).0,
-            _ => match mode {
-                crate::config::QuotaDisplay::Used => format::percent(utilization),
-                crate::config::QuotaDisplay::Remaining => format::percent(1.0 - utilization),
-            },
-        };
-        let text = if over {
-            format!("F {label}!")
-        } else {
-            format!("F {label}")
-        };
-        Cell::from(Span::styled(text, Style::new().fg(color)))
-    }
+    // Same in-bar countdown gauge as the 7d cell, at every width; the critical
+    // override only changes the color/`!`, never the fill math.
+    let fill = match mode {
+        crate::config::QuotaDisplay::Used => utilization,
+        crate::config::QuotaDisplay::Remaining => 1.0 - utilization,
+    };
+    let (text, bold_chars, marker) = quota_bar_text(&scoped.window, now, display, reset_absolute);
+    Cell::from(quota_cell_line(
+        fill, color, &text, bold_chars, over, bar_width, marker,
+    ))
 }
 
 /// Reset text for the detail pane: compact countdown plus the absolute local
@@ -5310,6 +6220,11 @@ pub(crate) struct MainChrome {
     /// visible inner height) so the runtime can clamp its stored offset; `None`
     /// means no modal was open OR its entry aged out of the ring (→ close it).
     pub input_modal_max_scroll: Option<u16>,
+    /// Set by `draw` after rendering the account detail modal (.prd/19 rule 6),
+    /// with the same contract as [`Self::input_modal_max_scroll`]: `Some(max)`
+    /// clamps the stored scroll, `None` means no modal was open OR its pinned
+    /// account left the snapshot (→ close it).
+    pub account_modal_max_scroll: Option<u16>,
     /// Draw feedback for the raw request/response viewer (UI-7/UI-8): scroll
     /// clamps plus the clickable tab/button rects this frame rendered. Unlike
     /// the input modal, `None` only means "no raw modal drawn this frame" —
@@ -5498,8 +6413,15 @@ const META_W_MAX: usize = 32;
 
 impl RowMetrics {
     /// Measure the visible rows. `completed` is the already-windowed slice the
-    /// frame will render (plus slack); in-flight rows share the meta slot.
-    fn measure(width: u16, in_flight: &[InFlight], completed: &[&Completed]) -> Self {
+    /// frame will render (plus slack); in-flight rows share the meta slot AND
+    /// the duration slot (their live elapsed time renders there, so a
+    /// long-running request must not push the columns around).
+    fn measure(
+        width: u16,
+        now: SystemTime,
+        in_flight: &[InFlight],
+        completed: &[&Completed],
+    ) -> Self {
         let mut m = RowMetrics {
             width,
             meta_w: 0,
@@ -5515,6 +6437,8 @@ impl RowMetrics {
                 request.effort.as_deref(),
             );
             m.meta_w = m.meta_w.max(cell_width(&meta));
+            let elapsed = now.duration_since(request.started_at).unwrap_or_default();
+            m.dur_w = m.dur_w.max(format::elapsed_secs(elapsed).len());
         }
         for entry in completed {
             let CompletedBody::Request {
@@ -5593,9 +6517,9 @@ fn draw_activity(
         })
         .collect();
     let metrics = if chrome.activity_scroll == 0 {
-        RowMetrics::measure(area.width, in_flight, &visible)
+        RowMetrics::measure(area.width, now, in_flight, &visible)
     } else {
-        RowMetrics::measure(area.width, &[], &visible)
+        RowMetrics::measure(area.width, now, &[], &visible)
     };
     // In-flight rows pinned on top ONLY when viewing the live tail (scroll==0);
     // while scrolled into history they'd steal rows from the page being read.
@@ -5627,6 +6551,20 @@ fn draw_activity(
             // completed rows. Unknown kind → 8 blank cells (alignment holds).
             let kind = request.kind.as_deref().unwrap_or("");
             spans.push(Span::styled(format!("{kind:<8} "), kind_style(kind)));
+            // Client Name column (activity in-flight identity): the same cell
+            // the completed row draws — the doc builder already resolved the
+            // display name off the same tenant join, so a RUNNING row shows
+            // who is asking instead of waiting for the finish. Unattributed →
+            // a blank but still padded cell, never coerced to "local".
+            let short = request
+                .client_name
+                .as_deref()
+                .map(|n| format::client_short_name(&masked_text(n, view.email_anonymous)))
+                .unwrap_or_default();
+            spans.push(Span::styled(
+                format!("{} ", pad_cells(&short, ACTIVITY_NAME_W)),
+                Style::new().fg(Color::Cyan),
+            ));
             // `[model effort]` badge while in flight (issue #2, 2a): filled at
             // routing time (req11) with the same per-request values the finish
             // will record, so the running badge reads exactly like its
@@ -5642,16 +6580,59 @@ fn draw_activity(
                 ),
                 metrics.meta_w,
             ));
-            if let Some(account) = &request.account {
-                spans.push(Span::raw(format!(
-                    " → {}",
-                    row_account_name(account, view.email_anonymous, &view.domain_abbrev)
-                )));
-            }
+            // From here the row is the COMPLETED row's column sequence with the
+            // not-yet-known cells held open at full width: `…` in the status
+            // slot, the live elapsed time in the duration slot, `—` for
+            // tokens/throughput/cost. Nothing shifts when the finish lands.
+            let account = request
+                .account
+                .as_deref()
+                .map(|a| row_account_name(a, view.email_anonymous, &view.domain_abbrev))
+                .unwrap_or_default();
+            spans.push(Span::raw(format!(
+                " {} → ",
+                pad_cells(&account, ACTIVITY_EMAIL_W)
+            )));
+            spans.push(Span::styled("  …", dim()));
             spans.push(Span::styled(
-                format!(" ({}…)", format::elapsed_secs(elapsed)),
+                format!(
+                    " {} {} {}",
+                    pad_cells_left(&format::elapsed_secs(elapsed), metrics.dur_w),
+                    pad_cells_left(PENDING_CELL, metrics.tok_w),
+                    pad_cells_left(PENDING_CELL, metrics.tps_w),
+                ),
                 dim(),
             ));
+            spans.push(Span::raw(format!(
+                " {}",
+                pad_cells_left(PENDING_CELL, metrics.cost_w)
+            )));
+            // Derived session title (U2) — seeded at START time for exactly
+            // this reason, so it does not pop into existence at the finish.
+            if let Some(label) = request
+                .user_id
+                .as_deref()
+                .and_then(|id| view.session_labels.get(id))
+            {
+                spans.push(Span::styled(
+                    format!(
+                        " \u{ab}{}\u{bb}",
+                        truncate_chars(&masked_text(label, view.email_anonymous), 16)
+                    ),
+                    dim().add_modifier(Modifier::ITALIC),
+                ));
+            }
+            // Input excerpt LAST, on the same budget math as a completed row.
+            if let Some(excerpt) = request.excerpt.as_deref() {
+                let consumed: usize = spans.iter().map(|s| cell_width(&s.content)).sum();
+                let budget = (metrics.width as usize).saturating_sub(consumed + 3);
+                if budget > 0 {
+                    spans.push(Span::raw(format!(
+                        " \u{201c}{}\u{201d}",
+                        truncate_cells(&masked_text(excerpt, view.email_anonymous), budget)
+                    )));
+                }
+            }
             lines.push(Line::from(spans));
         }
     }
@@ -5814,6 +6795,11 @@ fn draw_activity(
 
 /// The account/email column width on activity rows (Z 2026-07-15: 이메일 10자).
 const ACTIVITY_EMAIL_W: usize = 10;
+
+/// Placeholder in the numeric columns of a RUNNING activity row: the value is
+/// unknowable until the finish lands, but the column still holds its width so
+/// the feed does not jump when it does.
+const PENDING_CELL: &str = "\u{2014}";
 
 /// The client Name column width on activity rows (activity client-name,
 /// Z 2026-08-24: "첫 4자만 출력") — matches the 4-char shortening rule of
@@ -7450,6 +8436,8 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
                     Span::raw(" used/left  "),
                     key("t"),
                     Span::raw(" eta/utc  "),
+                    key("o"),
+                    Span::raw(" sort  "),
                     key("S"),
                     Span::raw(" sched  "),
                     key("↑↓"),
@@ -7482,6 +8470,8 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
                 Span::raw(" used/left  "),
                 key("t"),
                 Span::raw(" eta/utc  "),
+                key("o"),
+                Span::raw(" sort  "),
                 key("Esc"),
                 Span::raw(" back  "),
                 key("q"),
@@ -7552,7 +8542,15 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
             // Keys overlay (multi-tenant #22): read-only; mutations live in
             // the CLI (`llmux key …`).
             Overlay::Keys => Line::from(vec![
-                Span::raw(" keys — issue/suspend/rotate via `llmux key …`  "),
+                Span::raw(" keys — "),
+                key("w"),
+                Span::raw(" window  "),
+                key("f"),
+                Span::raw(" models  "),
+                key("↑/↓ PgUp/PgDn Home/End"),
+                Span::raw(" scroll  "),
+                key("r"),
+                Span::raw(" refresh  "),
                 key("K/Esc"),
                 Span::raw(" back  "),
                 key("q"),
@@ -7742,7 +8740,6 @@ mod tests {
             logs: Vec::new(),
             model_usage,
             client_usage: Vec::new(),
-            tenant_usage: Vec::new(),
             client_keys: Vec::new(),
             windowed: Vec::new(),
             codex: crate::dashboard::CodexSettingsDoc::default(),
@@ -7872,11 +8869,63 @@ mod tests {
         );
     }
 
-    /// Multi-tenant #22: the keys tab renders issued keys joined with their
-    /// tenant usage (name/email, state, counts, cost, span) plus dim
-    /// per-model breakdown rows, and builtin buckets with usage.
-    #[test]
-    fn keys_overlay_renders_key_rows_usage_and_model_breakdown() {
+    // --- keys panel (multi-tenant #22 + keys-history K) ---------------------
+
+    /// A keys-usage answer with one keyed tenant (one model cell) and one
+    /// builtin bucket — the document the panel renders from.
+    fn keys_doc(window: &str, models: Vec<String>) -> crate::key_usage::KeysUsageDoc {
+        crate::key_usage::KeysUsageDoc {
+            window: window.into(),
+            models,
+            available_models: vec!["claude-opus-4-8".into(), "gpt-6-astra".into()],
+            from_ms: 0,
+            to_ms: 1_700_100_000_000,
+            rows: 15,
+            generated_ms: 1_700_100_000_000,
+            tenants: vec![
+                crate::dashboard::TenantUsageDoc {
+                    tenant: "k-aaaa".into(),
+                    name: "pc-b".into(),
+                    email: Some("b@x.com".into()),
+                    requests: 12,
+                    ok: 11,
+                    errors: 1,
+                    tokens_in: 3_400,
+                    tokens_out: 900,
+                    cost_usd: 1.25,
+                    first_ms: 1_700_000_000_000,
+                    last_ms: 1_700_100_000_000,
+                    models: vec![crate::dashboard::TenantModelDoc {
+                        group: "claude".into(),
+                        model: "claude-opus-4-8".into(),
+                        requests: 12,
+                        tokens_in: 3_400,
+                        tokens_out: 900,
+                        cache_read: 0,
+                        cache_creation: 0,
+                        cost_usd: 1.25,
+                    }],
+                },
+                crate::dashboard::TenantUsageDoc {
+                    tenant: "local".into(),
+                    name: "local".into(),
+                    email: None,
+                    requests: 3,
+                    ok: 3,
+                    errors: 0,
+                    tokens_in: 10,
+                    tokens_out: 5,
+                    cost_usd: 0.0,
+                    first_ms: 1_700_000_000_000,
+                    last_ms: 1_700_000_000_000,
+                    models: Vec::new(),
+                },
+            ],
+            health: crate::key_usage::UsageHealth::default(),
+        }
+    }
+
+    fn keys_view() -> DashboardView {
         let mut view = view_with(Vec::new());
         view.client_keys = vec![crate::dashboard::KeyRowDoc {
             id: "k-aaaa".into(),
@@ -7888,51 +8937,37 @@ mod tests {
             created_at_ms: 1,
             revoked_at_ms: None,
         }];
-        view.tenant_usage = vec![
-            crate::dashboard::TenantUsageDoc {
-                tenant: "k-aaaa".into(),
-                name: "pc-b".into(),
-                email: Some("b@x.com".into()),
-                requests: 12,
-                ok: 11,
-                errors: 1,
-                tokens_in: 3_400,
-                tokens_out: 900,
-                cost_usd: 1.25,
-                first_ms: 1_700_000_000_000,
-                last_ms: 1_700_100_000_000,
-                models: vec![crate::dashboard::TenantModelDoc {
-                    group: "claude".into(),
-                    model: "claude-opus-4-8".into(),
-                    requests: 12,
-                    tokens_in: 3_400,
-                    tokens_out: 900,
-                    cache_read: 0,
-                    cache_creation: 0,
-                    cost_usd: 1.25,
-                }],
-            },
-            crate::dashboard::TenantUsageDoc {
-                tenant: "local".into(),
-                name: "local".into(),
-                email: None,
-                requests: 3,
-                ok: 3,
-                errors: 0,
-                tokens_in: 10,
-                tokens_out: 5,
-                cost_usd: 0.0,
-                first_ms: 1_700_000_000_000,
-                last_ms: 1_700_000_000_000,
-                models: Vec::new(),
-            },
-        ];
-        let rows = render_rows(&view, &chrome_overlay(Overlay::Keys), 160, 30);
+        view
+    }
+
+    /// Chrome with the keys overlay open over a loaded answer.
+    fn keys_chrome(panel: crate::tui::KeysPanel) -> Chrome {
+        Chrome {
+            keys: panel,
+            ..chrome_overlay(Overlay::Keys)
+        }
+    }
+
+    fn loaded_panel() -> crate::tui::KeysPanel {
+        crate::tui::KeysPanel {
+            doc: Some(std::sync::Arc::new(keys_doc("all", Vec::new()))),
+            ..Default::default()
+        }
+    }
+
+    /// Multi-tenant #22 + keys-history K-6: the keys tab renders issued keys
+    /// joined with their DURABLE tenant usage (name/email, state, counts,
+    /// cost, span) plus dim per-model breakdown rows, and builtin buckets.
+    #[test]
+    fn keys_overlay_renders_key_rows_usage_and_model_breakdown() {
+        let rows = render_rows(&keys_view(), &keys_chrome(loaded_panel()), 160, 30);
         let all = rows.join("\n");
-        assert!(all.contains("k-aaaa"), "key id row:\n{all}");
+        assert!(
+            all.contains("k-aaaa"),
+            "attribution id in the key cell:\n{all}"
+        );
         assert!(all.contains("pc-b <b@x.com>"), "name+email joined:\n{all}");
         assert!(all.contains("suspended"), "state column:\n{all}");
-        assert!(all.contains("lmk-b1b2"), "display prefix only:\n{all}");
         assert!(all.contains("$1.25"), "priced cost:\n{all}");
         assert!(
             all.contains("└ claude/claude-opus-4-8"),
@@ -7942,16 +8977,328 @@ mod tests {
         assert!(all.contains("→"), "used-from → used-to span:\n{all}");
     }
 
+    /// K-6 `name을 맨 앞`: the NAME column is first and the key metadata cell
+    /// never exceeds 16 display cells (and never carries a secret).
+    #[test]
+    fn keys_overlay_puts_name_first_and_caps_the_key_cell() {
+        let mut view = keys_view();
+        view.client_keys[0].id = "k-0123456789abcdef".into();
+        view.client_keys[0].key_prefix = "lmk-longprefix".into();
+        let mut doc = keys_doc("all", Vec::new());
+        doc.tenants[0].tenant = "k-0123456789abcdef".into();
+        let panel = crate::tui::KeysPanel {
+            doc: Some(std::sync::Arc::new(doc)),
+            ..Default::default()
+        };
+        let rows = keys_rows(&view, &keys_chrome(panel.clone()));
+        assert_eq!(rows[0].cells[0], "pc-b <b@x.com>", "name is column 0");
+        let key_cell = &rows[0].cells[1];
+        assert!(
+            cell_width(key_cell) <= 16,
+            "key cell is at most 16 display cells: {key_cell:?}"
+        );
+        assert!(
+            key_cell.ends_with('…'),
+            "an over-long key cell is clipped, not wrapped: {key_cell:?}"
+        );
+        // Header order matches the rendered cells.
+        let frame = render_rows(&view, &keys_chrome(panel), 160, 30);
+        let header = frame
+            .iter()
+            .find(|l| l.contains("name") && l.contains("cost"))
+            .expect("header row");
+        let name_at = header.find("name").expect("name column");
+        let key_at = header.find("key").expect("key column");
+        assert!(name_at < key_at, "name precedes key: {header:?}");
+    }
+
+    /// K-0 `위아래 키로 볼 수 있게`: every flattened row is reachable — the
+    /// LAST row renders once the panel is scrolled to the end, on a terminal
+    /// far too short to show them all at once.
+    /// 40 tenants, each with one model row: 80 flattened rows — more than any
+    /// test terminal can show at once.
+    fn big_keys_panel() -> (DashboardView, crate::tui::KeysPanel) {
+        let mut view = keys_view();
+        let mut doc = keys_doc("all", Vec::new());
+        // 40 tenants, each with a model row: 80+ rows on a 12-row terminal.
+        doc.tenants = (0..40)
+            .map(|i| crate::dashboard::TenantUsageDoc {
+                tenant: format!("k-{i:04}"),
+                name: format!("tenant-{i:02}"),
+                email: None,
+                requests: 1,
+                ok: 1,
+                errors: 0,
+                tokens_in: 1,
+                tokens_out: 1,
+                cost_usd: 0.0,
+                first_ms: 1_700_000_000_000,
+                last_ms: 1_700_000_000_000,
+                models: vec![crate::dashboard::TenantModelDoc {
+                    group: "claude".into(),
+                    model: format!("model-{i:02}"),
+                    requests: 1,
+                    tokens_in: 1,
+                    tokens_out: 1,
+                    cache_read: 0,
+                    cache_creation: 0,
+                    cost_usd: 0.0,
+                }],
+            })
+            .collect();
+        view.client_keys.clear();
+        let panel = crate::tui::KeysPanel {
+            doc: Some(std::sync::Arc::new(doc)),
+            ..Default::default()
+        };
+        (view, panel)
+    }
+
+    #[test]
+    fn keys_overlay_scroll_reaches_the_final_row_offscreen() {
+        let (view, panel) = big_keys_panel();
+        let rows = keys_rows(&view, &keys_chrome(panel.clone()));
+        assert_eq!(rows.len(), 80, "40 tenant rows + 40 model rows");
+
+        // Unscrolled, a 12-row frame cannot show the last tenant.
+        let top = render(&view, &keys_chrome(panel.clone()), 200, 12);
+        assert!(!top.contains("tenant-39"), "last row is offscreen:\n{top}");
+
+        // Scrolled to the end (what End computes), it is on screen.
+        let end = crate::tui::KeysPanel {
+            scroll: rows.len() - 1,
+            ..panel
+        };
+        let bottom = render(&view, &keys_chrome(end), 200, 12);
+        assert!(
+            bottom.contains("└ claude/model-39"),
+            "the final flattened row is reachable:\n{bottom}"
+        );
+    }
+
+    /// K-6 `name을 맨 앞` on a REAL terminal: at 100x28 and 80x24 the fixed
+    /// columns used to sum past the frame width, starving the `Fill(1)` name
+    /// column to ZERO — the name header, every tenant name and every model
+    /// label disappeared (live capture, 2026-09-14). The name column keeps a
+    /// usable budget at every width; lower-value columns yield instead.
+    #[test]
+    fn keys_overlay_keeps_names_and_model_labels_on_narrow_terminals() {
+        let view = keys_view();
+        for (w, h) in [(80, 24), (100, 28), (120, 30), (160, 40)] {
+            let text = render(&view, &keys_chrome(loaded_panel()), w, h);
+            assert!(
+                text.contains("name"),
+                "{w}x{h}: the name header survives:\n{text}"
+            );
+            assert!(
+                text.contains("pc-b"),
+                "{w}x{h}: the tenant name is visible:\n{text}"
+            );
+            assert!(
+                text.contains("└ claude/"),
+                "{w}x{h}: the model label is visible:\n{text}"
+            );
+        }
+    }
+
+    /// The narrow layout sheds the widest, lowest-value columns first (the
+    /// `used` span, then `kind`) and never the name/key/req/token/cost core.
+    #[test]
+    fn keys_overlay_sheds_low_value_columns_before_the_name_column() {
+        let view = keys_view();
+        let wide = render(&view, &keys_chrome(loaded_panel()), 200, 30);
+        assert!(wide.contains("used"), "a wide frame shows every column");
+
+        let narrow = render(&view, &keys_chrome(loaded_panel()), 80, 24);
+        assert!(
+            !narrow.contains("used"),
+            "80 cells drop the widest span column:\n{narrow}"
+        );
+        for core in ["name", "key", "req", "in", "out", "cost"] {
+            assert!(
+                narrow.contains(core),
+                "80 cells keep the {core} column:\n{narrow}"
+            );
+        }
+    }
+
+    /// The visible-column budget is derived, not hardcoded per width: every
+    /// kept column plus the name minimum fits the frame, and `name` is never
+    /// dropped.
+    #[test]
+    fn keys_visible_columns_always_fit_and_always_keep_the_name() {
+        for width in [20_u16, 40, 60, 80, 100, 120, 160, 200] {
+            let cols = keys_visible_columns(width);
+            assert_eq!(cols.first(), Some(&0), "width {width}: name is first");
+            let fixed: u16 = cols.iter().skip(1).map(|&i| KEYS_COLUMNS[i].width).sum();
+            let spacing = cols.len().saturating_sub(1) as u16;
+            assert!(
+                fixed + spacing <= width,
+                "width {width}: fixed columns {fixed} + spacing {spacing} must leave room for the name"
+            );
+        }
+    }
+
+    /// K-0: scrolling to the END shows the final PAGE, not one last row over a
+    /// blank screen — every row stays reachable, the viewport just stops at the
+    /// last full page.
+    #[test]
+    fn keys_overlay_end_scroll_shows_a_full_final_page() {
+        let (view, panel) = big_keys_panel();
+        let rows = keys_rows(&view, &keys_chrome(panel.clone()));
+        let end = crate::tui::KeysPanel {
+            scroll: rows.len() - 1,
+            ..panel
+        };
+        let frame = render_rows(&view, &keys_chrome(end), 200, 14);
+        let text = frame.join("\n");
+        assert!(
+            text.contains("└ claude/model-39"),
+            "the very last row is on screen:\n{text}"
+        );
+        // A full page means the rows just BEFORE the end fill the viewport.
+        assert!(
+            text.contains("tenant-37") && text.contains("tenant-39"),
+            "the final page is filled, not one row over blank space:\n{text}"
+        );
+    }
+
+    /// K-0/K-6: the title states the ACTIVE filter — a filtered view can
+    /// never be read as lifetime data.
+    #[test]
+    fn keys_overlay_title_states_the_active_window_and_model_filter() {
+        let panel = crate::tui::KeysPanel {
+            window: crate::key_usage::UsageWindow::H24,
+            models: ["claude-opus-4-8".to_string()].into_iter().collect(),
+            doc: Some(std::sync::Arc::new(keys_doc(
+                "24h",
+                vec!["claude-opus-4-8".into()],
+            ))),
+            ..Default::default()
+        };
+        let text = render(&keys_view(), &keys_chrome(panel), 160, 30);
+        assert!(text.contains("window 24h"), "window in the title:\n{text}");
+        assert!(text.contains("1 model(s)"), "filter in the title:\n{text}");
+        assert!(text.contains("15 requests"), "matched rows:\n{text}");
+    }
+
+    /// K-4/K-5: while the legacy history is migrating, the totals are partial
+    /// by construction — the panel says `importing history N%` so they cannot
+    /// be read as final.
+    #[test]
+    fn keys_overlay_labels_totals_as_partial_while_the_history_imports() {
+        let mut doc = keys_doc("all", Vec::new());
+        doc.health = crate::key_usage::UsageHealth {
+            importing: true,
+            import_pct: 42,
+            ..Default::default()
+        };
+        let panel = crate::tui::KeysPanel {
+            doc: Some(std::sync::Arc::new(doc)),
+            ..Default::default()
+        };
+        let text = render(&keys_view(), &keys_chrome(panel), 200, 30);
+        assert!(
+            text.contains("importing history 42%"),
+            "partial totals are labelled:\n{text}"
+        );
+
+        // At rest the label is absent (no permanent scare text).
+        let text = render(&keys_view(), &keys_chrome(loaded_panel()), 200, 30);
+        assert!(
+            !text.contains("importing history"),
+            "quiet at rest:\n{text}"
+        );
+    }
+
+    /// K-5: a failed query says so — it must never render as a valid zero, and
+    /// it must not leave the previous (differently-filtered) rows on screen.
+    #[test]
+    fn keys_overlay_shows_a_failed_query_instead_of_zeros() {
+        let panel = crate::tui::KeysPanel {
+            error: Some("database is locked".into()),
+            ..Default::default()
+        };
+        let text = render(&keys_view(), &keys_chrome(panel), 160, 30);
+        assert!(
+            text.contains("keys usage unavailable") && text.contains("database is locked"),
+            "the failure is named:\n{text}"
+        );
+        assert!(
+            !text.contains("pc-b <b@x.com>"),
+            "no tenant rows are rendered under a failed query:\n{text}"
+        );
+    }
+
+    /// K-0: the `f` picker lists the observed models with their selection
+    /// state and its own key legend.
+    #[test]
+    fn keys_overlay_model_picker_lists_options_and_marks_selection() {
+        let panel = crate::tui::KeysPanel {
+            doc: Some(std::sync::Arc::new(keys_doc("all", Vec::new()))),
+            picker: Some(crate::tui::KeysPicker {
+                cursor: 0,
+                selected: ["gpt-6-astra".to_string()].into_iter().collect(),
+                options: vec!["claude-opus-4-8".into(), "gpt-6-astra".into()],
+            }),
+            ..Default::default()
+        };
+        let text = render(&keys_view(), &keys_chrome(panel), 160, 30);
+        assert!(text.contains("[ ] claude-opus-4-8"), "unselected:\n{text}");
+        assert!(text.contains("[x] gpt-6-astra"), "selected:\n{text}");
+        assert!(text.contains("Space toggle"), "picker legend:\n{text}");
+    }
+
+    /// The picker's key legend stays fully readable on a narrow terminal —
+    /// a half-width popup clipped it to "…Ente" at 80 columns (live capture).
+    #[test]
+    fn keys_model_picker_legend_is_readable_at_eighty_columns() {
+        let panel = crate::tui::KeysPanel {
+            doc: Some(std::sync::Arc::new(keys_doc("all", Vec::new()))),
+            picker: Some(crate::tui::KeysPicker {
+                cursor: 0,
+                selected: Default::default(),
+                options: vec!["claude-opus-4-8".into(), "gpt-6-astra".into()],
+            }),
+            ..Default::default()
+        };
+        let text = render(&keys_view(), &keys_chrome(panel), 80, 24);
+        assert!(
+            text.contains("Enter apply · Esc cancel"),
+            "the whole legend fits:\n{text}"
+        );
+    }
+
     /// The keys tab with nothing issued and no usage renders the how-to hint
     /// instead of an empty table.
     #[test]
     fn keys_overlay_empty_state_carries_the_issue_hint() {
-        let view = view_with(Vec::new());
-        let rows = render_rows(&view, &chrome_overlay(Overlay::Keys), 160, 30);
-        let all = rows.join("\n");
+        let panel = crate::tui::KeysPanel {
+            doc: Some(std::sync::Arc::new(crate::key_usage::KeysUsageDoc {
+                window: "all".into(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let text = render(&view_with(Vec::new()), &keys_chrome(panel), 160, 30);
         assert!(
-            all.contains("llmux key new --name"),
-            "empty-state hint:\n{all}"
+            text.contains("llmux key new --name"),
+            "empty-state hint:\n{text}"
+        );
+    }
+
+    /// Before the first answer arrives the panel says it is loading — it does
+    /// NOT show an empty table that reads like "no usage".
+    #[test]
+    fn keys_overlay_says_loading_before_the_first_answer() {
+        let panel = crate::tui::KeysPanel {
+            loading: true,
+            ..Default::default()
+        };
+        let text = render(&view_with(Vec::new()), &keys_chrome(panel), 160, 30);
+        assert!(
+            text.contains("loading keys usage"),
+            "loading state:\n{text}"
         );
     }
 
@@ -7962,11 +9309,12 @@ mod tests {
     fn accounts_overlay_renders_exactly_one_accounts_separator() {
         let view = view_with(Vec::new());
         let rows = render_rows(&view, &chrome_overlay(Overlay::Accounts), 160, 30);
-        // A separator row is the titled top border (` accounts ────`) — the
-        // label followed by the border line. Hint TEXT mentioning the word
-        // ("no accounts — run `llmux login`…") is not a separator.
+        // A separator row is the titled top border
+        // (` accounts · sort name ────`) — the label followed by the border
+        // line. Hint TEXT mentioning the word ("no accounts — run `llmux
+        // login`…") is not a separator.
         let hits: Vec<usize> = (2..rows.len() - 2)
-            .filter(|&y| rows[y].contains("accounts ─"))
+            .filter(|&y| rows[y].contains("accounts · sort"))
             .collect();
         assert_eq!(
             hits,
@@ -8053,12 +9401,24 @@ mod tests {
     /// Runtime QA (100 cols, `show_fable_weekly` ON): the row used to overflow,
     /// and ratatui shaved EVERY column to fit — the group header read `gr` and
     /// the cell `CO`. At a width that cannot hold everything, identity
-    /// (group + account) and the reset count must survive; the compact Fbl
-    /// marker is what gives way, and it returns at a wider terminal.
+    /// (group + account) and the reset count must survive.
+    ///
+    /// Z 2026-09-18 (.prd/18 rules 3–4, owner: "7d-fable이 아니라 5h를 줄여줘",
+    /// "status 창부터 줄여줘"): this replaces
+    /// `narrow_100_keeps_group_and_reset_readable_by_dropping_the_fable_marker`.
+    /// The give-way order is now status (20 → 8) and then the `5h` column; the
+    /// `7d Fbl` gauge never gives way. With this view (name 14, `rst` on, Fbl
+    /// on) the narrow row minimum is `82 + status`, so 100 cols keep every
+    /// column with status at 18, while 88 cols cannot hold `5h` even with
+    /// status at its 8-col floor — there the stub drops and status settles at
+    /// 15.
     #[test]
-    fn narrow_100_keeps_group_and_reset_readable_by_dropping_the_fable_marker() {
+    fn narrow_100_keeps_fable_gauge_and_drops_five_hour_last() {
         let mut view = usage_control_view();
         view.show_fable_weekly = true;
+
+        // 100 cols: status shrinks (20 → 18) and that alone buys the row — every
+        // column, `5h` included, survives.
         let rows = render_rows(&view, &chrome_overlay(Overlay::Accounts), 100, 24);
         let frame = rows.join("\n");
         let header = rows
@@ -8071,9 +9431,15 @@ mod tests {
         );
         assert!(header.contains("rst"), "{header:?}\n{frame}");
         assert!(
-            !header.contains("Fbl"),
-            "the Fbl marker gives way at 100 cols: {header:?}\n{frame}"
+            header.contains("7d Fbl"),
+            "the Fbl gauge never gives way: {header:?}\n{frame}"
         );
+        assert!(
+            header.contains("5h"),
+            "status alone absorbs the deficit at 100 cols: {header:?}\n{frame}"
+        );
+        let status_w = header.find("5h").unwrap() - header.find("status").unwrap() - 1;
+        assert_eq!(status_w, 18, "status shrank 20 → 18: {header:?}\n{frame}");
         let codex_row = rows
             .iter()
             .find(|r| r.contains("CODEX"))
@@ -8084,9 +9450,31 @@ mod tests {
             "the other group cell is intact too:\n{frame}"
         );
 
-        // Wide enough → the Fable marker is back, with `rst` still present.
+        // 88 cols: status at its floor still overflows → the `5h` stub is the
+        // column that drops. `7d Fbl`, `rst` and the identity columns stay.
+        let tight = render_rows(&view, &chrome_overlay(Overlay::Accounts), 88, 24);
+        let tight_frame = tight.join("\n");
+        let tight_header = tight
+            .iter()
+            .find(|r| r.contains("account") && r.contains("status"))
+            .unwrap_or_else(|| panic!("header row:\n{tight_frame}"));
+        assert!(
+            !tight_header.contains("5h"),
+            "the 5h stub is the first column to drop: {tight_header:?}\n{tight_frame}"
+        );
+        assert!(
+            tight_header.contains("7d Fbl") && tight_header.contains("rst"),
+            "Fbl and rst survive the drop: {tight_header:?}\n{tight_frame}"
+        );
+        assert!(
+            tight.iter().any(|r| r.contains("CODEX")),
+            "identity survives too:\n{tight_frame}"
+        );
+
+        // Wide enough → every column present, `rst` included.
         let wide = render_rows(&view, &chrome_overlay(Overlay::Accounts), 200, 24).join("\n");
-        assert!(wide.contains("Fbl"), "{wide}");
+        assert!(wide.contains("7d Fbl"), "{wide}");
+        assert!(wide.contains("5h"), "{wide}");
         assert!(wide.contains("rst"), "{wide}");
         assert!(wide.contains("CODEX"), "{wide}");
     }
@@ -8099,7 +9487,7 @@ mod tests {
         let view = usage_control_view();
         let mut chrome = chrome_overlay(Overlay::Accounts);
         let codex_pos = view
-            .display_order(SystemTime::now())
+            .display_order(Default::default(), SystemTime::now())
             .iter()
             .position(|&i| view.snapshot.accounts[i].credential_kind == "codex")
             .expect("codex row");
@@ -8122,13 +9510,34 @@ mod tests {
         assert!(footer.contains("r remove"), "{footer}");
     }
 
+    /// The accounts pane title names the ACTIVE within-group order, so the
+    /// operator can see which of the two `o` modes produced the rows — and
+    /// both MAIN and the overlay advertise the `o sort` key.
+    #[test]
+    fn accounts_title_shows_sort_mode() {
+        let view = usage_control_view();
+        let mut chrome = chrome_overlay(Overlay::Accounts);
+        let name = render_rows(&view, &chrome, 160, 30).join("\n");
+        assert!(name.contains("accounts · sort name"), "{name}");
+        chrome.account_sort = super::super::triage::AccountSort::Next;
+        let next = render_rows(&view, &chrome, 160, 30).join("\n");
+        assert!(next.contains("accounts · sort next"), "{next}");
+        assert!(!next.contains("accounts · sort name"), "{next}");
+        // Both keybars advertise the toggle.
+        let footer = |rows: Vec<String>| rows[rows.len() - 1].clone();
+        let overlay_bar = footer(render_rows(&view, &chrome, 160, 30));
+        assert!(overlay_bar.contains("o sort"), "{overlay_bar}");
+        let main_bar = footer(render_rows(&view, &chrome_overlay(Overlay::None), 160, 30));
+        assert!(main_bar.contains("o sort"), "{main_bar}");
+    }
+
     /// The redemption confirmation names the account and the ONE reset it
     /// spends — a bare y/N with no subject is exactly what this forbids.
     #[test]
     fn reset_confirmation_names_the_account_and_one_reset() {
         let view = usage_control_view();
         let codex_pos = view
-            .display_order(SystemTime::now())
+            .display_order(Default::default(), SystemTime::now())
             .iter()
             .position(|&i| view.snapshot.accounts[i].credential_kind == "codex")
             .expect("codex row");
@@ -8256,6 +9665,7 @@ mod tests {
             usage_scroll: 0,
             input_modal: None,
             raw_modal: None,
+            account_modal: None,
             frame: 0,
             mode: Mode::Normal,
             overlay,
@@ -8270,6 +9680,7 @@ mod tests {
             sessions_pct: 100,
             session_cursor: 0,
             session_sort: Default::default(),
+            account_sort: Default::default(),
             config_cursor: 0,
             config_input: String::new(),
             config_saved: Default::default(),
@@ -8278,6 +9689,7 @@ mod tests {
             reset_absolute: false,
             limits_input: String::new(),
             attach: None,
+            keys: Default::default(),
         }
     }
 
@@ -8405,6 +9817,10 @@ mod tests {
             effort: None,
             fast: false,
             kind: None,
+            user_id: None,
+            tenant: None,
+            excerpt: None,
+            client_name: None,
             started_at: std::time::SystemTime::UNIX_EPOCH,
         }];
         let text = render(&view, &chrome_overlay(Overlay::None), 160, 30);
@@ -9669,6 +11085,10 @@ mod tests {
             effort: None,
             fast: false,
             kind: None,
+            user_id: None,
+            tenant: None,
+            excerpt: None,
+            client_name: None,
             started_at: std::time::SystemTime::UNIX_EPOCH,
         }];
         let text = render(&view, &chrome_overlay(Overlay::None), 160, 30);
@@ -9697,6 +11117,10 @@ mod tests {
             effort: Some("max".into()),
             fast: true,
             kind: None,
+            user_id: None,
+            tenant: None,
+            excerpt: None,
+            client_name: None,
             started_at: std::time::SystemTime::UNIX_EPOCH,
         }];
         let text = render(&view, &chrome_overlay(Overlay::None), 160, 30);
@@ -9727,6 +11151,10 @@ mod tests {
             effort: None,
             fast: false,
             kind: Some("compact".into()),
+            user_id: None,
+            tenant: None,
+            excerpt: None,
+            client_name: None,
             started_at: std::time::SystemTime::UNIX_EPOCH,
         }];
         let rows = render_rows(&view, &chrome_overlay(Overlay::None), 160, 30);
@@ -9738,6 +11166,215 @@ mod tests {
             row.find("compact").unwrap_or(usize::MAX)
                 < row.find("[opus-4-8]").unwrap_or(usize::MAX),
             "kind → badge order on the in-flight row: {row}"
+        );
+    }
+
+    /// activity in-flight identity: a RUNNING row shows WHO is asking and
+    /// WHAT they asked — the same Name column, «session» label and “input”
+    /// excerpt its eventual completed row shows. Before this, the running row
+    /// stopped at the badge and the account.
+    #[test]
+    fn in_flight_row_shows_client_name_session_label_and_excerpt_like_a_completed_row() {
+        let mut view = view_with(Vec::new());
+        view.session_labels
+            .insert("u1".into(), "hello world".into());
+        view.in_flight = vec![super::super::activity::InFlight {
+            id: 1,
+            method: "POST".into(),
+            path: "/v1/messages".into(),
+            account: Some("claude:me@example.com".into()),
+            group: Some("claude".into()),
+            model: Some("claude-opus-4-8".into()),
+            effort: None,
+            fast: false,
+            kind: Some("user".into()),
+            user_id: Some("u1".into()),
+            tenant: Some("k-t1".into()),
+            excerpt: Some("hello world".into()),
+            client_name: Some("Z (U09F1M5MML1)".into()),
+            started_at: std::time::SystemTime::now(),
+        }];
+        let rows = render_rows(&view, &chrome_overlay(Overlay::None), 160, 30);
+        let row = rows
+            .iter()
+            .find(|l| l.contains("[opus-4-8]"))
+            .expect("in-flight row rendered");
+        // Name cell: the 4-char short form, padded, BEFORE the badge.
+        let name_at = row.find("Z   ").expect("short client name cell: {row}");
+        let badge_at = row.find("[opus-4-8]").expect("badge");
+        assert!(name_at < badge_at, "name → badge order: {row}");
+        assert!(
+            row.contains("\u{ab}hello world\u{bb}"),
+            "derived session label rides the running row: {row}"
+        );
+        assert!(
+            row.contains("\u{201c}hello world\u{201d}"),
+            "input excerpt rides the running row: {row}"
+        );
+    }
+
+    /// Display-cell offset of byte position `at` in `row`. Byte offsets and
+    /// char counts both lie here — the spinner/marker glyphs are multi-byte
+    /// and a CJK name cell is one char but two cells wide.
+    fn cells_before(row: &str, at: usize) -> usize {
+        cell_width(&row[..at])
+    }
+
+    /// Every column boundary of an activity row that can be located by
+    /// CONTENT rather than by a hardcoded width: the badge, the email arrow,
+    /// the right edge of the duration cell, the three `—` placeholder cells
+    /// (tokens / throughput / cost) and the «session» / “input” starts.
+    ///
+    /// Right-aligned numeric cells are pinned by their RIGHT edge — that is
+    /// what the padding decides; their left edge follows from the arrow
+    /// anchor, which is asserted separately.
+    fn row_columns(row: &str) -> Vec<usize> {
+        let badge = row
+            .find("[opus-4-8]")
+            .unwrap_or_else(|| panic!("badge in {row}"));
+        let arrow = row
+            .find(" → ")
+            .unwrap_or_else(|| panic!("email arrow in {row}"));
+        let tail = &row[arrow..];
+        let first_dash = tail
+            .find('—')
+            .unwrap_or_else(|| panic!("placeholder cells in {row}"));
+        // The duration text always ends in `s`; nothing else between the
+        // arrow and the first placeholder does. Located by CONTENT so the
+        // assertion still holds when `dur_w` grows.
+        let dur_end = tail[..first_dash]
+            .rfind('s')
+            .unwrap_or_else(|| panic!("duration cell in {row}"));
+        let mut cols = vec![
+            cells_before(row, badge),
+            cells_before(row, arrow),
+            cells_before(row, arrow + dur_end) + 1,
+        ];
+        cols.extend(
+            tail.match_indices('—')
+                .map(|(at, _)| cells_before(row, arrow + at)),
+        );
+        cols.push(cells_before(
+            row,
+            row.find('«').unwrap_or_else(|| panic!("label in {row}")),
+        ));
+        cols.push(cells_before(
+            row,
+            row.find('“').unwrap_or_else(|| panic!("excerpt in {row}")),
+        ));
+        cols
+    }
+
+    /// A view holding one RUNNING and one COMPLETED request that differ ONLY
+    /// in being in flight — same kind, client name, model, account, client id
+    /// and excerpt — so any column that fails to line up is the renderer's
+    /// doing and nothing else's.
+    fn aligned_pair_view(client_name: &str, running_for: Duration) -> DashboardView {
+        let mut view = view_with(Vec::new());
+        view.session_labels
+            .insert("u1".into(), "hello world".into());
+        view.in_flight = vec![super::super::activity::InFlight {
+            id: 1,
+            method: "POST".into(),
+            path: "/v1/messages".into(),
+            account: Some("claude:me@example.com".into()),
+            group: Some("claude".into()),
+            model: Some("claude-opus-4-8".into()),
+            effort: None,
+            fast: false,
+            kind: Some("user".into()),
+            user_id: Some("u1".into()),
+            tenant: Some("k-t1".into()),
+            excerpt: Some("hello world".into()),
+            client_name: Some(client_name.into()),
+            started_at: std::time::SystemTime::now() - running_for,
+        }];
+        view.completed = vec![Completed {
+            at: UNIX_EPOCH + Duration::from_millis(1_000),
+            body: CompletedBody::Request {
+                id: 2,
+                method: "POST".into(),
+                path: "/v1/messages".into(),
+                account: Some("claude:me@example.com".into()),
+                status: 200,
+                duration: Duration::from_millis(1_200),
+                tokens: None,
+                group: Some("claude".into()),
+                model: Some("claude-opus-4-8".into()),
+                effort: None,
+                fast: Some(false),
+                ttfb_ms: None,
+                ttft_ms: None,
+                gen_ms: None,
+                aborted: false,
+                user_id: Some("u1".into()),
+                kind: Some("user".into()),
+                excerpt: Some("hello world".into()),
+                tenant: Some("k-t1".into()),
+                client_name: Some(client_name.into()),
+            },
+        }];
+        view
+    }
+
+    /// The two activity rows of `view` that carry the model badge: the
+    /// running one and the completed one.
+    fn badge_rows(view: &DashboardView) -> (String, String) {
+        let rows = render_rows(view, &chrome_overlay(Overlay::None), 160, 30);
+        let found: Vec<String> = rows
+            .into_iter()
+            .filter(|l| l.contains("[opus-4-8]"))
+            .collect();
+        assert_eq!(
+            found.len(),
+            2,
+            "one running row + one completed row, got {found:#?}"
+        );
+        (found[0].clone(), found[1].clone())
+    }
+
+    /// The running row is not merely *decorated* like a completed row — every
+    /// column lands in the SAME screen column, which is the whole point of
+    /// sharing the layout (a feed that reflows as requests come and go is
+    /// unreadable).
+    #[test]
+    fn in_flight_row_columns_align_with_a_completed_row() {
+        let view = aligned_pair_view("Z (U09F1M5MML1)", Duration::ZERO);
+        let (running, completed) = badge_rows(&view);
+        let (a, b) = (row_columns(&running), row_columns(&completed));
+        assert_eq!(
+            a.len(),
+            8,
+            "badge, arrow, duration, 3 placeholders, label, excerpt: {a:?}"
+        );
+        assert_eq!(
+            a, b,
+            "columns differ between the running and completed rows:\n{running}\n{completed}"
+        );
+    }
+
+    /// The same alignment must survive the two things that MOVE the columns:
+    /// a wide (CJK) name cell, and an in-flight row whose live elapsed time is
+    /// wider than any completed duration on screen — the running row itself
+    /// widens the shared duration column, so the completed row has to be
+    /// measured against it (`RowMetrics::measure` takes `now` for exactly
+    /// this reason).
+    #[test]
+    fn in_flight_row_columns_align_with_a_wide_name_and_a_long_run() {
+        let view = aligned_pair_view("한글이름 (U0)", Duration::from_secs(11 * 60));
+        let (running, completed) = badge_rows(&view);
+        let (a, b) = (row_columns(&running), row_columns(&completed));
+        assert_eq!(a.len(), 8, "{a:?}");
+        assert_eq!(
+            a, b,
+            "columns differ under a wide name + a long run:\n{running}\n{completed}"
+        );
+        // The running row really did widen the shared duration column: a 660s
+        // elapsed needs 6 cells, so the completed `1.2s` is now left-padded by
+        // 2 on top of the separator space after the 3-cell status.
+        assert!(
+            completed.contains("200   1.2s"),
+            "the in-flight elapsed must widen `dur_w` for BOTH rows: {completed}"
         );
     }
 
@@ -9778,7 +11415,7 @@ mod tests {
         let labels = BTreeMap::new();
         let abbrev = BTreeMap::new();
         let cost_span = |entry: &Completed| {
-            let m = RowMetrics::measure(200, &[], &[entry]);
+            let m = RowMetrics::measure(200, UNIX_EPOCH, &[], &[entry]);
             completed_line(
                 entry,
                 false,
@@ -9831,7 +11468,7 @@ mod tests {
         let labels = BTreeMap::new();
         let abbrev = BTreeMap::new();
         let render = |entry: &Completed| -> String {
-            let m = RowMetrics::measure(200, &[], &[entry]);
+            let m = RowMetrics::measure(200, UNIX_EPOCH, &[], &[entry]);
             completed_line(
                 entry,
                 false,
@@ -9947,7 +11584,7 @@ mod tests {
         let labels = BTreeMap::new();
         let abbrev = BTreeMap::new();
         let name_cell = |entry: &Completed| {
-            let m = RowMetrics::measure(200, &[], &[entry]);
+            let m = RowMetrics::measure(200, UNIX_EPOCH, &[], &[entry]);
             completed_line(
                 entry,
                 false,
@@ -10008,7 +11645,7 @@ mod tests {
         let labels = BTreeMap::new();
         let abbrev = BTreeMap::new();
         let rendered_width = |entry: &Completed, w: u16| {
-            let m = RowMetrics::measure(w, &[], &[entry]);
+            let m = RowMetrics::measure(w, UNIX_EPOCH, &[], &[entry]);
             completed_line(
                 entry,
                 false,
@@ -10066,7 +11703,7 @@ mod tests {
         let run = [probe.clone(), probe.clone()];
         let labels = BTreeMap::new();
         let abbrev = BTreeMap::new();
-        let m = RowMetrics::measure(120, &[], &[&probe]);
+        let m = RowMetrics::measure(120, UNIX_EPOCH, &[], &[&probe]);
         let header = folded_run_line(
             &run,
             false,
@@ -10462,6 +12099,423 @@ mod tests {
             hits.expect("layout").input_modal_max_scroll,
             None,
             "aged-out entry yields the close signal"
+        );
+    }
+
+    /// A view whose single account carries EVERY optional datum the modal can
+    /// print: both windows, a scoped Fable limit, a scoped cooldown, an
+    /// account-wide cooldown, a ceiling override, totals, poll health, a
+    /// manual pin and a usage-control document with one credit.
+    fn rich_account_view() -> (DashboardView, String) {
+        use crate::proxy::usage_controls::UsageControlDoc;
+        use crate::routing::BackendGroup;
+        use crate::scheduler::window::{
+            LimitSeverity, QuotaWindow, ScopedQuotaWindow, WindowSource,
+        };
+        use crate::scheduler::{
+            AccountId, AccountSnapshot, Cooldown429Reason, CooldownScope, CooldownSource,
+            ManualPin, ModelScopedCooldown,
+        };
+
+        let name = "claude:me@example.com".to_string();
+        let now = SystemTime::now();
+        let mut view = view_with(Vec::new());
+        view.snapshot.accounts = vec![AccountSnapshot {
+            id: AccountId(name.clone()),
+            healthy: true,
+            credential_kind: "oauth",
+            group: BackendGroup::Claude,
+            five_hour: Some(QuotaWindow {
+                utilization: 0.42,
+                resets_at: now + Duration::from_secs(3_600),
+                fetched_at: now - Duration::from_secs(180),
+                source: WindowSource::UsagePoll,
+            }),
+            seven_day: Some(QuotaWindow {
+                utilization: 0.61,
+                resets_at: now + Duration::from_secs(400_000),
+                fetched_at: now - Duration::from_secs(180),
+                source: WindowSource::Headers,
+            }),
+            scoped_limits: vec![ScopedQuotaWindow {
+                scope_label: "Fable".into(),
+                window: QuotaWindow {
+                    utilization: 0.97,
+                    resets_at: now + Duration::from_secs(80_000),
+                    fetched_at: now - Duration::from_secs(180),
+                    source: WindowSource::UsagePoll,
+                },
+                severity: LimitSeverity::Critical,
+                is_active: true,
+            }],
+            scoped_cooldowns: vec![ModelScopedCooldown {
+                scope: CooldownScope::ModelScoped("Fable".into()),
+                until: now + Duration::from_secs(90),
+                set_at: now - Duration::from_secs(30),
+                reason: Cooldown429Reason::FableObservedCritical,
+            }],
+            cooldown_until: Some(now + Duration::from_secs(45)),
+            cooldown_source: Some(CooldownSource::RetryAfter),
+            in_flight: 2,
+            token_expires_at_ms: Some(1_780_000_000_000),
+            last_refresh_ms: Some(1_779_000_000_000),
+            paused: false,
+            limits: crate::config::AccountLimits {
+                five_hour_max: None,
+                seven_day_max: Some(0.95),
+                fable_weekly_max: None,
+            },
+        }];
+        view.snapshot
+            .current
+            .insert(BackendGroup::Claude, AccountId(name.clone()));
+        view.snapshot
+            .fable_current
+            .insert(BackendGroup::Claude, AccountId(name.clone()));
+        view.snapshot.manual_pin.insert(
+            BackendGroup::Claude,
+            ManualPin {
+                account: AccountId(name.clone()),
+                until: now + Duration::from_secs(240),
+            },
+        );
+        view.session_totals.insert(
+            name.clone(),
+            super::super::activity::Totals {
+                requests: 12,
+                ok: 11,
+                errors: 1,
+                tokens_in: 1_200,
+                tokens_out: 300,
+            },
+        );
+        view.poll_health.insert(
+            name.clone(),
+            super::super::PollHealth {
+                last_ok: Some(now - Duration::from_secs(180)),
+                consecutive_failures: 0,
+                next_at: now + Duration::from_secs(120),
+            },
+        );
+        view.usage_controls.insert(
+            name.clone(),
+            UsageControlDoc {
+                available_resets: Some(3),
+                applicable_resets: Some(0),
+                credits: vec![crate::auth::codex_usage::ResetCredit {
+                    id: Some("cr-1".into()),
+                    reset_type: Some("codex_rate_limits".into()),
+                    status: Some("available".into()),
+                    ..Default::default()
+                }],
+                last_refresh_ms: Some(1_779_000_000_000),
+                ..Default::default()
+            },
+        );
+        (view, name)
+    }
+
+    /// .prd/19 rule 7: the modal prints every recorded section for one account.
+    /// Asserted on the MODAL's own rect (the table beneath also says `status`
+    /// and `account`), so a label can never pass from the surface underneath.
+    #[test]
+    fn account_modal_renders_every_section() {
+        let (view, name) = rich_account_view();
+        let mut chrome = chrome_overlay(Overlay::None);
+        chrome.account_modal = Some(AccountModal {
+            account: name.clone(),
+            scroll: 0,
+        });
+        let (w, h) = (120u16, 50u16);
+        let rows = render_rows(&view, &chrome, w, h);
+        let area = centered_rect(
+            Rect {
+                x: 0,
+                y: 0,
+                width: w,
+                height: h,
+            },
+            80,
+            85,
+        );
+        let body: String = rows
+            [area.y as usize..(area.y as usize + area.height as usize).min(rows.len())]
+            .iter()
+            .map(|row| {
+                row.chars()
+                    .skip(area.x as usize)
+                    .take(area.width as usize)
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        for label in [
+            "identity", "status", "token", "windows", "5h raw", "7d raw", "scoped", "cooldown",
+            "limits", "lifetime", "poll", "resets",
+        ] {
+            assert!(body.contains(label), "section `{label}` missing:\n{body}");
+        }
+        assert!(body.contains(&name), "the account name is in the modal");
+        assert!(
+            body.contains("esc close"),
+            "the close hint rides the modal border:\n{body}"
+        );
+    }
+
+    /// .prd/19 rule 6: a modal pinned to an account that left the snapshot
+    /// draws nothing and reports `None` — the runtime's close signal.
+    #[test]
+    fn account_modal_closes_when_account_gone() {
+        let (view, _) = rich_account_view();
+        let mut chrome = chrome_overlay(Overlay::None);
+        chrome.account_modal = Some(AccountModal {
+            account: "claude:gone@example.com".into(),
+            scroll: 0,
+        });
+        let mut hits = None;
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("terminal");
+        terminal
+            .draw(|f| draw(f, Some(&view), &chrome, &mut hits))
+            .expect("draw");
+        assert_eq!(
+            hits.expect("layout").account_modal_max_scroll,
+            None,
+            "a vanished account yields the close signal"
+        );
+    }
+
+    /// The modal's gate is GROUP-scoped, exactly like the selector's. Mixed
+    /// pool: every claude account is usage-stale while a codex account is
+    /// eligible, so the POOL-wide `headers_only_mode` is false but the CLAUDE
+    /// group's is true — the claude selector serves its stale accounts through
+    /// the headers-only fallback, so the modal must read `ready`, not print a
+    /// `usage stale` block the selector does not believe.
+    #[test]
+    fn account_modal_gate_is_group_scoped() {
+        use crate::routing::BackendGroup;
+        use crate::scheduler::window::{QuotaWindow, WindowSource};
+        use crate::scheduler::{AccountId, AccountSnapshot};
+
+        let now = SystemTime::now();
+        let mut view = view_with(Vec::new());
+        let acct =
+            |name: &str, kind: &'static str, group, five: Option<QuotaWindow>| AccountSnapshot {
+                id: AccountId(name.into()),
+                healthy: true,
+                credential_kind: kind,
+                group,
+                five_hour: five,
+                seven_day: None,
+                scoped_limits: Vec::new(),
+                scoped_cooldowns: Vec::new(),
+                cooldown_until: None,
+                cooldown_source: None,
+                in_flight: 0,
+                token_expires_at_ms: None,
+                last_refresh_ms: None,
+                paused: false,
+                limits: crate::config::AccountLimits::default(),
+            };
+        // Live window, but fetched way past `usage_max_age` (600s) → UsageStale.
+        let stale = QuotaWindow {
+            utilization: 0.10,
+            resets_at: now + Duration::from_secs(3_600),
+            fetched_at: now - Duration::from_secs(5_000),
+            source: WindowSource::UsagePoll,
+        };
+        view.snapshot.accounts = vec![
+            acct(
+                "claude:a@example.com",
+                "oauth",
+                BackendGroup::Claude,
+                Some(stale),
+            ),
+            // Codex is exempt from the staleness gate → eligible, so the
+            // pool-wide fallback never trips.
+            acct("codex:b@example.com", "codex", BackendGroup::Codex, None),
+        ];
+        assert!(
+            !select::headers_only_mode(&view.snapshot, &view.select_params, None, now),
+            "the eligible codex account keeps the POOL-wide flag false"
+        );
+        assert!(
+            select::headers_only_mode(
+                &view.snapshot,
+                &view.select_params,
+                Some(BackendGroup::Claude),
+                now
+            ),
+            "…while the all-stale claude group IS in headers-only fallback"
+        );
+
+        let ctx = FrameCtx {
+            now,
+            tz_offset: 0,
+            order: vec![0, 1],
+            // The frame-wide flag the modal used to gate with.
+            headers_only: false,
+            frame: 0,
+            mask: false,
+            quota_display: view.quota_display,
+            reset_absolute: false,
+        };
+        let chrome = chrome_overlay(Overlay::None);
+        let lines = account_modal_lines(&view, &ctx, &chrome, &view.snapshot.accounts[0]);
+        let flat: Vec<String> = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        let body = flat.join("\n");
+        let gate_row = flat
+            .iter()
+            .find(|l| l.trim_start().starts_with("gate"))
+            .unwrap_or_else(|| panic!("no gate row:\n{body}"));
+        assert!(
+            !gate_row.contains("stale"),
+            "group-scoped fallback ⇒ the claude account is not stale-blocked: {gate_row}"
+        );
+        assert!(
+            gate_row.contains("ready"),
+            "it reads as an eligible, non-current account: {gate_row}"
+        );
+        assert!(
+            !flat.iter().any(|l| l.trim_start().starts_with("blocked")),
+            "an eligible account has no `blocked` row:\n{body}"
+        );
+    }
+
+    /// The modal's gate also honors the GROUP-scoped heuristic-degraded mode,
+    /// exactly like `pick_scoped`. Every claude account is parked SOLELY by a
+    /// heuristic (retry-after-less 429) cooldown while a codex account is
+    /// eligible, so the pool-wide flag is false but the claude group's is true:
+    /// the claude selector serves the soonest-freed parked account, so the modal
+    /// must NOT claim that account is `blocked cooldown`. The park itself stays
+    /// visible in the `cooldown` section; the `degraded` row says why the gate
+    /// reads ready anyway.
+    #[test]
+    fn account_modal_gate_honors_heuristic_degraded_mode() {
+        use crate::routing::BackendGroup;
+        use crate::scheduler::select::Decision;
+        use crate::scheduler::{AccountId, AccountSnapshot, CooldownSource};
+
+        let now = SystemTime::now();
+        let mut view = view_with(Vec::new());
+        let acct = |name: &str, kind: &'static str, group, park: Option<u64>| AccountSnapshot {
+            id: AccountId(name.into()),
+            healthy: true,
+            credential_kind: kind,
+            group,
+            five_hour: None,
+            seven_day: None,
+            scoped_limits: Vec::new(),
+            scoped_cooldowns: Vec::new(),
+            cooldown_until: park.map(|secs| now + Duration::from_secs(secs)),
+            cooldown_source: park.map(|_| CooldownSource::Heuristic),
+            in_flight: 0,
+            token_expires_at_ms: None,
+            last_refresh_ms: None,
+            paused: false,
+            limits: crate::config::AccountLimits::default(),
+        };
+        view.snapshot.accounts = vec![
+            acct(
+                "claude:a@example.com",
+                "oauth",
+                BackendGroup::Claude,
+                Some(600),
+            ),
+            // Frees soonest → the account the degraded selector picks.
+            acct(
+                "claude:b@example.com",
+                "oauth",
+                BackendGroup::Claude,
+                Some(120),
+            ),
+            // Eligible, so the POOL-wide flag never trips.
+            acct("codex:c@example.com", "codex", BackendGroup::Codex, None),
+        ];
+        assert!(
+            !select::heuristic_degraded_mode(&view.snapshot, &view.select_params, None, now),
+            "the eligible codex account keeps the POOL-wide flag false"
+        );
+        assert!(
+            select::heuristic_degraded_mode(
+                &view.snapshot,
+                &view.select_params,
+                Some(BackendGroup::Claude),
+                now
+            ),
+            "…while the all-heuristic-parked claude group IS in degraded mode"
+        );
+        let picked = select::pick_scoped(
+            &view.snapshot,
+            &view.select_params,
+            Some(BackendGroup::Claude),
+            now,
+            select::RequestScope::NonFable,
+        );
+        assert_eq!(
+            picked,
+            Decision::Switch {
+                to: AccountId("claude:b@example.com".into())
+            },
+            "the degraded selector serves the soonest-freed parked account"
+        );
+
+        let ctx = FrameCtx {
+            now,
+            tz_offset: 0,
+            order: vec![0, 1, 2],
+            headers_only: false,
+            frame: 0,
+            mask: false,
+            quota_display: view.quota_display,
+            reset_absolute: false,
+        };
+        let chrome = chrome_overlay(Overlay::None);
+        // Index 1 = the account the selector just picked.
+        let lines = account_modal_lines(&view, &ctx, &chrome, &view.snapshot.accounts[1]);
+        let flat: Vec<String> = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        let body = flat.join("\n");
+        let gate_row = flat
+            .iter()
+            .find(|l| l.trim_start().starts_with("gate"))
+            .unwrap_or_else(|| panic!("no gate row:\n{body}"));
+        // A cooldown-blocked gate row renders TIME-ONLY (`▌ 2m 00s`, the 120s
+        // park above), so the countdown's absence is the cooldown gate's
+        // absence.
+        assert!(
+            !gate_row.contains("2m"),
+            "group degraded mode ⇒ the picked account is not cooldown-blocked: {gate_row}"
+        );
+        assert!(
+            gate_row.contains("ready"),
+            "it reads as an eligible, non-current account: {gate_row}"
+        );
+        assert!(
+            !flat.iter().any(|l| l.trim_start().starts_with("blocked")),
+            "the account the selector picks has no `blocked` row:\n{body}"
+        );
+        assert!(
+            flat.iter().any(|l| l.trim_start().starts_with("degraded")),
+            "…and the `degraded` row explains why the gate reads ready:\n{body}"
+        );
+        assert!(
+            body.contains("heuristic"),
+            "the cooldown FACT stays visible in the cooldown section:\n{body}"
         );
     }
 
@@ -11396,16 +13450,27 @@ mod tests {
     /// Leftover-width receipt (Z 2026-07-13): with every column a fixed
     /// `Length`, the leftover terminal width is poured into the quota gauge
     /// BARS instead of dying as dead space on the right (~col 120) — the
-    /// follow-up to the NAME_COL_MAX cap. A wide (200-col) render reaches near
-    /// the right edge; the same account at 120 cols stays within the terminal.
+    /// follow-up to the NAME_COL_MAX cap. A wide (200-col) render pushes the
+    /// row far past its minimum; the same account at 120 cols stays within the
+    /// terminal.
+    ///
+    /// Z 2026-09-18 (.prd/18): the reach at 200 cols dropped from ≥170 to ≥145
+    /// (measured 149) — there are now TWO stretchy gauges (7d + Fbl) instead of
+    /// three and the 5h stub is a fixed 8, so both bars hit the GAUGE_BAR_MAX
+    /// cap before the leftover runs out. The cap winning at an ultra-wide
+    /// terminal is the intended behaviour, not dead space from a packed-left
+    /// table. This fixture (name 14, Fbl on, no `rst`) has a wide row of
+    /// `27 + status + 14 + 2×17 + 8 + 10 spaces` = 101 at the 8-col status
+    /// floor and 113 as rendered here (status at its full 20), so 149 is 36
+    /// cols of pure bar growth.
     #[test]
     fn accounts_gauges_absorb_leftover_width() {
         let mut view = view_with(Vec::new());
         view.snapshot.accounts = vec![fable_account()];
         view.show_fable_weekly = true;
 
-        // Wide: leftover width flows into the 3 gauge bars, so the row's content
-        // reaches near the 200-col right edge (was dying at ~120 dead-space).
+        // Wide: leftover width flows into the stretchy gauge bars, so the row's
+        // content runs far past its 113-col rendered minimum (was dying ~120).
         let wide = render_rows(&view, &chrome_overlay(Overlay::None), 200, 40);
         let wide_row = wide
             .iter()
@@ -11417,9 +13482,9 @@ mod tests {
                 )
             });
         assert!(
-            wide_row.trim_end().chars().count() >= 170,
-            "leftover width goes to the gauge bars — the row reaches near the \
-             200-col right edge instead of dying at ~120:\n{wide_row}"
+            wide_row.trim_end().chars().count() >= 145,
+            "leftover width goes to the gauge bars — the row runs well past its \
+             113-col rendered minimum instead of dying at ~120:\n{wide_row}"
         );
 
         // Narrow: the same row still fits inside a 120-col terminal (the bars
@@ -11444,6 +13509,12 @@ mod tests {
     /// `WIDE_TABLE_AT=150` predated the NAME_COL_MAX cap, so at ~149 cols the
     /// wide column set (req/tok) was hidden and the width poured into fat bars.
     /// The wide set must engage as soon as it actually fits.
+    ///
+    /// Z 2026-09-18 (.prd/18): "fits" is now judged with `status` at its 8-col
+    /// floor and `5h` at its fixed 8, so the set engages EARLIER than before —
+    /// for this fixture (Fbl on, no `rst`) the minimum wide row is
+    /// `27 + 8 + name + 2×17 + 8 + 10 spaces` = 87 + name = 101 at name 14, so
+    /// 110 cols is wide now and the narrow probe moved to 90.
     #[test]
     fn accounts_wide_set_fits_before_150() {
         let mut view = view_with(Vec::new());
@@ -11462,22 +13533,392 @@ mod tests {
             "at 149 cols the wide set fits — header shows req + tok:\n{header_149}"
         );
 
-        // 110 cols: too narrow for the wide set → header has 5h but not req.
-        let at_110 = render_rows(&view, &chrome_overlay(Overlay::None), 110, 40);
-        let header_110 = at_110
+        // 90 cols: too narrow for the wide set → header has 5h but not req.
+        let at_90 = render_rows(&view, &chrome_overlay(Overlay::None), 90, 40);
+        let header_90 = at_90
             .iter()
             .find(|line| line.contains("account") && line.contains("5h"))
-            .unwrap_or_else(|| panic!("expected the accounts header row:\n{}", at_110.join("\n")));
+            .unwrap_or_else(|| panic!("expected the accounts header row:\n{}", at_90.join("\n")));
         assert!(
-            !header_110.contains("req"),
-            "at 110 cols the narrow set still exists — no req column:\n{header_110}"
+            !header_90.contains("req"),
+            "at 90 cols the narrow set still exists — no req column:\n{header_90}"
         );
     }
 
-    /// The narrow layout compresses the gauge to an inline `F 97%` marker
-    /// (no third gauge+reset pair) when the toggle is ON, and drops it when OFF.
+    // --- .prd/18: the 5h stub, the status sponge, the un-shrinkable Fbl ------
+
+    /// A view with one account per group, every row carrying a live 7d window so
+    /// the ONLY place `cold` can come from is the 5h cell — the negative
+    /// controls and the positive control share one frame (.prd/18 tests,
+    /// Z 2026-09-18).
+    fn five_hour_group_view() -> DashboardView {
+        use crate::routing::BackendGroup;
+        use crate::scheduler::window::{QuotaWindow, WindowSource};
+        use crate::scheduler::{AccountId, AccountSnapshot};
+        let now = SystemTime::now();
+        let window = |utilization: f64| QuotaWindow {
+            utilization,
+            resets_at: now + Duration::from_secs(80_000),
+            fetched_at: now,
+            source: WindowSource::UsagePoll,
+        };
+        let account =
+            |name: &str, kind: &'static str, group, five: Option<QuotaWindow>| AccountSnapshot {
+                id: AccountId(name.into()),
+                healthy: true,
+                credential_kind: kind,
+                group,
+                five_hour: five,
+                seven_day: Some(window(0.20)),
+                scoped_limits: Vec::new(),
+                scoped_cooldowns: Vec::new(),
+                cooldown_until: None,
+                cooldown_source: None,
+                in_flight: 0,
+                token_expires_at_ms: None,
+                last_refresh_ms: None,
+                paused: false,
+                limits: crate::config::AccountLimits::default(),
+            };
+        let mut view = view_with(Vec::new());
+        view.show_fable_weekly = false;
+        view.snapshot.accounts = vec![
+            // Codex has no 5h source at all; grok DOES report a header-fed burst
+            // window (.prd/18 §Tension) — both must still read `-`.
+            account("codex:me@example.com", "codex", BackendGroup::Codex, None),
+            account(
+                "grok:me@example.com",
+                "grok",
+                BackendGroup::Grok,
+                Some(window(0.30)),
+            ),
+            account("claude:me@example.com", "oauth", BackendGroup::Claude, None),
+        ];
+        view
+    }
+
+    /// .prd/18 rule 1 (owner 2026-09-18: "코덱스랑 grok은 5시간 제한이 없음 cold가
+    /// 아니라 `-` 처럼 n/a 표시해야함"): the 5h cell is Claude-only. A CODEX row
+    /// and a GROK row render a dim `-` and carry no `cold` anywhere — even the
+    /// grok row, whose burst window is real but is not a 5h limit. A CLAUDE row
+    /// with no 5h window still reads the honest `○ cold`.
     #[test]
-    fn fable_gauge_narrow_uses_compact_marker_gated_by_toggle() {
+    fn five_hour_cell_is_n_a_for_non_claude_groups() {
+        let view = five_hour_group_view();
+        let rows = render_rows(&view, &chrome_overlay(Overlay::Accounts), 200, 24);
+        let frame = rows.join("\n");
+        let header = rows
+            .iter()
+            .find(|r| r.contains("account") && r.contains("5h"))
+            .unwrap_or_else(|| panic!("header row:\n{frame}"));
+        let five_at = header.find("5h").expect("5h column offset");
+        let cell = |row: &str| -> String {
+            row.chars()
+                .skip(five_at)
+                .take(FIVE_H_COL_WIDTH as usize)
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        };
+        for group in ["CODEX", "GROK"] {
+            let row = rows
+                .iter()
+                .find(|r| r.contains(group))
+                .unwrap_or_else(|| panic!("{group} row:\n{frame}"));
+            assert_eq!(cell(row), "-", "{group} 5h cell is n/a: {row:?}\n{frame}");
+            assert!(
+                !row.contains("cold"),
+                "{group} row never claims a cold 5h window: {row:?}\n{frame}"
+            );
+        }
+        let claude = rows
+            .iter()
+            .find(|r| r.contains("CLAUDE"))
+            .unwrap_or_else(|| panic!("claude row:\n{frame}"));
+        assert_eq!(
+            cell(claude),
+            "○ cold",
+            "a claude row with no 5h window still shows the cold state: \
+             {claude:?}\n{frame}"
+        );
+    }
+
+    /// .prd/18 rule 1 extended to the Fable column (owner 2026-09-18: "7d
+    /// fable도 코덱스 그록등 사용량 없는 열에 cold가 아니라 `-`로 비워줘"): the
+    /// `7d Fbl` cell is Claude-only. A CODEX row and a GROK row render a dim `-`
+    /// and carry no `cold` from the Fbl offset on; a CLAUDE row with no Fable
+    /// scope still reads the honest `○ cold`. The `cold` assertion is scoped to
+    /// the Fbl slice because the CLAUDE row legitimately shows `○ cold` under
+    /// `5h` (Z 2026-09-18).
+    #[test]
+    fn fable_gauge_cell_is_n_a_for_non_claude_groups() {
+        let mut view = five_hour_group_view();
+        // The helper turns the Fable column off for the 5h test; this test is
+        // about that column, so switch it on for this frame only.
+        view.show_fable_weekly = true;
+        let rows = render_rows(&view, &chrome_overlay(Overlay::Accounts), 200, 24);
+        let frame = rows.join("\n");
+        let header = rows
+            .iter()
+            .find(|r| r.contains("account") && r.contains("7d Fbl"))
+            .unwrap_or_else(|| panic!("header row:\n{frame}"));
+        let fbl_at = header.find("7d Fbl").expect("7d Fbl column offset");
+        let cell = |row: &str| -> String { row.chars().skip(fbl_at).collect::<String>() };
+        for group in ["CODEX", "GROK"] {
+            let row = rows
+                .iter()
+                .find(|r| r.contains(group))
+                .unwrap_or_else(|| panic!("{group} row:\n{frame}"));
+            let tail = cell(row);
+            assert!(
+                tail.trim_end().starts_with('-'),
+                "{group} Fbl cell is n/a: {tail:?}\n{frame}"
+            );
+            assert!(
+                !tail.contains("cold"),
+                "{group} row never claims a cold Fable window: {tail:?}\n{frame}"
+            );
+        }
+        let claude = rows
+            .iter()
+            .find(|r| r.contains("CLAUDE"))
+            .unwrap_or_else(|| panic!("claude row:\n{frame}"));
+        assert!(
+            cell(claude).starts_with("○ cold"),
+            "a claude row with no Fable scope still shows the cold state: \
+             {claude:?}\n{frame}"
+        );
+    }
+
+    /// .prd/18 rule 2 (owner: "최대 8칸 넓이로 해줘"): every 5h cell state fits
+    /// [`FIVE_H_COL_WIDTH`] — the widest is `◑ 100%!` (7 cells). Pure over
+    /// [`five_hour_text`], so the width contract holds without a terminal
+    /// (Z 2026-09-18).
+    #[test]
+    fn five_hour_cell_fits_eight_cells() {
+        use crate::routing::BackendGroup;
+        use crate::scheduler::window::{QuotaWindow, WindowSource};
+        use unicode_width::UnicodeWidthStr;
+
+        let now = SystemTime::now();
+        let max_age = Duration::from_secs(600);
+        // One window per display state: fresh (populated), old observation
+        // (stale), and the poll-degraded overlay via consecutive_failures.
+        let window = |utilization: f64, fetched_at: SystemTime| {
+            Some(QuotaWindow {
+                utilization,
+                resets_at: now + Duration::from_secs(3_600),
+                fetched_at,
+                source: WindowSource::UsagePoll,
+            })
+        };
+        let cases: Vec<(&str, Option<QuotaWindow>, u32)> = vec![
+            ("populated", window(1.0, now), 0),
+            ("stale", window(1.0, now - Duration::from_secs(1_800)), 0),
+            ("poll-degraded", window(1.0, now), 3),
+            ("cold", None, 0),
+            ("cold + poll-degraded", None, 3),
+        ];
+        for (label, win, failures) in cases {
+            for parked in [false, true] {
+                for mode in [
+                    crate::config::QuotaDisplay::Used,
+                    crate::config::QuotaDisplay::Remaining,
+                ] {
+                    for group in BackendGroup::ALL {
+                        let (text, _) =
+                            five_hour_text(*group, &win, 0.9, parked, now, max_age, failures, mode);
+                        assert!(
+                            UnicodeWidthStr::width(text.as_str()) <= FIVE_H_COL_WIDTH as usize,
+                            "5h cell `{text}` ({label}, parked={parked}, \
+                             group={group:?}) fits {FIVE_H_COL_WIDTH} cells"
+                        );
+                    }
+                }
+            }
+        }
+        // The widest state is the one the column was sized for.
+        let (widest, _) = five_hour_text(
+            BackendGroup::Claude,
+            &window(1.0, now - Duration::from_secs(1_800)),
+            0.9,
+            true,
+            now,
+            max_age,
+            0,
+            crate::config::QuotaDisplay::Used,
+        );
+        assert_eq!(widest, "◑ 100%!");
+    }
+
+    /// .prd/18 rule 2: the 5h column is a FIXED 8 at every width — it never
+    /// takes a share of the leftover the stretchy gauges drink. The header
+    /// offset of `7d` minus that of `5h` is exactly 9 (8 + the inter-column
+    /// space) at a narrow, a just-wide and an ultra-wide terminal
+    /// (Z 2026-09-18).
+    #[test]
+    fn five_hour_column_is_fixed_eight_wide() {
+        let mut view = view_with(Vec::new());
+        view.snapshot.accounts = vec![fable_account()];
+        view.show_fable_weekly = true;
+        for w in [100u16, 149, 200] {
+            let rows = render_rows(&view, &chrome_overlay(Overlay::None), w, 40);
+            let frame = rows.join("\n");
+            let header = rows
+                .iter()
+                .find(|r| r.contains("account") && r.contains("5h"))
+                .unwrap_or_else(|| panic!("header row at {w}:\n{frame}"));
+            let five = header.find("5h").expect("5h offset");
+            let seven = header.find("7d").expect("7d offset");
+            assert_eq!(
+                seven - five,
+                FIVE_H_COL_WIDTH as usize + 1,
+                "5h stays a fixed {FIVE_H_COL_WIDTH}-wide column at {w} cols: \
+                 {header:?}\n{frame}"
+            );
+        }
+    }
+
+    /// .prd/18 rule 4 (owner: "accounts 공간이 부족하면 status 창부터 줄여줘
+    /// (최소칸 8칸)"): at a width between the row's 20-status minimum (98) and
+    /// its 8-status minimum (86), `status` is the only column that gives way —
+    /// `5h`, `7d` and `7d Fbl` are all still there, and status keeps at least
+    /// its 8-cell floor (Z 2026-09-18).
+    #[test]
+    fn status_column_shrinks_before_any_gauge_gives_way() {
+        let mut view = view_with(Vec::new());
+        view.snapshot.accounts = vec![fable_account()];
+        view.show_fable_weekly = true;
+
+        let rows = render_rows(&view, &chrome_overlay(Overlay::None), 90, 40);
+        let frame = rows.join("\n");
+        let header = rows
+            .iter()
+            .find(|r| r.contains("account") && r.contains("status"))
+            .unwrap_or_else(|| panic!("header row:\n{frame}"));
+        for kept in ["5h", "7d", "7d Fbl"] {
+            assert!(
+                header.contains(kept),
+                "`{kept}` survives — only status gives way: {header:?}\n{frame}"
+            );
+        }
+        let status_w = header.find("5h").unwrap() - header.find("status").unwrap() - 1;
+        assert!(
+            (STATUS_COL_MIN..STATUS_COL_MAX).contains(&status_w),
+            "status shrank below its 20-col full width but not past its \
+             {STATUS_COL_MIN}-col floor (got {status_w}): {header:?}\n{frame}"
+        );
+        // …and the name column is untouched at this width: it is the LAST
+        // column to give way, after status and the 5h stub.
+        assert!(
+            rows.iter().any(|r| r.contains("me@example.com")),
+            "the account name is not clipped while status still has slack:\n{frame}"
+        );
+    }
+
+    /// .prd/18 rule 4, step 3 (astra review 2026-09-18): with a 20-col name the
+    /// row can overflow even after `status` is at its 8-col floor and the `5h`
+    /// stub has dropped — narrow row minimum = `14 + 8 + 20 + 2×17 + 3 + 8` = 87
+    /// with `rst` on (83 without), both past an 80-col terminal. Before the name
+    /// step the constraints summed past the frame and ratatui shaved EVERY
+    /// column (the `gr`/`CO` class this whole layout exists to prevent). The
+    /// `account` column is what gives way there — never the gauges.
+    ///
+    /// At 80 cols the arithmetic lands on exactly 80: with `rst` the name is
+    /// `80 − (14 + 8 + 34 + 3 + 8 spaces)` = 13, without it 17; status sits on
+    /// its 8-col floor in both.
+    #[test]
+    fn narrow_80_shrinks_name_to_protect_status_floor_and_fable_gauge() {
+        use crate::scheduler::AccountId;
+
+        const LONG: &str = "claude:longname-account@example.com";
+        for resets in [false, true] {
+            let mut view = view_with(Vec::new());
+            let mut account = fable_account();
+            account.id = AccountId(LONG.into());
+            view.snapshot.accounts = vec![account];
+            view.show_fable_weekly = true;
+            if resets {
+                view.usage_controls.insert(
+                    LONG.into(),
+                    crate::proxy::usage_controls::UsageControlDoc {
+                        available_resets: Some(3),
+                        applicable_resets: Some(0),
+                        ..Default::default()
+                    },
+                );
+            }
+            let rows = render_rows(&view, &chrome_overlay(Overlay::Accounts), 80, 24);
+            let frame = rows.join("\n");
+            let header = rows
+                .iter()
+                .find(|r| r.contains("account") && r.contains("status"))
+                .unwrap_or_else(|| panic!("header row (rst={resets}):\n{frame}"));
+            for kept in ["group", "status", "7d", "7d Fbl"] {
+                assert!(
+                    header.contains(kept),
+                    "`{kept}` survives at 80 cols (rst={resets}): {header:?}\n{frame}"
+                );
+            }
+            assert!(
+                !header.contains("5h"),
+                "the 5h stub already dropped (rst={resets}): {header:?}\n{frame}"
+            );
+            // Nothing is shaved: the full header words are there, and the group
+            // cell reads CLAUDE rather than a 2-char stub.
+            let row = rows
+                .iter()
+                .find(|r| r.contains("CLAUDE"))
+                .unwrap_or_else(|| panic!("intact CLAUDE group cell (rst={resets}):\n{frame}"));
+            // status sits exactly on its floor, and its text survives.
+            let status_w = header.find("7d").unwrap() - header.find("status").unwrap() - 1;
+            assert_eq!(
+                status_w, STATUS_COL_MIN,
+                "status is at its {STATUS_COL_MIN}-col floor (rst={resets}): \
+                 {header:?}\n{frame}"
+            );
+            assert!(
+                row.contains("ready"),
+                "the status cell still spells its word (rst={resets}): \
+                 {row:?}\n{frame}"
+            );
+            // The Fbl gauge kept its full cell: the 97% window's percent label.
+            assert!(
+                row.contains("3%!"),
+                "the Fbl gauge renders its percent label (rst={resets}): \
+                 {row:?}\n{frame}"
+            );
+            // …and the name is the column that paid for it.
+            assert!(
+                !row.contains("longname-account@example.com"),
+                "the name column is the one that gave way (rst={resets}): \
+                 {row:?}\n{frame}"
+            );
+            assert!(
+                row.contains("longname"),
+                "…clipped, not dropped (rst={resets}): {row:?}\n{frame}"
+            );
+            if resets {
+                // `rst` survives the squeeze; this oauth row has no resets at
+                // all, so its cell is the honest `—` (never a count).
+                assert!(
+                    header.contains("rst") && row.contains('—'),
+                    "the reset column survives too: {row:?}\n{frame}"
+                );
+            }
+        }
+    }
+
+    /// The narrow layout renders the FULL Fbl gauge — the same in-bar
+    /// countdown plus percent label the wide set draws — when the toggle is ON,
+    /// and no column at all when OFF.
+    ///
+    /// Z 2026-09-18 (.prd/18 rule 3, owner: "7d-fable이 아니라 5h를 줄여줘"):
+    /// this replaces `fable_gauge_narrow_uses_compact_marker_gated_by_toggle`.
+    /// The compact `F 22h!` marker is deleted — the Fbl gauge never gives way,
+    /// so a narrow terminal shrinks `status` and drops `5h` instead.
+    #[test]
+    fn fable_gauge_narrow_renders_the_full_gauge_gated_by_toggle() {
         use crate::routing::BackendGroup;
         use crate::scheduler::AccountId;
 
@@ -11488,20 +13929,27 @@ mod tests {
             AccountId("claude:me@example.com".into()),
         );
 
-        // Width < WIDE_TABLE_AT → narrow layout. The compact marker carries
-        // the top countdown unit + the critical `!` (80_000s out → "F 22h!").
+        // 90 cols → narrow set (no req/tok), yet the Fbl column is a full gauge:
+        // the in-bar countdown (80_000s out → "22h") plus the percent label of
+        // the 97% window (remaining mode → "3%", critical `!`).
         view.show_fable_weekly = true;
-        let on = render(&view, &chrome_overlay(Overlay::None), 120, 20);
+        let on = render(&view, &chrome_overlay(Overlay::None), 90, 20);
+        assert!(on.contains("7d Fbl"), "narrow toggle ON: Fbl column:\n{on}");
         assert!(
-            on.contains("F 22h!"),
-            "narrow toggle ON: compact `F 22h!` marker rendered:\n{on}"
+            on.contains("22h") && on.contains("3%!"),
+            "narrow toggle ON: the full gauge (in-bar countdown + percent), not \
+             the deleted compact marker:\n{on}"
+        );
+        assert!(
+            !on.contains("F 22h"),
+            "the compact `F 22h` marker is gone for good:\n{on}"
         );
 
         view.show_fable_weekly = false;
-        let off = render(&view, &chrome_overlay(Overlay::None), 120, 20);
+        let off = render(&view, &chrome_overlay(Overlay::None), 90, 20);
         assert!(
-            !off.contains("F 22h"),
-            "narrow toggle OFF: no Fable marker:\n{off}"
+            !off.contains("Fbl"),
+            "narrow toggle OFF: no Fbl column:\n{off}"
         );
     }
 
@@ -11616,15 +14064,18 @@ mod tests {
         );
         view.show_fable_weekly = true;
 
-        // Narrow marker: the countdown (`F 22h`) with no critical `!`
-        // (is_active must not force the over-threshold marker at 76%).
+        // The gauge carries the countdown in the bar and 24% remaining in the
+        // label, with no critical `!` (is_active must not force the
+        // over-threshold marker at 76%). Z 2026-09-18: the narrow set draws the
+        // same full gauge as the wide one (.prd/18 rule 3), so this reads the
+        // percent label instead of the deleted `F 22h` marker.
         let narrow = render(&view, &chrome_overlay(Overlay::None), 120, 20);
         assert!(
-            narrow.contains("F 22h"),
-            "76%/warning/is_active renders its normal countdown marker:\n{narrow}"
+            narrow.contains("22h") && narrow.contains("24%"),
+            "76%/warning/is_active renders its normal countdown gauge:\n{narrow}"
         );
         assert!(
-            !narrow.contains("22h!"),
+            !narrow.contains("24%!"),
             "is_active alone must NOT force the red-critical `!` marker:\n{narrow}"
         );
     }
@@ -11633,7 +14084,7 @@ mod tests {
     /// window is expired (util → 0) but its `severity` field can still be a
     /// stale `Critical` until the next usage poll. The gauge must key off the
     /// reset-aware `is_constraining` (which short-circuits on `is_expired`), so
-    /// a just-reset window renders its honest full-quota `F 100%` (remaining
+    /// a just-reset window renders its honest full-quota `100%` (remaining
     /// mode) with NO forced-red `!` — not the old red critical flash.
     #[test]
     fn fable_gauge_reset_window_is_not_forced_red() {
@@ -11686,13 +14137,13 @@ mod tests {
         );
         view.show_fable_weekly = true;
 
-        // Expired → effective utilization 0 → remaining-mode label `F 100%`
+        // Expired → effective utilization 0 → remaining-mode label `100%`
         // (full quota is back), and because `is_constraining` short-circuits
         // on the expired window the stale `Critical` severity does NOT force
         // the red-critical `!` marker.
         let narrow = render(&view, &chrome_overlay(Overlay::None), 120, 20);
         assert!(
-            narrow.contains("F 100%"),
+            narrow.contains("100%"),
             "expired/reset Fable window renders its honest full-quota 100%:\n{narrow}"
         );
         assert!(
@@ -11785,6 +14236,10 @@ mod tests {
             effort: None,
             fast: false,
             kind: None,
+            user_id: None,
+            tenant: None,
+            excerpt: None,
+            client_name: None,
             started_at: UNIX_EPOCH,
         }];
         view.completed = vec![
@@ -11965,7 +14420,9 @@ mod tests {
     }
 
     /// Narrow (<80col) keeps the same reduced column set and renders without
-    /// panic — the compressed mode may clip, never crash (issue #70).
+    /// panic — the compressed mode may clip, never crash (issue #70). At 70
+    /// cols the `5h` stub is already gone (.prd/18: status is at its 8-col floor
+    /// and the row still does not fit), so the header is keyed on `7d`.
     #[test]
     fn accounts_row_narrow_uses_reduced_columns_without_panic() {
         use crate::routing::BackendGroup;
@@ -11980,7 +14437,7 @@ mod tests {
         let rows = render_rows(&view, &chrome_overlay(Overlay::None), 70, 30);
         let header = rows
             .iter()
-            .find(|r| r.contains("5h") && r.contains("7d"))
+            .find(|r| r.contains("account") && r.contains("7d"))
             .expect("narrow accounts header row");
         for gone in ["auth", "reset", "token"] {
             assert!(

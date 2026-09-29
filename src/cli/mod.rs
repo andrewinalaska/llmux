@@ -147,6 +147,14 @@ pub struct RunArgs {
     /// always restarted).
     #[arg(long)]
     pub force: bool,
+    /// Do not inject the llmux catalog into Claude Code (`/model` picker
+    /// lineup AND the `ANTHROPIC_DEFAULT_*_MODEL` alias exports). By default
+    /// `run` fetches `GET /llmux/models` once from the proxy it points
+    /// `claude` at, passes the lineup as `claude --settings`, and exports the
+    /// catalog id owning each of the `opus` / `fable` / `sonnet` / `haiku`
+    /// aliases (a var you already set is left alone).
+    #[arg(long)]
+    pub no_model_picker: bool,
     /// Arguments passed through to `claude` after `--`.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub args: Vec<String>,

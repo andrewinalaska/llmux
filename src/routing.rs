@@ -178,6 +178,8 @@ fn builtin_codex_rules() -> Vec<Rule> {
         Rule::Exact("gpt-5.6-sol".to_string()),
         Rule::Exact("gpt-6".to_string()),
         Rule::Exact("gpt-6-astra".to_string()),
+        Rule::Exact("gpt-6-sol".to_string()),
+        Rule::Exact("gpt-6-luna".to_string()),
         Rule::Exact("sol".to_string()),
         Rule::Exact("terra".to_string()),
         Rule::Exact("luna".to_string()),
@@ -503,6 +505,7 @@ mod tests {
             BackendGroup::Claude
         );
         assert_eq!(builtin().classify(Some("sonnet[1m]")), BackendGroup::Claude);
+        assert_eq!(builtin().classify(Some("grok-4.7[1m]")), BackendGroup::Grok);
         assert_eq!(builtin().classify(Some("grok-4.6[1m]")), BackendGroup::Grok);
         assert_eq!(builtin().classify(Some("grok[1m]")), BackendGroup::Grok);
     }
@@ -761,15 +764,19 @@ mod tests {
         // they are PREFIXES, not an `o*` wildcard, so `or-…` never matches.
         let c = Classifier::default();
         for (model, expected) in [
+            ("claude-opus-5-5", BackendGroup::Claude),
             ("claude-opus-5", BackendGroup::Claude),
             ("opus", BackendGroup::Claude),
             ("fable", BackendGroup::Claude),
             ("gpt-5.6-sol", BackendGroup::Codex),
             ("gpt-6-astra", BackendGroup::Codex),
+            ("gpt-6-sol", BackendGroup::Codex),
+            ("gpt-6-luna", BackendGroup::Codex),
             ("o3-mini", BackendGroup::Codex),
             ("o1", BackendGroup::Codex),
             ("sol", BackendGroup::Codex),
             ("astra", BackendGroup::Codex),
+            ("grok-4.7", BackendGroup::Grok),
             ("grok-4.6", BackendGroup::Grok),
             ("grok", BackendGroup::Grok),
         ] {
@@ -805,6 +812,10 @@ mod tests {
         );
         // A recognized family still wins over the default.
         assert_eq!(c.classify(Some("claude-opus-5")), BackendGroup::Claude);
+        assert_eq!(
+            c.classify(Some("claude-opus-5-5[1m]")),
+            BackendGroup::Claude
+        );
     }
 
     #[test]

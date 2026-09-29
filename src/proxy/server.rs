@@ -40,6 +40,123 @@ pub const EVALUATE_TICK: Duration = Duration::from_secs(60);
 /// as defense in depth). The first tick fires immediately at startup.
 const REFRESH_TICK: Duration = Duration::from_secs(600);
 
+/// Hard deadline for hyper's graceful drain after `/llmux/shutdown`: once it
+/// passes, the daemon exits even with connections still open.
+///
+/// WHY a hard exit exists at all: hyper's graceful shutdown releases the
+/// listener immediately but then waits for EVERY in-flight connection to
+/// close, and a client that never closes its connection waits forever. On
+/// iq-64 (2026-09-10..21) seven such connections kept a retired daemon (pid
+/// 91799, started 08-27) alive for 25 days. A retired daemon is not idle: its
+/// background refresh loop kept rotating the SAME OAuth refresh-token family
+/// as its successor, so whichever daemon refreshed second got
+/// `invalid_grant "Refresh token not found or invalid"` and benched the
+/// account with a sticky `AuthFailed`. Bounding the drain bounds that overlap.
+/// Generous on purpose (a long streaming response must still finish) — the
+/// loops are already stopped by then, so the wait costs nothing but a socket.
+pub const SHUTDOWN_DRAIN_DEADLINE: Duration = Duration::from_secs(600);
+
+/// Operator override for [`SHUTDOWN_DRAIN_DEADLINE`], in whole seconds. Exists
+/// so the deadline → exit path can be exercised end to end (the CLI
+/// integration test holds a connection open against a 1s deadline) and so an
+/// operator with a known-stuck client can shorten the wait without a rebuild.
+/// Unset, unparsable or zero → the default.
+pub const SHUTDOWN_DRAIN_DEADLINE_ENV: &str = "LLMUX_SHUTDOWN_DRAIN_DEADLINE_SECS";
+
+/// The effective drain deadline: [`SHUTDOWN_DRAIN_DEADLINE_ENV`] when set to a
+/// positive integer, else [`SHUTDOWN_DRAIN_DEADLINE`].
+pub fn shutdown_drain_deadline() -> Duration {
+    parse_drain_deadline(std::env::var(SHUTDOWN_DRAIN_DEADLINE_ENV).ok().as_deref())
+}
+
+/// [`shutdown_drain_deadline`]'s parse, separated from the environment read so
+/// it is testable: positive whole seconds win, anything else is the default.
+fn parse_drain_deadline(raw: Option<&str>) -> Duration {
+    raw.and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(SHUTDOWN_DRAIN_DEADLINE)
+}
+
+/// How long the exiting daemon waits for a token refresh that was in flight
+/// when shutdown landed. The refresh loop is stopped COOPERATIVELY, never
+/// aborted: a refresh has already rotated the provider-side token the moment
+/// the token endpoint answers, and only the pool CAS + config persist that
+/// follow make that rotation survive the restart. Aborting between the two
+/// would hand the successor a refresh token the provider has just retired —
+/// the very `invalid_grant` this change exists to remove. One refresh is one
+/// HTTP round trip (10s connect timeout) plus a config read-merge-write, so
+/// 30s is slack, not a wait anyone sees.
+pub const REFRESH_SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The daemon's background loops, collected so they can be stopped the INSTANT
+/// shutdown is requested rather than after the drain.
+///
+/// Same incident as [`SHUTDOWN_DRAIN_DEADLINE`]: while a retired daemon drains,
+/// its refresh loop must not keep rotating refresh tokens the successor now
+/// owns. Two stop mechanisms because the loops differ in what an interrupted
+/// iteration costs:
+/// - `abortable` (usage poller, evaluation tick, idle-probe sweep, activity
+///   fold): read-only or idempotent per iteration — cancelled outright.
+/// - `refresh_stop`: the token refresh loop watches this flag and exits
+///   between passes; a pass already in flight runs to completion (see
+///   [`REFRESH_SETTLE_TIMEOUT`] for why).
+struct BackgroundTasks {
+    abortable: Vec<tokio::task::AbortHandle>,
+    refresh_stop: tokio::sync::watch::Sender<bool>,
+}
+
+impl BackgroundTasks {
+    /// Stop every registered loop. Idempotent: aborting an already-aborted (or
+    /// finished) task is a no-op and re-sending `true` changes nothing, so
+    /// the post-serve call can repeat it unconditionally.
+    fn stop_all(&self) {
+        for handle in &self.abortable {
+            handle.abort();
+        }
+        self.refresh_stop.send_replace(true);
+    }
+}
+
+/// Run `pass` once per `period` tick until `stop` flips to `true` (or its
+/// sender is gone). The stop is checked only BETWEEN passes: a pass that is in
+/// flight when the flag lands finishes first, then the loop returns. This is
+/// the cooperative-cancellation seam the token refresh loop runs on — the
+/// generic shape exists so the "in-flight pass completes" guarantee can be
+/// tested without a token endpoint.
+///
+/// Contract: once stop is set, NO new pass starts. The select is `biased`
+/// with the stop arm first (an unbiased select could pick a ready tick over
+/// an already-set stop — and the interval's first tick is always ready), and
+/// the flag is re-read right before the pass for the case where stop lands
+/// in the same poll the tick arm won.
+pub(crate) async fn run_until_stopped<F, Fut>(
+    period: Duration,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+    mut pass: F,
+) where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let mut interval = tokio::time::interval(period);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            biased;
+            // `Err` = sender dropped = the daemon is going away; same exit.
+            _ = stop.wait_for(|stopped| *stopped) => return,
+            _ = interval.tick() => {}
+        }
+        if *stop.borrow() {
+            return;
+        }
+        pass().await;
+        if *stop.borrow() {
+            return;
+        }
+    }
+}
+
 /// Per-account relayed-traffic totals, owned by the proxy (the scheduler
 /// pool deliberately tracks quota windows only; src/scheduler is untouched).
 #[derive(Debug, Default)]
@@ -865,8 +982,16 @@ impl AppState {
                 let (api_key, label) = (api_key.clone(), label.clone());
                 account.name = crate::cli::login::openrouter_account_name(c, &label, &api_key);
             }
-            name = account.name.clone();
+            // Resolve the name from the MERGED roster, not from the request:
+            // a uuid-matched re-login keeps the established name
+            // (`docs/keys-history/relogin-trace.md` B6), so echoing the
+            // caller's label would report an account that exists nowhere.
+            let probe = account.clone();
             outcome = c.upsert_account(account);
+            name = c
+                .find_account(&probe)
+                .map(|idx| c.accounts[idx].name.clone())
+                .unwrap_or(probe.name);
         })?;
         self.apply_roster(&merged);
         // Names/kinds are not credentials; no token reaches a log line.
@@ -952,6 +1077,32 @@ pub async fn serve(
     // can no longer delay startup ("serve first, hydrate later").
     let hydrate_cut = state.hub.arm_persistence(state.activity_log_path.clone());
 
+    // Arm the durable keys-usage store (`docs/keys-history/spec.md` K). Its
+    // location is derived from THIS state's `config_path` (never from the
+    // environment), so a test/alternate config gets an isolated sibling
+    // directory and can never open the user's real `usage.sqlite3`. An open
+    // failure is loud (warning + activity note) and leaves the daemon serving
+    // without durable metering — the panel then says so instead of rendering
+    // zeros. Armed BEFORE the fold task starts so no live request is missed.
+    let usage_db_path = crate::key_usage::db_path_for_config(state.config_path.as_deref());
+    match usage_db_path.as_deref() {
+        Some(path) => match crate::key_usage::KeyUsageStore::open(path) {
+            Ok(store) => {
+                tracing::info!(path = %path.display(), "keys usage store ready");
+                state.hub.arm_usage_store(Some(store));
+            }
+            Err(err) => {
+                tracing::warn!(path = %path.display(), error = %err, "keys usage store unavailable");
+                state.hub.push_note(
+                    format!("keys usage store unavailable ({err})"),
+                    true,
+                    SystemTime::now(),
+                );
+            }
+        },
+        None => tracing::debug!("no config path — keys usage store disabled"),
+    }
+
     // Dashboard fold: the single consumer of the activity-event channel (and,
     // in TUI mode, the tracing-bridge channel) into the hub. Spawned once —
     // the receiver is taken out of `pending_events`/`pending_logs`. Without a
@@ -985,6 +1136,7 @@ pub async fn serve(
         state.pool.clone(),
         state.client.clone(),
         state.config.upstream.clone(),
+        state.config.grok.upstream.clone(),
         state.config.scheduler,
     )
     .with_events(state.events.clone());
@@ -1009,16 +1161,20 @@ pub async fn serve(
     let poller_task = tokio::spawn(poller.run());
 
     // Background token refresh (A2): first tick immediately, then every
-    // REFRESH_TICK. Lives next to the usage poller, aborted on shutdown.
+    // REFRESH_TICK. Lives next to the usage poller. Stopped COOPERATIVELY on
+    // shutdown (never aborted) so a refresh that has already rotated the
+    // provider-side token always reaches the pool CAS + config persist — see
+    // `REFRESH_SETTLE_TIMEOUT`.
     let refresh_state = state.clone();
-    let refresh_task = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(REFRESH_TICK);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            interval.tick().await;
-            background_refresh_pass(&refresh_state).await;
-        }
-    });
+    let (refresh_stop, refresh_stop_rx) = tokio::sync::watch::channel(false);
+    let refresh_task = tokio::spawn(run_until_stopped(
+        REFRESH_TICK,
+        refresh_stop_rx,
+        move || {
+            let state = refresh_state.clone();
+            async move { background_refresh_pass(&state).await }
+        },
+    ));
 
     // Background: keep ALL cold accounts warm (issue #45, generalized). A cold
     // account with NO client traffic is never probed by the request path. The
@@ -1140,6 +1296,62 @@ pub async fn serve(
         let path = state.activity_log_path.clone();
         tokio::task::spawn_blocking(move || hub.hydrate_persisted(path.as_deref(), hydrate_cut))
     };
+    // 1b. Legacy keys-usage import (keys-history K-4): replay the SAME
+    //     pre-bind cut of `activity.jsonl` into the durable store, once. The
+    //     import is transactional against a persisted byte offset and every
+    //     row carries the identity it would have been written live under, so
+    //     re-running it (restart) imports nothing and the live appends that
+    //     raced this task are never double-counted. Blocking work, off the
+    //     serving path; a failure is visible and never fatal.
+    let usage_import_task = state.hub.usage_store().map(|store| {
+        let path = state.activity_log_path.clone();
+        let hub = state.hub.clone();
+        tokio::task::spawn_blocking(move || {
+            let Some(path) = path else { return };
+            match store.import_activity_jsonl(&path, hydrate_cut) {
+                Ok(outcome) if outcome.imported > 0 => {
+                    tracing::info!(
+                        imported = outcome.imported,
+                        duplicates = outcome.duplicates,
+                        skipped = outcome.skipped,
+                        "keys usage history imported"
+                    );
+                    hub.push_note(
+                        format!("keys usage: {} legacy requests imported", outcome.imported),
+                        false,
+                        SystemTime::now(),
+                    );
+                }
+                // Read the log but stored nothing usable: silence here would
+                // look identical to "there was no history", so say it out loud.
+                Ok(outcome) if outcome.skipped > 0 => {
+                    tracing::warn!(
+                        skipped = outcome.skipped,
+                        duplicates = outcome.duplicates,
+                        bytes = outcome.bytes,
+                        "keys usage history import stored nothing usable"
+                    );
+                    hub.push_note(
+                        format!(
+                            "keys usage: {} legacy lines unusable, none imported",
+                            outcome.skipped
+                        ),
+                        true,
+                        SystemTime::now(),
+                    );
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::warn!(error = %err, "keys usage history import failed");
+                    hub.push_note(
+                        format!("keys usage import failed ({err})"),
+                        true,
+                        SystemTime::now(),
+                    );
+                }
+            }
+        })
+    });
     // 2. Raw-io retention prune (Feature B): guarded by config (`enabled =
     //    false` skips it; `retention_days = 0` keeps everything). The scan is
     //    streaming and the commit preserves records appended while it ran (see
@@ -1157,27 +1369,93 @@ pub async fn serve(
         })
     });
 
+    // Stop these the moment shutdown is requested — NOT after the drain. A
+    // draining daemon that keeps refreshing tokens fights its successor over
+    // the same refresh-token family (see `SHUTDOWN_DRAIN_DEADLINE`).
+    let background = Arc::new(BackgroundTasks {
+        abortable: [
+            Some(poller_task.abort_handle()),
+            Some(tick_task.abort_handle()),
+            sweep_task
+                .as_ref()
+                .map(tokio::task::JoinHandle::abort_handle),
+            fold_task
+                .as_ref()
+                .map(tokio::task::JoinHandle::abort_handle),
+        ]
+        .into_iter()
+        .flatten()
+        .collect(),
+        refresh_stop,
+    });
+
     let shutdown = state.shutdown.clone();
-    let result = axum::serve(
+    let on_shutdown = Arc::clone(&background);
+    // Fires once the graceful drain has begun — the drain deadline below is
+    // measured from THIS moment, not from startup.
+    let (drain_started_tx, drain_started_rx) = tokio::sync::oneshot::channel::<()>();
+    let drain_deadline = shutdown_drain_deadline();
+    let serve_fut = axum::serve(
         listener,
         router(state).into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(async move { shutdown.notified().await })
-    .await;
-    poller_task.abort();
-    tick_task.abort();
-    refresh_task.abort();
-    if let Some(sweep_task) = sweep_task {
-        sweep_task.abort();
-    }
-    if let Some(fold_task) = fold_task {
-        fold_task.abort();
+    .with_graceful_shutdown(async move {
+        shutdown.notified().await;
+        on_shutdown.stop_all();
+        tracing::info!(
+            "shutdown: background loops stopping; draining in-flight connections (deadline {}s)",
+            drain_deadline.as_secs()
+        );
+        let _ = drain_started_tx.send(());
+    });
+    // The drain watchdog. hyper waits for every in-flight connection to close
+    // and a stuck client never closes; without this the process lives on
+    // forever (iq-64: 25 days) rotating its successor's refresh tokens. When
+    // the deadline wins, the serve future is dropped here and the function
+    // falls through to the SAME tail as a clean drain: refresh settle, then
+    // return, so `main` returns and the runtime shuts down — which also waits
+    // for any running blocking task (a config persist) to finish. No
+    // `process::exit`, so nothing in that tail is skipped.
+    let result = tokio::select! {
+        result = serve_fut => result,
+        _ = async {
+            match drain_started_rx.await {
+                Ok(()) => tokio::time::sleep(drain_deadline).await,
+                // Sender dropped without firing: serve returned on its own
+                // (bind error, etc.) — the other arm has already won.
+                Err(_) => std::future::pending::<()>().await,
+            }
+        } => {
+            tracing::warn!("shutdown drain deadline reached; exiting with connections still open");
+            Ok(())
+        }
+    };
+    // Repeat the stop unconditionally: on a shutdown request this is a no-op
+    // (the graceful future already did it); when serve returned for any other
+    // reason it is the only stop the loops get.
+    background.stop_all();
+    // Let an in-flight token refresh settle (pool CAS + config persist) before
+    // the process goes away. Bounded so a hung token endpoint cannot turn the
+    // exiting daemon into a new kind of zombie; past the bound, abort and go.
+    let mut refresh_task = refresh_task;
+    if tokio::time::timeout(REFRESH_SETTLE_TIMEOUT, &mut refresh_task)
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            "shutdown: token refresh still in flight after {}s; exiting without it",
+            REFRESH_SETTLE_TIMEOUT.as_secs()
+        );
+        refresh_task.abort();
     }
     // Blocking-pool tasks cannot be interrupted once running; `abort` here only
     // cancels them if they have not started. Both are safe to leave finishing
     // (read-only hydration; atomic-rename prune) — the runtime waits for them
     // on shutdown.
     hydrate_task.abort();
+    if let Some(usage_import_task) = usage_import_task {
+        usage_import_task.abort();
+    }
     if let Some(prune_task) = prune_task {
         prune_task.abort();
     }
@@ -1228,12 +1506,21 @@ pub async fn background_refresh_pass(state: &AppState) {
     // which can trip the upstream's request-rate limit. One-per-pass spaces
     // them across REFRESH_TICK; tokens carry hours of headroom so the sweep has
     // plenty of time, and request-time forced refresh is the backstop.
-    let mut candidate: Option<(AccountId, AccountCredential, u64)> = None;
+    let mut candidate: Option<(
+        AccountId,
+        AccountCredential,
+        crate::scheduler::AccountFingerprint,
+        u64,
+    )> = None;
     for account in state.pool.snapshot().accounts {
         if !account.healthy {
             continue;
         }
-        let Some(credential) = state.pool.credential(&account.id) else {
+        // Credential AND fingerprint in ONE capture: the refresh's writes are
+        // gated on this, so a re-login landing mid-refresh is never overwritten
+        // or benched (`docs/keys-history/relogin-trace.md` B5).
+        let Some((credential, fingerprint)) = state.pool.credential_with_fingerprint(&account.id)
+        else {
             continue;
         };
         let expires_at_ms = match &credential {
@@ -1248,15 +1535,15 @@ pub async fn background_refresh_pass(state: &AppState) {
         }
         if candidate
             .as_ref()
-            .is_none_or(|(_, _, soonest)| expires_at_ms < *soonest)
+            .is_none_or(|(_, _, _, soonest)| expires_at_ms < *soonest)
         {
-            candidate = Some((account.id.clone(), credential, expires_at_ms));
+            candidate = Some((account.id.clone(), credential, fingerprint, expires_at_ms));
         }
     }
-    let Some((account_id, credential, _)) = candidate else {
+    let Some((account_id, credential, fingerprint, _)) = candidate else {
         return;
     };
-    match forward::refresh_credential(state, &account_id, &credential).await {
+    match forward::refresh_credential(state, &account_id, &credential, &fingerprint).await {
         forward::RefreshOutcome::Refreshed(fresh) => {
             if let AccountCredential::Oauth { expires_at_ms, .. }
             | AccountCredential::Codex { expires_at_ms, .. } = fresh
@@ -1268,13 +1555,22 @@ pub async fn background_refresh_pass(state: &AppState) {
                 );
             }
         }
-        forward::RefreshOutcome::Permanent => {
-            state.pool.record_auth_failure(&account_id);
-            state.emit(ActivityEvent::Error {
-                context: Some("refresh".into()),
-                message: format!("{account_id}: refresh token dead; re-login required"),
-            });
+        forward::RefreshOutcome::Permanent { detail } => {
+            // Only bench if the dead refresh token is STILL this account's
+            // credential: a re-login that landed during the refresh has
+            // already healed it (relogin-trace B1/B5).
+            if state.pool.record_auth_failure_if(&account_id, &fingerprint) {
+                state.emit(ActivityEvent::Error {
+                    context: Some("refresh".into()),
+                    message: format!(
+                        "{account_id}: refresh token dead ({detail}); re-login required"
+                    ),
+                });
+            }
         }
+        // The account was re-credentialed mid-refresh; nothing was written and
+        // nothing is wrong — the next tick sees the new token's expiry.
+        forward::RefreshOutcome::Superseded => {}
         forward::RefreshOutcome::Failed => {} // transient — next tick retries
     }
 }
@@ -1296,6 +1592,7 @@ pub fn router(state: AppState) -> Router {
         .route("/llmux/remove-account", post(remove_account_endpoint))
         .route("/llmux/pause-account", post(pause_account_endpoint))
         .route("/llmux/keys", get(keys_list_endpoint))
+        .route("/llmux/keys/usage", get(keys_usage_endpoint))
         .route("/llmux/keys/new", post(keys_new_endpoint))
         .route("/llmux/keys/suspend", post(keys_suspend_endpoint))
         .route("/llmux/keys/remove", post(keys_remove_endpoint))
@@ -1528,6 +1825,105 @@ async fn keys_list_endpoint(State(state): State<AppState>) -> Response {
         serde_json::json!({ "keys": keys }).to_string(),
     )
         .into_response()
+}
+
+/// Query parameters of `GET /llmux/keys/usage` (keys-history K-1/K-2).
+/// Encoding: `?window=<all|1h|24h|7d|14d|30d|90d>&models=<a,b,c>` — the model
+/// list is ONE comma-separated parameter (documented in
+/// `docs/operational-reference.md`), absent or empty meaning "every model".
+#[derive(Debug, Default, serde::Deserialize)]
+struct KeysUsageParams {
+    #[serde(default)]
+    window: Option<String>,
+    #[serde(default)]
+    models: Option<String>,
+}
+
+/// `GET /llmux/keys/usage` — the durable, windowed, model-filtered per-tenant
+/// usage behind the `K` panel (admin-gated with the rest of `/llmux/*`).
+///
+/// The query runs on the blocking pool against a bounded indexed aggregate —
+/// never on the event loop, never a full-history scan — and the answer is
+/// named + priced here (an attach client has neither the key registry nor the
+/// pricing overrides). An unknown window is a 400; a missing store is a 503
+/// and a failed query a 500, because a filtered view must never be able to
+/// masquerade as a valid empty one.
+async fn keys_usage_endpoint(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<KeysUsageParams>,
+) -> Response {
+    let raw_window = params.window.as_deref().unwrap_or("all");
+    let Some(window) = crate::key_usage::UsageWindow::parse(raw_window) else {
+        return relay_error(
+            StatusCode::BAD_REQUEST,
+            &format!(
+                "unknown window {raw_window:?}; expected one of {}",
+                crate::key_usage::UsageWindow::ALL
+                    .iter()
+                    .map(|w| w.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        );
+    };
+    let models: Vec<String> = params
+        .models
+        .as_deref()
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .map(str::to_string)
+        .collect();
+    let Some(store) = state.hub.usage_store() else {
+        return relay_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "durable keys usage is unavailable on this daemon (no config path or the store failed to open)",
+        );
+    };
+    let now_ms = now_epoch_ms();
+    let query = crate::key_usage::UsageQuery::new(window, now_ms).with_models(models);
+    let health = store.health();
+    let report = {
+        let store = store.clone();
+        let query = query.clone();
+        tokio::task::spawn_blocking(move || store.query(&query)).await
+    };
+    let report = match report {
+        Ok(Ok(report)) => report,
+        Ok(Err(err)) => {
+            tracing::warn!(error = %err, "keys usage query failed");
+            return relay_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("keys usage query failed: {err}"),
+            );
+        }
+        Err(err) => {
+            return relay_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("keys usage query task failed: {err}"),
+            )
+        }
+    };
+    let doc = crate::key_usage::usage_doc(
+        report,
+        &crate::dashboard::key_row_docs(&state),
+        &state.config.pricing,
+        health,
+        now_ms,
+    );
+    match serde_json::to_string(&doc) {
+        Ok(body) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            body,
+        )
+            .into_response(),
+        Err(err) => relay_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("keys usage serialization failed: {err}"),
+        ),
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -3314,6 +3710,188 @@ mod tests {
         }
     }
 
+    /// Shutdown must stop the background loops, not just stop accepting
+    /// connections: a daemon draining a connection that never closes keeps
+    /// refreshing tokens its successor now owns (iq-64 2026-09-10..21). One
+    /// `stop_all` aborts every abortable loop AND flips the refresh stop flag.
+    #[tokio::test]
+    async fn background_tasks_stop_all_stops_every_loop() {
+        let poller_like = tokio::spawn(async {
+            let mut interval = tokio::time::interval(Duration::from_millis(10));
+            loop {
+                interval.tick().await;
+            }
+        });
+        let sweep_like = tokio::spawn(std::future::pending::<()>());
+        let (refresh_stop, mut refresh_stop_rx) = tokio::sync::watch::channel(false);
+        let tasks = BackgroundTasks {
+            abortable: vec![poller_like.abort_handle(), sweep_like.abort_handle()],
+            refresh_stop,
+        };
+
+        tasks.stop_all();
+
+        let poller_err = poller_like.await.expect_err("poller loop was aborted");
+        assert!(poller_err.is_cancelled(), "{poller_err:?}");
+        let sweep_err = sweep_like.await.expect_err("sweep loop was aborted");
+        assert!(sweep_err.is_cancelled(), "{sweep_err:?}");
+        assert!(refresh_stop_rx.has_changed().unwrap() && *refresh_stop_rx.borrow_and_update());
+        // Idempotent: the post-serve call repeats it unconditionally.
+        tasks.stop_all();
+    }
+
+    /// The refresh loop is stopped cooperatively: a pass that is IN FLIGHT when
+    /// shutdown lands runs to its end (provider rotation → pool CAS → config
+    /// persist is one unit), then the loop exits without starting another
+    /// pass. Deterministic: the period is long enough that only the immediate
+    /// first tick fires, and completion is observed via counters.
+    #[tokio::test]
+    async fn run_until_stopped_finishes_the_in_flight_pass_then_exits() {
+        let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let finished = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let mut entered_tx = Some(entered_tx);
+        let mut release_rx = Some(release_rx);
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let (s, f) = (Arc::clone(&started), Arc::clone(&finished));
+        let loop_task = tokio::spawn(run_until_stopped(
+            Duration::from_secs(3600),
+            stop_rx,
+            move || {
+                s.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let f = Arc::clone(&f);
+                let entered = entered_tx.take();
+                let release = release_rx.take();
+                async move {
+                    if let Some(entered) = entered {
+                        let _ = entered.send(());
+                    }
+                    if let Some(release) = release {
+                        let _ = release.await;
+                    }
+                    f.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            },
+        ));
+
+        // The first (immediate) tick has started a pass and is parked inside it.
+        entered_rx.await.unwrap();
+        assert_eq!(finished.load(std::sync::atomic::Ordering::SeqCst), 0);
+        // Shutdown lands mid-pass ...
+        stop_tx.send_replace(true);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!loop_task.is_finished(), "must not exit mid-pass");
+        // ... the pass is allowed to finish, and then the loop exits by itself.
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), loop_task)
+            .await
+            .expect("loop exits after the in-flight pass")
+            .unwrap();
+        assert_eq!(started.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(finished.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// Stop while idle (between passes) returns promptly without running
+    /// another pass, and a dropped sender counts as stop.
+    #[tokio::test]
+    async fn run_until_stopped_returns_promptly_when_idle() {
+        let passes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let p = Arc::clone(&passes);
+        let loop_task = tokio::spawn(run_until_stopped(
+            Duration::from_secs(3600),
+            stop_rx,
+            move || {
+                p.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async {}
+            },
+        ));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(passes.load(std::sync::atomic::Ordering::SeqCst), 1);
+        drop(stop_tx);
+        tokio::time::timeout(Duration::from_secs(2), loop_task)
+            .await
+            .expect("loop exits when the stop sender is dropped")
+            .unwrap();
+        assert_eq!(passes.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// The race the review caught: stop already set AND a tick ready in the
+    /// same poll (the interval's first tick is always ready). An unbiased
+    /// select could take the tick and start a pass after shutdown. With stop
+    /// set before the loop even starts, ZERO passes may run. Repeated so a
+    /// lucky branch order cannot hide a regression.
+    #[tokio::test]
+    async fn run_until_stopped_never_starts_a_pass_once_stop_is_set() {
+        for _ in 0..50 {
+            let passes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let (stop_tx, stop_rx) = tokio::sync::watch::channel(true);
+            let p = Arc::clone(&passes);
+            let loop_task = tokio::spawn(run_until_stopped(
+                Duration::from_millis(1),
+                stop_rx,
+                move || {
+                    p.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    async {}
+                },
+            ));
+            tokio::time::timeout(Duration::from_secs(2), loop_task)
+                .await
+                .expect("loop exits at once")
+                .unwrap();
+            assert_eq!(passes.load(std::sync::atomic::Ordering::SeqCst), 0);
+            drop(stop_tx);
+        }
+    }
+
+    /// Same contract from the other side: stop lands while the loop is idle
+    /// with a tick due imminently; the loop must not run that tick's pass.
+    #[tokio::test]
+    async fn run_until_stopped_drops_a_tick_that_races_the_stop() {
+        for _ in 0..20 {
+            let passes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+            let p = Arc::clone(&passes);
+            let loop_task = tokio::spawn(run_until_stopped(
+                Duration::from_millis(5),
+                stop_rx,
+                move || {
+                    p.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    async {}
+                },
+            ));
+            // First (immediate) pass runs; then stop lands right as the next
+            // tick becomes due.
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            stop_tx.send_replace(true);
+            let after_stop = passes.load(std::sync::atomic::Ordering::SeqCst);
+            tokio::time::timeout(Duration::from_secs(2), loop_task)
+                .await
+                .expect("loop exits")
+                .unwrap();
+            // Whatever ran before the stop is fine; nothing may START after it
+            // except a pass that was already in flight (there is none here —
+            // the pass body is synchronous).
+            assert_eq!(passes.load(std::sync::atomic::Ordering::SeqCst), after_stop);
+        }
+    }
+
+    /// The env override is what lets the CLI test drive the deadline path;
+    /// junk falls back to the compiled default rather than to "no deadline".
+    #[test]
+    fn shutdown_drain_deadline_honours_a_positive_override_only() {
+        assert_eq!(parse_drain_deadline(Some("1")), Duration::from_secs(1));
+        assert_eq!(parse_drain_deadline(Some(" 45 ")), Duration::from_secs(45));
+        assert_eq!(parse_drain_deadline(Some("0")), SHUTDOWN_DRAIN_DEADLINE);
+        assert_eq!(parse_drain_deadline(Some("soon")), SHUTDOWN_DRAIN_DEADLINE);
+        assert_eq!(parse_drain_deadline(None), SHUTDOWN_DRAIN_DEADLINE);
+        // And the real function with the variable unset in this process.
+        if std::env::var_os(SHUTDOWN_DRAIN_DEADLINE_ENV).is_none() {
+            assert_eq!(shutdown_drain_deadline(), SHUTDOWN_DRAIN_DEADLINE);
+        }
+    }
+
     #[test]
     fn scope_split_control_vs_data() {
         // Control plane = /llmux/* management + dashboard/status reads.
@@ -3871,9 +4449,9 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_json(response).await;
         let models = body["models"].as_array().expect("models array");
-        // 29 curated (9 claude + 8 codex + 2 grok + 10 openrouter) + 1
+        // 36 curated (11 claude + 11 codex + 4 grok + 10 openrouter) + 1
         // synthesized (grok-4.3 is out-of-catalog now).
-        assert_eq!(models.len(), 30);
+        assert_eq!(models.len(), 37);
 
         let by_id = |id: &str| {
             models
@@ -3882,8 +4460,19 @@ mod tests {
                 .unwrap_or_else(|| panic!("{id} present"))
         };
         // The live pin (grok-4.3) carries the "grok" alias via a synthesized
-        // row; the curated grok-4.6 / grok-4.5 do not.
+        // row; the curated grok-4.7 / grok-4.7[1m] / grok-4.6 / grok-4.5 do
+        // not.
         assert_eq!(by_id("grok-4.3")["aliases"], serde_json::json!(["grok"]));
+        assert_eq!(by_id("grok-4.7")["aliases"], serde_json::json!([]));
+        // The opt-in twin serializes with xAI's real window and NEVER an
+        // alias — not even when its own base row is the pin (asserted in
+        // `catalog::tests::grok_family_alias_follows_the_pin`).
+        assert_eq!(by_id("grok-4.7[1m]")["aliases"], serde_json::json!([]));
+        assert_eq!(by_id("grok-4.7[1m]")["max_context"], 500_000);
+        assert_eq!(
+            by_id("grok-4.7[1m]")["name"],
+            "Grok 4.7 [1M] (500k upstream)"
+        );
         assert_eq!(by_id("grok-4.6")["aliases"], serde_json::json!([]));
         assert_eq!(by_id("grok-4.5")["aliases"], serde_json::json!([]));
         // Static codex alias and context survive serialization.
@@ -4608,7 +5197,9 @@ mod tests {
         let state = endpoint_state(&path, vec![oauth_account_realistic("claude:old", "uuid-x")]);
 
         // Re-login: same uuid, new name (profile email changed) — must UPDATE
-        // the existing entry, not add a second one (dedup by account_uuid).
+        // the existing entry, not add a second one (dedup by account_uuid),
+        // KEEPING the established name (`docs/keys-history/relogin-trace.md`
+        // B6) and reporting that resolved name back to the caller.
         let mut relogin = oauth_account_realistic("claude:new", "uuid-x");
         if let AccountCredential::Oauth { access_token, .. } = &mut relogin.credential {
             *access_token = "sk-ant-oat01-ROTATEDTOKENVALUE".to_string();
@@ -4621,10 +5212,21 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_json(response).await;
         assert_eq!(body["added"], false, "re-login updates, never adds");
+        assert_eq!(
+            body["name"], "claude:old",
+            "the response reports the resolved roster name, not the request's label"
+        );
 
         let on_disk = crate::config::load_path(&path).expect("reload");
         assert_eq!(on_disk.accounts.len(), 1, "no duplicate from re-login");
-        assert_eq!(on_disk.accounts[0].name, "claude:new");
+        assert_eq!(on_disk.accounts[0].name, "claude:old");
+        match &on_disk.accounts[0].credential {
+            AccountCredential::Oauth { access_token, .. } => assert_eq!(
+                access_token, "sk-ant-oat01-ROTATEDTOKENVALUE",
+                "the credential IS replaced"
+            ),
+            other => panic!("unexpected credential {other:?}"),
+        }
     }
 
     #[tokio::test]

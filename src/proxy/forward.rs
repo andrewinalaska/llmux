@@ -37,7 +37,9 @@ use crate::provider::{
 };
 use crate::routing::BackendGroup;
 use crate::scheduler::select::{self, Decision};
-use crate::scheduler::{headers as rl_headers, AccountId, DEFAULT_HEURISTIC_COOLDOWN};
+use crate::scheduler::{
+    headers as rl_headers, AccountFingerprint, AccountId, DEFAULT_HEURISTIC_COOLDOWN,
+};
 use crate::tui::{ActivityEvent, TokenCounts};
 
 /// Hop-by-hop headers stripped from the client request before forwarding
@@ -1017,6 +1019,14 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
         method: parts.method.to_string(),
         path: path_query.clone(),
         kind: Some(classified.kind.to_string()),
+        // Identity + input ride the START too (activity in-flight identity):
+        // all three are already resolved above, and the running row needs them
+        // to render the same Name / session label / input excerpt cells its
+        // eventual completed row renders. Cloned — the originals move into
+        // `ctx` just below.
+        user_id: user_id.clone(),
+        tenant: tenant.clone(),
+        excerpt: classified.excerpt.clone(),
     });
     let mut ctx = ForwardContext {
         method: parts.method,
@@ -1319,13 +1329,37 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
         // codex chatgpt tokens) expiring within 5 minutes.
         if let Some(expires_at_ms) = refreshable_expiry(&credential) {
             if expiring_soon(expires_at_ms) {
-                match refresh_credential(state, &account, &credential).await {
+                match refresh_credential(state, &account, &credential, lease.fingerprint()).await {
                     RefreshOutcome::Refreshed(fresh) => credential = fresh,
-                    RefreshOutcome::Permanent => {
-                        state.pool.record_auth_failure(&account);
+                    // A re-login replaced this account's credential mid-refresh
+                    // (relogin-trace B2): re-lease so the request goes out with
+                    // what the pool holds NOW, counted like any other retry so
+                    // the loop stays bounded.
+                    RefreshOutcome::Superseded => {
+                        drop(lease);
+                        switches += 1;
+                        if switches > max_switches {
+                            ctx.flush_log(state);
+                            ctx.emit_finished(state, Some(&account), StatusCode::BAD_GATEWAY, None);
+                            return error_response(
+                                StatusCode::BAD_GATEWAY,
+                                "proxy_error",
+                                "account retries exhausted (credential replaced during refresh)",
+                            );
+                        }
+                        continue;
+                    }
+                    RefreshOutcome::Permanent { detail } => {
+                        // Only bench if the dead refresh token is still the
+                        // account's live credential (relogin-trace B1).
+                        state
+                            .pool
+                            .record_auth_failure_if(&account, lease.fingerprint());
                         state.emit(ActivityEvent::Error {
                             context: Some("refresh".into()),
-                            message: format!("{account}: refresh token dead; re-login required"),
+                            message: format!(
+                                "{account}: refresh token dead ({detail}); re-login required"
+                            ),
                         });
                         drop(lease);
                         switches += 1;
@@ -1508,7 +1542,11 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                     // marker; a credential update heals it), switch.
                     tracing::warn!(account = %account, error = %err, "persistent upstream error; switching");
                     ctx.log(format!("=== ERROR ===\npersistent: {err}"));
-                    state.pool.record_auth_failure(&account);
+                    // Guarded: this verdict belongs to the credential the lease
+                    // pinned, not to whatever replaced it (relogin-trace B1).
+                    state
+                        .pool
+                        .record_auth_failure_if(&account, lease.fingerprint());
                     drop(lease);
                     switches += 1;
                     if switches > max_switches {
@@ -1779,9 +1817,13 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                 );
                 if oauth && !force_refreshed.contains(&account) {
                     force_refreshed.insert(account.clone());
-                    if let RefreshOutcome::Refreshed(_) =
-                        refresh_credential(state, &account, &credential).await
-                    {
+                    // `Superseded` retries for the same reason `Refreshed`
+                    // does: the pool now holds a credential this request has
+                    // not tried yet (relogin-trace B2).
+                    if matches!(
+                        refresh_credential(state, &account, &credential, lease.fingerprint()).await,
+                        RefreshOutcome::Refreshed(_) | RefreshOutcome::Superseded
+                    ) {
                         // Retry the SAME account with the refreshed token
                         // (it is now the pool credential; re-leased next
                         // iteration).
@@ -1790,8 +1832,12 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                     }
                 }
                 // Second 401, refresh failure, or apikey account: auth is
-                // dead — mark and switch.
-                state.pool.record_auth_failure(&account);
+                // dead — mark and switch. Guarded, so a 401 earned by a
+                // credential a re-login retired cannot bench its successor
+                // (relogin-trace B1).
+                state
+                    .pool
+                    .record_auth_failure_if(&account, lease.fingerprint());
                 drop(lease);
                 switches += 1;
                 if switches > max_switches {
@@ -1822,7 +1868,9 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                 return transient_response(&format!("upstream returned {status}"));
             }
             UpstreamSignal::Persistent => {
-                state.pool.record_auth_failure(&account);
+                state
+                    .pool
+                    .record_auth_failure_if(&account, lease.fingerprint());
                 drop(lease);
                 switches += 1;
                 if switches > max_switches {
@@ -2020,9 +2068,111 @@ pub(crate) enum RefreshOutcome {
     /// New tokens are live in the pool (and persisted); use this credential.
     Refreshed(AccountCredential),
     /// Refresh token is dead (401/invalid_grant) — re-login required.
-    Permanent,
+    /// `detail` is the upstream reason rendered by [`refresh_death_detail`]:
+    /// without it the operator-visible message said only "refresh token dead",
+    /// which hid the one distinction that matters — expired (just re-login)
+    /// vs. rotated-out-from-under-us by a second daemon (iq-64, 2026-09-10..21).
+    Permanent { detail: String },
     /// Transient refresh failure — old token may still work.
     Failed,
+    /// The account was RE-CREDENTIALED (a re-login) while this refresh was in
+    /// flight, so its tokens were discarded rather than applied
+    /// (`docs/keys-history/relogin-trace.md` B2). Nothing was written to the
+    /// pool or the config file; the caller must fall back to whatever the pool
+    /// holds now, and must NOT treat this as an auth failure.
+    Superseded,
+}
+
+/// Longest reason we quote in a refresh-death detail — enough to recognise an
+/// HTML error page or a provider incident string, short enough to stay one
+/// line in the TUI log. Applied to EVERY branch (structured fields included):
+/// a provider's `error_description` is as unparsed, from our point of view,
+/// as an HTML page.
+const RAW_DETAIL_LIMIT: usize = 120;
+
+/// Appended when the upstream reason says the refresh token is unknown rather
+/// than merely expired: that is the signature of a SECOND process rotating the
+/// same refresh-token family, not of a stale login.
+const ROTATED_HINT: &str =
+    " — token was rotated elsewhere (another llmux daemon or a copied config using this login?)";
+
+/// Appended when the upstream says "revoked": most often the same rotation
+/// story (grok phrases a superseded token this way), but a user revoking the
+/// grant in the provider's account settings produces the identical sentence,
+/// so the hint names both.
+const REVOKED_HINT: &str =
+    " — token was rotated elsewhere (another llmux daemon or a copied config?) or the grant was revoked upstream";
+
+/// Render the upstream reason a refresh died, for the operator-facing message.
+///
+/// WHY this exists: the message used to be "refresh token dead; re-login
+/// required" and nothing else, which hid the only distinction that changes what
+/// the operator should DO. On iq-64 (2026-09-10..21) a retired daemon kept
+/// draining for 25 days and its background refresh loop kept rotating the same
+/// OAuth refresh-token family as its successor; the loser saw `invalid_grant
+/// "Refresh token not found or invalid"` and benched a perfectly good account.
+/// Re-logging in would have been undone by the next tick — the actual fix was
+/// killing the zombie daemon.
+///
+/// Both anthropic and grok answer `{"error": ..., "error_description": ...}`,
+/// so the preference order is `error_description` (the actionable sentence),
+/// then `error`, then the raw body. Whichever branch wins, the text is
+/// upstream-authored and lands in the activity log and the TUI, so every
+/// branch goes through the same sanitizer: credentials masked, whitespace
+/// collapsed to one line, length bounded. A structured field is not trusted
+/// more than an HTML page just because it parsed.
+pub(crate) fn refresh_death_detail(status: &StatusCode, body: &str) -> String {
+    let parsed = serde_json::from_str::<serde_json::Value>(body).ok();
+    let field = |name: &str| {
+        parsed
+            .as_ref()
+            .and_then(|doc| doc.get(name))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    let reason = match (field("error"), field("error_description")) {
+        (Some(error), Some(description)) => format!("{error}: {description}"),
+        (Some(error), None) => error,
+        (None, Some(description)) => description,
+        (None, None) => body.to_string(),
+    };
+    let reason = sanitize_detail(&reason);
+    // An empty/whitespace body would otherwise render as a dangling status.
+    let reason = if reason.is_empty() {
+        "no upstream detail".to_string()
+    } else {
+        reason
+    };
+    let hint = {
+        let lower = reason.to_lowercase();
+        if lower.contains("not found or invalid") {
+            ROTATED_HINT
+        } else if lower.contains("revoked") {
+            REVOKED_HINT
+        } else {
+            ""
+        }
+    };
+    format!("{} {reason}{hint}", status.as_u16())
+}
+
+/// The one sanitizer every refresh-death reason passes through, structured
+/// or raw: mask credential-shaped tokens, collapse to one line, bound length.
+fn sanitize_detail(text: &str) -> String {
+    collapse_and_truncate(&super::logging::mask_credentials(text), RAW_DETAIL_LIMIT)
+}
+
+/// One-line rendering of an arbitrary payload: runs of whitespace (a pretty
+/// -printed JSON body, an HTML page) become single spaces, then cut to `limit`
+/// CHARACTERS — never bytes, so a multi-byte body cannot panic the slice.
+fn collapse_and_truncate(text: &str, limit: usize) -> String {
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    match collapsed.char_indices().nth(limit) {
+        Some((cut, _)) => format!("{}…", &collapsed[..cut]),
+        None => collapsed,
+    }
 }
 
 /// Refresh an oauth credential through the [`RefreshCoalescer`] (concurrent
@@ -2031,10 +2181,18 @@ pub(crate) enum RefreshOutcome {
 /// worker threads — file IO via `spawn_blocking`). `pub(crate)` because the
 /// server's background refresh task reuses this exact path, so request-time
 /// and background refreshes coalesce.
+///
+/// `expected` is the fingerprint `credential` was captured WITH (a lease's
+/// pinned fingerprint, or one `credential_with_fingerprint` returned in the
+/// same lock). Both writes -- pool and config file -- are gated on it, so a
+/// refresh that started from a credential a re-login has since retired writes
+/// NOTHING and reports [`RefreshOutcome::Superseded`]
+/// (`docs/keys-history/relogin-trace.md` B2/B3).
 pub(crate) async fn refresh_credential(
     state: &AppState,
     account: &AccountId,
     credential: &AccountCredential,
+    expected: &AccountFingerprint,
 ) -> RefreshOutcome {
     // (refresh_token, identity for persistence, refresh future) per kind.
     // Anthropic refreshes coalesce via the RefreshCoalescer; codex refreshes
@@ -2137,17 +2295,31 @@ pub(crate) async fn refresh_credential(
                     unreachable!("filtered above")
                 }
             };
-            state.pool.update_credential(account, fresh.clone());
+            // Guarded apply: a re-login that landed while this refresh was in
+            // flight owns the account now, and these tokens were minted from
+            // the credential it retired (relogin-trace B2).
+            if !state
+                .pool
+                .update_credential_if(account, expected, fresh.clone())
+            {
+                tracing::info!(
+                    account = %account,
+                    "token refresh superseded by a newer credential; discarded"
+                );
+                return RefreshOutcome::Superseded;
+            }
             state.emit(ActivityEvent::TokenRefreshed {
                 account: account.0.clone(),
                 expires_at_ms: tokens.expires_at_ms,
             });
-            persist_tokens(state, ident, &tokens, refreshed_at_ms).await;
+            persist_tokens(state, ident, expected, &tokens, refreshed_at_ms).await;
             RefreshOutcome::Refreshed(fresh)
         }
         Err(crate::auth::AuthError::RefreshPermanent { status, body }) => {
             tracing::warn!(account = %account, %status, %body, "refresh token dead; re-login required");
-            RefreshOutcome::Permanent
+            RefreshOutcome::Permanent {
+                detail: refresh_death_detail(&status, &body),
+            }
         }
         Err(err) => {
             tracing::warn!(account = %account, error = %err, "token refresh failed (transient)");
@@ -2166,9 +2338,17 @@ fn non_empty_or(preferred: &str, fallback: &str) -> String {
 
 /// Persist refreshed tokens with read-merge-write semantics. Persistence
 /// failure is logged, never fatal: the pool already has the live tokens.
+///
+/// The write is GUARDED by the digest of the credential the refresh started
+/// from (`expected`), compared against the row on disk INSIDE the
+/// read-merge-write closure. The pool CAS and this write are necessarily two
+/// steps, so a re-login can land between them; without the guard the stale
+/// refresh would overwrite the re-login's row and the next restart would lose
+/// it (`docs/keys-history/relogin-trace.md` B3).
 async fn persist_tokens(
     state: &AppState,
     ident: String,
+    expected: &AccountFingerprint,
     tokens: &crate::auth::oauth::OAuthTokens,
     refreshed_at_ms: u64,
 ) {
@@ -2178,21 +2358,28 @@ async fn persist_tokens(
     let access = tokens.access_token.clone();
     let refresh = tokens.refresh_token.clone();
     let expires = tokens.expires_at_ms;
+    let expected_digest = expected.digest.clone();
     let result = tokio::task::spawn_blocking(move || {
-        crate::config::update_path(&path, |config| {
-            config.update_oauth_tokens(
+        let mut refused = false;
+        let merged = crate::config::update_path(&path, |config| {
+            refused = !config.update_oauth_tokens_if(
                 &ident,
+                |stored| crate::scheduler::credential_digest(stored) == expected_digest,
                 &access,
                 refresh.as_deref(),
                 expires,
                 refreshed_at_ms,
             );
-        })
+        });
+        (merged, refused)
     })
     .await;
     match result {
-        Ok(Ok(_)) => {}
-        Ok(Err(err)) => tracing::warn!(error = %err, "failed to persist refreshed tokens"),
+        Ok((Ok(_), false)) => {}
+        Ok((Ok(_), true)) => tracing::info!(
+            "refreshed tokens not persisted: the stored credential moved on (re-login)"
+        ),
+        Ok((Err(err), _)) => tracing::warn!(error = %err, "failed to persist refreshed tokens"),
         Err(err) => tracing::warn!(error = %err, "token persistence task failed"),
     }
 }
@@ -3084,6 +3271,127 @@ mod tests {
 
     use super::*;
 
+    /// The refresh-death message must carry the upstream reason, and must call
+    /// out the one reason that is NOT "your login expired": a token the
+    /// provider no longer knows (or has revoked) is what a second process
+    /// rotating the same refresh-token family produces — the iq-64 zombie
+    /// daemon (2026-09-10..21), where re-logging in would have fixed nothing.
+    #[test]
+    fn refresh_death_detail_quotes_upstream_reason_and_flags_rotation() {
+        let anthropic = r#"{"error": "invalid_grant", "error_description": "Refresh token not found or invalid"}"#;
+        let detail = refresh_death_detail(&StatusCode::BAD_REQUEST, anthropic);
+        assert!(
+            detail.contains("invalid_grant: Refresh token not found or invalid"),
+            "{detail}"
+        );
+        assert!(detail.starts_with("400 "), "{detail}");
+        assert!(detail.contains("rotated elsewhere"), "{detail}");
+
+        // grok phrases the same situation as "revoked".
+        let grok =
+            r#"{"error":"invalid_grant","error_description":"Refresh token has been revoked"}"#;
+        let detail = refresh_death_detail(&StatusCode::BAD_REQUEST, grok);
+        assert!(
+            detail.contains("Refresh token has been revoked"),
+            "{detail}"
+        );
+        assert!(detail.contains("rotated elsewhere"), "{detail}");
+    }
+
+    /// A STRUCTURED reason is still upstream-authored text headed for the
+    /// activity log: a token echoed back inside `error_description` must be
+    /// masked exactly as it would be in a raw body (review M1).
+    #[test]
+    fn refresh_death_detail_masks_credentials_inside_structured_fields() {
+        let body = r#"{"error":"invalid_grant","error_description":"token sk-ant-oat01-abcdefghijklmnopqrstuvwxyz0123456789 rejected; header was Bearer eyJhbGciOiJSUzI1NiJ9SECRETSECRETSECRET"}"#;
+        let detail = refresh_death_detail(&StatusCode::BAD_REQUEST, body);
+        assert!(!detail.contains("abcdefghijklmnopqrstuvwxyz"), "{detail}");
+        assert!(!detail.contains("SECRETSECRET"), "{detail}");
+        assert!(detail.contains("invalid_grant"), "{detail}");
+        assert!(
+            detail.contains("sk-ant-"),
+            "prefix kept for recognition: {detail}"
+        );
+    }
+
+    /// Newlines in a structured field would break the one-line TUI log row
+    /// (and let an upstream forge a second "log line"); collapse them.
+    #[test]
+    fn refresh_death_detail_collapses_newlines_in_structured_fields() {
+        let body = "{\"error\":\"invalid_grant\",\"error_description\":\"line one\\n\\nline   two\\r\\nline three\"}";
+        let detail = refresh_death_detail(&StatusCode::BAD_REQUEST, body);
+        assert_eq!(detail, "400 invalid_grant: line one line two line three");
+    }
+
+    /// An oversized `error_description` is bounded like a raw body — the
+    /// status prefix, the limit, and one ellipsis, no more.
+    #[test]
+    fn refresh_death_detail_bounds_an_oversized_structured_reason() {
+        let long = "x".repeat(RAW_DETAIL_LIMIT * 3);
+        let body = format!(r#"{{"error":"invalid_grant","error_description":"{long}"}}"#);
+        let detail = refresh_death_detail(&StatusCode::BAD_REQUEST, &body);
+        assert!(detail.ends_with('…'), "{detail}");
+        assert!(
+            detail.chars().count() <= 4 + RAW_DETAIL_LIMIT + 1,
+            "{} chars: {detail}",
+            detail.chars().count()
+        );
+    }
+
+    /// "revoked" is ambiguous (rotation OR an upstream grant revocation), so
+    /// its hint names both instead of asserting rotation.
+    #[test]
+    fn refresh_death_detail_softens_the_hint_for_revoked() {
+        let body =
+            r#"{"error":"invalid_grant","error_description":"Refresh token has been revoked"}"#;
+        let detail = refresh_death_detail(&StatusCode::BAD_REQUEST, body);
+        assert!(detail.contains("revoked upstream"), "{detail}");
+        assert!(detail.contains("rotated elsewhere"), "{detail}");
+    }
+
+    /// A merely EXPIRED token is an ordinary re-login — no rotation hint, or
+    /// the hint stops meaning anything.
+    #[test]
+    fn refresh_death_detail_omits_the_hint_for_a_plain_expiry() {
+        let body = r#"{"error":"invalid_grant","error_description":"Refresh token expired"}"#;
+        let detail = refresh_death_detail(&StatusCode::BAD_REQUEST, body);
+        assert_eq!(detail, "400 invalid_grant: Refresh token expired");
+    }
+
+    /// A provider incident answers HTML, not JSON: quote what we got (one
+    /// line, bounded) instead of losing the reason or panicking.
+    #[test]
+    fn refresh_death_detail_falls_back_to_a_truncated_raw_body() {
+        let body = format!(
+            "<html>\n  <body>{}</body>\n</html>",
+            "gateway error ".repeat(40)
+        );
+        let detail = refresh_death_detail(&StatusCode::BAD_GATEWAY, &body);
+        assert!(
+            detail.starts_with("502 <html> <body>gateway error"),
+            "{detail}"
+        );
+        assert!(!detail.contains('\n'), "collapsed to one line: {detail}");
+        assert!(
+            detail.chars().count() <= 4 + RAW_DETAIL_LIMIT + 1,
+            "{detail}"
+        );
+        assert!(!detail.contains("rotated elsewhere"), "{detail}");
+
+        // Degenerate bodies stay printable rather than trailing a bare status.
+        assert_eq!(
+            refresh_death_detail(&StatusCode::BAD_REQUEST, ""),
+            "400 no upstream detail"
+        );
+        // A multi-byte body must be cut on a char boundary, not a byte one.
+        let wide = "한".repeat(200);
+        let detail = refresh_death_detail(&StatusCode::BAD_REQUEST, &wide);
+        assert!(
+            detail.chars().count() <= 4 + RAW_DETAIL_LIMIT + 1,
+            "{detail}"
+        );
+    }
+
     #[test]
     fn redacted_header_pairs_hide_credentials_keep_names() {
         let mut headers = HeaderMap::new();
@@ -3558,6 +3866,27 @@ mod tests {
             accept: &'static [&'static str],
             body: &'static str,
         },
+        /// [`Scripted::RequireBearer`] that first runs a test hook. The seam
+        /// that makes "a re-login lands while a stale-credential request is in
+        /// flight" DETERMINISTIC (`docs/keys-history/relogin-trace.md`): the
+        /// hook runs inside the upstream call, so the roster has already
+        /// changed by the time the answer reaches the forwarding loop.
+        RequireBearerAfterHook {
+            accept: &'static [&'static str],
+            body: &'static str,
+            hook: Hook,
+        },
+    }
+
+    /// A test callback the mock upstream runs before answering. Manual `Debug`
+    /// (a closure has none) so [`Scripted`] keeps its derives.
+    #[derive(Clone)]
+    struct Hook(Arc<dyn Fn() + Send + Sync>);
+
+    impl std::fmt::Debug for Hook {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("Hook")
+        }
     }
 
     #[derive(Debug, Clone)]
@@ -3639,6 +3968,10 @@ mod tests {
                     ))
                     .expect("response")
             }
+            Scripted::RequireBearerAfterHook { accept, body, hook } => {
+                (hook.0)();
+                bearer_response(auth.as_deref(), accept, body)
+            }
             Scripted::RequireBearer { accept, body } => {
                 let authorized = auth
                     .as_deref()
@@ -3658,6 +3991,30 @@ mod tests {
                         .expect("response")
                 }
             }
+        }
+    }
+
+    /// 200 `body` when the bearer is in `accept`, else 401 — the shared body
+    /// of the two `RequireBearer*` scripted replies.
+    fn bearer_response(
+        auth: Option<&str>,
+        accept: &'static [&'static str],
+        body: &'static str,
+    ) -> axum::response::Response {
+        let authorized = auth.is_some_and(|a| accept.iter().any(|t| a == format!("Bearer {t}")));
+        if authorized {
+            http::Response::builder()
+                .status(200)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(body))
+                .expect("response")
+        } else {
+            http::Response::builder()
+                .status(401)
+                .body(axum::body::Body::from(
+                    r#"{"type":"error","error":{"type":"authentication_error"}}"#,
+                ))
+                .expect("response")
         }
     }
 
@@ -4253,6 +4610,165 @@ mod tests {
             .expect("a");
         assert!(!a.healthy, "a marked AuthFailed after the second 401");
         assert_eq!(snapshot.legacy_current(), Some(&AccountId("b".into())));
+    }
+
+    /// A tempdir + seeded config file for the tests that must see what
+    /// actually reached DISK. Returns (dir, config path).
+    fn seeded_config(state: &AppState) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "llmux-relogin-fwd-{}-{}",
+            std::process::id(),
+            ulid::Ulid::new()
+        ));
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+        let config_path = dir.join("llmux.json");
+        crate::config::save_path(&config_path, &state.config).expect("seed config");
+        (dir, config_path)
+    }
+
+    fn persisted_token(config_path: &std::path::Path, name: &str) -> String {
+        let config = crate::config::load_path(config_path).expect("reload config");
+        match &config
+            .accounts
+            .iter()
+            .find(|a| a.name == name)
+            .expect("account persisted")
+            .credential
+        {
+            AccountCredential::Oauth { access_token, .. } => access_token.clone(),
+            other => panic!("unexpected persisted credential {other:?}"),
+        }
+    }
+
+    fn pool_token(state: &AppState, name: &str) -> String {
+        match state.pool.credential(&AccountId(name.into())) {
+            Some(AccountCredential::Oauth { access_token, .. }) => access_token,
+            other => panic!("unexpected pool credential {other:?}"),
+        }
+    }
+
+    /// `docs/keys-history/relogin-trace.md` B2 + B3: a re-login lands while a
+    /// request is in flight with the credential it retires. The forced refresh
+    /// that the resulting 401 triggers started from the RETIRED credential, so
+    /// neither the pool nor the config file may end up holding its tokens —
+    /// the re-login's credential must survive in BOTH.
+    #[tokio::test]
+    async fn a_stale_refresh_never_overwrites_a_relogin_in_memory_or_on_disk() {
+        let shared = MockShared::default();
+        let upstream = spawn_mock(shared.clone()).await;
+        let mut state = test_state(&upstream, vec![oauth_account("a", "at-a")]);
+        state.refresher = Arc::new(crate::auth::oauth::RefreshCoalescer::with_token_url(
+            format!("{upstream}/mock/token"),
+        ));
+        let (dir, config_path) = seeded_config(&state);
+        state.config_path = Some(config_path.clone());
+
+        // The re-login: config row replaced AND live roster reloaded, exactly
+        // as `AppState::inject_account` does — fired from inside the upstream
+        // call that is about to 401.
+        let hook_pool = state.pool.clone();
+        let hook_path = config_path.clone();
+        let hook = Hook(Arc::new(move || {
+            let relogged = oauth_account("a", "at-a-relogin");
+            crate::config::update_path(&hook_path, |c| {
+                c.upsert_account(relogged.clone());
+            })
+            .expect("re-login write");
+            hook_pool.reload_accounts(std::slice::from_ref(&relogged));
+        }));
+        {
+            let mut script = shared.script.lock().expect("lock");
+            script.push_back(Scripted::RequireBearerAfterHook {
+                accept: &["at-a-relogin"],
+                body: r#"{"ok":1}"#,
+                hook,
+            });
+            script.push_back(Scripted::RequireBearer {
+                accept: &["at-a-relogin"],
+                body: r#"{"ok":1}"#,
+            });
+        }
+
+        let response = forward(&state, client_request("{}")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        assert_eq!(
+            pool_token(&state, "a"),
+            "at-a-relogin",
+            "the retired credential's refresh must not overwrite the pool"
+        );
+        assert_eq!(
+            persisted_token(&config_path, "a"),
+            "at-a-relogin",
+            "…nor the config file the re-login just wrote"
+        );
+        assert!(
+            state.pool.snapshot().accounts[0].healthy,
+            "the re-logged-in account is never benched"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// B1: the SECOND 401 (the one that benches) is earned by a credential the
+    /// re-login has already retired — it must not bench the account the
+    /// re-login healed. The request then succeeds on the new credential.
+    #[tokio::test]
+    async fn a_stale_401_does_not_bench_an_account_that_just_re_logged_in() {
+        let shared = MockShared::default();
+        let upstream = spawn_mock(shared.clone()).await;
+        let mut state = test_state(&upstream, vec![oauth_account("a", "at-a")]);
+        state.refresher = Arc::new(crate::auth::oauth::RefreshCoalescer::with_token_url(
+            format!("{upstream}/mock/token"),
+        ));
+
+        let hook_pool = state.pool.clone();
+        let hook = Hook(Arc::new(move || {
+            hook_pool.reload_accounts(&[oauth_account("a", "at-a-relogin")]);
+        }));
+        {
+            let mut script = shared.script.lock().expect("lock");
+            // 1. at-a → 401 (forces a refresh to at-new).
+            script.push_back(Scripted::RequireBearer {
+                accept: &["at-a-relogin"],
+                body: r#"{"ok":1}"#,
+            });
+            // 2. at-new → 401, and the re-login lands during THIS call: the
+            //    refreshed credential is retired before its failure returns.
+            script.push_back(Scripted::RequireBearerAfterHook {
+                accept: &["at-a-relogin"],
+                body: r#"{"ok":1}"#,
+                hook,
+            });
+            // 3. the retry leases the re-login credential and succeeds.
+            script.push_back(Scripted::RequireBearer {
+                accept: &["at-a-relogin"],
+                body: r#"{"ok":1}"#,
+            });
+        }
+
+        let response = forward(&state, client_request("{}")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        assert!(
+            state.pool.snapshot().accounts[0].healthy,
+            "a 401 from the retired credential must not bench the re-login"
+        );
+        assert_eq!(pool_token(&state, "a"), "at-a-relogin");
+        let auths: Vec<_> = shared
+            .seen
+            .lock()
+            .expect("lock")
+            .iter()
+            .filter_map(|s| s.authorization.clone())
+            .collect();
+        assert_eq!(
+            auths,
+            vec![
+                "Bearer at-a".to_string(),
+                "Bearer at-new".to_string(),
+                "Bearer at-a-relogin".to_string(),
+            ]
+        );
     }
 
     #[tokio::test]

@@ -15,6 +15,7 @@ use crate::scheduler::window::{LimitSeverity, QuotaWindow, ScopedQuotaWindow, Wi
 use crate::scheduler::{AccountId, AccountSnapshot, CooldownSource, PoolSnapshot};
 
 use super::activity::{Completed, CompletedBody, InFlight, Totals};
+use super::triage::AccountSort;
 use super::{LastSwitch, PollHealth, TokenCounts};
 
 /// Everything one frame renders. Owned (no borrow into app state) so a
@@ -52,10 +53,11 @@ pub(crate) struct DashboardView {
     /// Per-client request attribution rows (issue #32), already sorted by
     /// requests desc. One representation used by both document and renderer.
     pub client_usage: Vec<crate::dashboard::ClientUsageDoc>,
-    /// Per-TENANT usage rows (multi-tenant #22): keyed attribution with
-    /// name/email joined, cost priced, span stamped — sorted by requests.
-    pub tenant_usage: Vec<crate::dashboard::TenantUsageDoc>,
-    /// Issued client keys (metadata only — never secrets).
+    /// Issued client keys (metadata only — never secrets). The keys panel's
+    /// NUMBERS no longer ride on the document: they come from the durable
+    /// keys-usage query (`docs/keys-history/spec.md` K), so only the roster is
+    /// needed here. `DashboardDoc::tenant_usage` stays on the wire for
+    /// existing API consumers.
     pub client_keys: Vec<crate::dashboard::KeyRowDoc>,
     /// Windowed (24h/72h) per-account/per-model heatmap slices (issue #23),
     /// carried straight from the document so local + attach render the same.
@@ -312,6 +314,15 @@ impl DashboardView {
                 // Kind rides the wire too (TUI UI-6 item 1) so the attached
                 // in-flight row shows the same aligned `kind` column.
                 kind: r.kind.clone(),
+                // Identity + input + the resolved display name ride the same
+                // hop (activity in-flight identity) so an ATTACHED running row
+                // shows the same Name / session / input cells as a completed
+                // row — dropping them here is exactly how the badge was lost
+                // before (issue #2 2a).
+                user_id: r.user_id.clone(),
+                tenant: r.tenant.clone(),
+                excerpt: r.excerpt.clone(),
+                client_name: r.client_name.clone(),
                 started_at: ms_time(r.started_at_ms),
             })
             .collect();
@@ -439,7 +450,6 @@ impl DashboardView {
             logs,
             model_usage: doc.model_usage.clone(),
             client_usage: doc.client_usage.clone(),
-            tenant_usage: doc.tenant_usage.clone(),
             client_keys: doc.client_keys.clone(),
             windowed: doc.windowed.clone(),
             codex: doc.codex.clone(),
@@ -477,13 +487,13 @@ impl DashboardView {
     }
 
     /// Display order of the accounts table: indices into `snapshot.accounts`
-    /// in INTERVENTION order (glance-triage atom 2) — exhausted, then
-    /// auth-broken, then known usage descending, then ready, then paused,
-    /// then cold/unknown; stable (config index) within a tier. The same list
-    /// drives the render AND every row cursor (switch/remove/limits), so a
-    /// click can never mis-target.
-    pub(crate) fn display_order(&self, now: SystemTime) -> Vec<usize> {
-        super::triage::intervention_order(&self.snapshot, &self.select_params, now)
+    /// in backend-group blocks (Claude, Codex, Grok, OpenRouter) — the primary
+    /// key in both modes — ordered within a block by `sort`: account name
+    /// (default) or the scheduler's own next-pick order. The same list drives
+    /// the render AND every row cursor (switch/remove/limits), so a click can
+    /// never mis-target.
+    pub(crate) fn display_order(&self, sort: AccountSort, now: SystemTime) -> Vec<usize> {
+        super::triage::display_order(&self.snapshot, &self.select_params, sort, now)
     }
 
     pub(crate) fn totals_for(&self, account: &str) -> Totals {
@@ -759,6 +769,40 @@ mod tests {
     }
 
     #[test]
+    fn from_doc_carries_in_flight_identity_for_the_name_and_excerpt() {
+        // activity in-flight identity: the Name column, the «session» label
+        // key and the “input” excerpt all ride the same HubDoc→JSON→from_doc
+        // hop the badge does. Dropping them here is exactly how the running
+        // row lost its identity before.
+        let mut json = doc_json();
+        let infl = &mut json["activity"]["in_flight"][0];
+        infl["user_id"] = serde_json::json!("u1");
+        infl["tenant"] = serde_json::json!("k-t1");
+        infl["excerpt"] = serde_json::json!("hello world");
+        infl["client_name"] = serde_json::json!("Z (U09F1M5MML1)");
+
+        let doc: DashboardDoc = serde_json::from_value(json).expect("parse doc");
+        let view = DashboardView::from_doc(&doc);
+
+        assert_eq!(view.in_flight.len(), 1);
+        assert_eq!(view.in_flight[0].user_id.as_deref(), Some("u1"));
+        assert_eq!(view.in_flight[0].tenant.as_deref(), Some("k-t1"));
+        assert_eq!(view.in_flight[0].excerpt.as_deref(), Some("hello world"));
+        assert_eq!(
+            view.in_flight[0].client_name.as_deref(),
+            Some("Z (U09F1M5MML1)")
+        );
+
+        // A doc WITHOUT the fields still parses (back-compat → None).
+        let doc2: DashboardDoc = serde_json::from_value(doc_json()).expect("parse legacy doc");
+        let view2 = DashboardView::from_doc(&doc2);
+        assert_eq!(view2.in_flight[0].user_id, None);
+        assert_eq!(view2.in_flight[0].tenant, None);
+        assert_eq!(view2.in_flight[0].excerpt, None);
+        assert_eq!(view2.in_flight[0].client_name, None);
+    }
+
+    #[test]
     fn from_doc_round_trips_the_event_banners() {
         // The event banners ride the doc from the daemon's live holder, so both
         // backends render them through from_doc. Present → carried verbatim.
@@ -835,7 +879,7 @@ mod tests {
             crate::scheduler::select::eligibility(b, &view.select_params, now(), false),
             Some(crate::scheduler::select::IneligibleReason::CoolingDown)
         );
-        assert_eq!(view.display_order(now()), vec![0, 1]);
+        assert_eq!(view.display_order(Default::default(), now()), vec![0, 1]);
 
         assert_eq!(view.totals_for("a").ok, 2);
         assert_eq!(view.global_totals.errors, 1);

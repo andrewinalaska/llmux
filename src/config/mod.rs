@@ -488,13 +488,42 @@ mod tests {
   ]
 }"#;
         let config: Config = serde_json::from_str(raw).expect("pre-grok config parses");
-        assert_eq!(config.grok.default_model, "grok-4.6", "defaults fill in");
+        assert_eq!(config.grok.default_model, "grok-4.7", "defaults fill in");
         assert!(config.routing.grok_models.is_empty());
         // Round-trip: serialize → parse → identical value (additive-only).
         let round: Config =
             serde_json::from_str(&serde_json::to_string(&config).expect("serialize"))
                 .expect("round trip");
         assert_eq!(round, config);
+    }
+
+    /// The default-pin roll (`grok-4.6` → `grok-4.7`, 2026-09-23) must move
+    /// only the DEFAULT: an on-disk config that names a model keeps it, and a
+    /// `grok` section that omits the field still picks up the new default.
+    #[test]
+    fn explicit_grok_model_survives_a_default_pin_roll() {
+        let raw = r#"{
+  "version": 1,
+  "grok": { "default_model": "grok-4.6" },
+  "accounts": []
+}"#;
+        let config: Config = serde_json::from_str(raw).expect("config parses");
+        assert_eq!(
+            config.grok.default_model, "grok-4.6",
+            "an explicit pin is never rewritten to the new default"
+        );
+    }
+
+    #[test]
+    fn grok_section_without_a_model_takes_the_current_default() {
+        let raw = r#"{
+  "version": 1,
+  "grok": { "reasoning_effort": "high" },
+  "accounts": []
+}"#;
+        let config: Config = serde_json::from_str(raw).expect("config parses");
+        assert_eq!(config.grok.default_model, "grok-4.7");
+        assert_eq!(config.grok.reasoning_effort.as_deref(), Some("high"));
     }
 
     pub(crate) fn oauth_account(name: &str, uuid: &str) -> AccountConfig {
@@ -866,11 +895,15 @@ mod tests {
         let mut config = Config::default();
         config.accounts.push(codex_account("codex-old", "acct-1"));
 
-        // Re-import with the same account_id replaces, never duplicates.
+        // Re-import with the same account_id replaces, never duplicates. The
+        // ESTABLISHED name survives the identity-matched replace
+        // (`docs/keys-history/relogin-trace.md` B6): paused_accounts,
+        // account_limits and the scheduler's per-account state are keyed by
+        // name, so a re-login must not rename the account out from under them.
         let outcome = config.upsert_account(codex_account("cx@x.com", "acct-1"));
         assert_eq!(outcome, Upsert::Updated);
         assert_eq!(config.accounts.len(), 1);
-        assert_eq!(config.accounts[0].name, "cx@x.com");
+        assert_eq!(config.accounts[0].name, "codex-old");
 
         // Refreshed codex tokens persist through the shared updater.
         assert!(config.update_oauth_tokens("acct-1", "at-new", Some("rt-new"), 99, 77));
@@ -969,11 +1002,13 @@ mod tests {
         config.accounts.push(oauth_account("old-name", "uuid-a"));
         config.accounts.push(apikey_account("api-1"));
 
-        // Same uuid, new name -> replaces in place (re-login rename).
+        // Same uuid, new name -> replaces the CREDENTIAL in place and KEEPS
+        // the established name (relogin-trace B6; the old "a re-login renames
+        // the account to its profile email" contract is retired).
         let outcome = config.upsert_account(oauth_account("new@x.com", "uuid-a"));
         assert_eq!(outcome, Upsert::Updated);
         assert_eq!(config.accounts.len(), 2);
-        assert_eq!(config.accounts[0].name, "new@x.com");
+        assert_eq!(config.accounts[0].name, "old-name");
 
         // Unknown uuid, unknown name -> appended.
         let outcome = config.upsert_account(oauth_account("c@x.com", "uuid-c"));

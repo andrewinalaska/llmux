@@ -25,7 +25,7 @@ This is the detailed, operational half of the docs: every command, the daemon/da
 | `key suspend\|resume\|remove\|rotate <id\|name>` | Suspend/resume/revoke/rotate a key. Takes effect on the very next request — no restart. `remove` is a soft-revoke: usage history keeps its name/email. `rotate` issues a new secret under the same attribution id. |
 | `api <path>` | Debug: GET an upstream path with the current account's credentials. |
 
-In the TUI: `s` switches account, `a` adds, `n` starts a new browser login, `r` removes, `R` reloads config, `d` toggles detail, `l` cycles the log panel, `p` opens the perf tab, `K` opens the keys tab (multi-tenant client keys + per-tenant usage; read-only — mutations go through `llmux key …`), `q` quits, and `j`/`k` or arrows navigate. For Codex accounts, `f` toggles fast (priority) mode, `m` cycles the model, and `e` cycles reasoning effort. The Grok group's `effort:` value on the same settings bar is click-cycled (or activated from the config tab's `grok.reasoning_effort` row): `bypass → none → low → medium → high → xhigh`, with the per-model clamp still applied at request time — `xhigh` rides through on `grok-4.6` and lands as `high` on `grok-4.5`. In the accounts overlay, `f` refreshes usage and `R` redeems one rate-limit reset (see [Usage controls](#usage-controls-refresh--resets)) — on MAIN those keys keep their old meanings (`f` codex fast, `R` reload config). In attach mode (`llmux dashboard`, or `server` attaching to a daemon), config-mutation keys `a`/`r`/`R` (reload) are disabled because they would act on the server host's config; `s` still works through `POST /llmux/switch`, and the usage controls work because they act on the daemon. Activity-panel mouse semantics are described under [Activity feed](#activity-feed).
+In the TUI: `s` switches account, `a` adds, `n` starts a new browser login, `r` removes, `R` reloads config, `d` toggles detail, `l` cycles the log panel, `p` opens the perf tab, `K` opens the keys tab (multi-tenant client keys + per-tenant usage; read-only — mutations go through `llmux key …`), `q` quits, and `j`/`k` or arrows navigate. For Codex accounts, `f` toggles fast (priority) mode, `m` cycles the model, and `e` cycles reasoning effort. The Grok group's `effort:` value on the same settings bar is click-cycled (or activated from the config tab's `grok.reasoning_effort` row): `bypass → none → low → medium → high → xhigh`, with the per-model clamp still applied at request time — `xhigh` rides through on `grok-4.6` and lands as `high` on `grok-4.5`. In the accounts overlay, `f` refreshes usage and `R` redeems one rate-limit reset (see [Usage controls](#usage-controls-refresh--resets)) — on MAIN those keys keep their old meanings (`f` codex fast, `R` reload config). Accounts rows are grouped Claude → Codex → Grok → OpenRouter, and `o` (MAIN or the accounts overlay) toggles the order WITHIN each group between account name (the default; a natural, numeric-aware order — digit runs compare as numbers, so a block reads `ai`, `ai1`, `ai2`, … `ai10`, not `ai10`, `ai1`, `ai`) and the scheduler's next-pick order — the pane title reports which is active. Left-clicking an accounts row (dashboard or accounts tab) opens a scrollable modal with every detail recorded for that account — Esc closes it, and right-click still opens the row's context menu. In attach mode (`llmux dashboard`, or `server` attaching to a daemon), config-mutation keys `a`/`r`/`R` (reload) are disabled because they would act on the server host's config; `s` still works through `POST /llmux/switch`, and the usage controls work because they act on the daemon. Activity-panel mouse semantics are described under [Activity feed](#activity-feed).
 
 ### Usage controls (refresh · resets)
 
@@ -38,6 +38,8 @@ An external Codex reset does not invalidate llmux's observed quota window, so a 
 - **Forced switch.** Selecting an account with `s` (or `POST /llmux/switch`) refreshes that account's usage BEFORE committing, including when it is already the active account — re-selecting is how you force a fresh read. The client no longer pre-judges eligibility from cached windows (a stale 100% could otherwise block the very switch that refreshes it); the pool remains the authority on pause, auth and cooldown, and a failed pre-switch refresh is shown as a separate warning rather than as a failed switch.
 
 `n` (from the accounts overlay or the account switcher) opens a provider picker — Claude (Anthropic OAuth), Codex (ChatGPT OAuth), Grok (xAI device code — it prints the verification URL and user code, best-effort opens the browser, then polls), OpenRouter (PKCE minting an `sk-or-v1-…` key). `↑↓` picks, `Enter` runs the flow, `Esc` cancels. The OAuth flow runs in the client that owns the keyboard, and the minted credential is injected into the daemon — in-process locally, over `POST /llmux/inject-account` when attached — so the account serves traffic without a restart and `n` is live in attach mode too. On a client with no browser (a headless SSH session), `n` refuses with the `llmux login` fallback hint instead of starting a flow that would hang.
+
+**Login identity and re-login.** A Claude OAuth login identifies the account by the `accountUuid` on its profile. If the profile fetch fails, or the profile carries no stable `accountUuid`, the login now **errors and saves nothing** — the freshly minted tokens are discarded with it — instead of storing an unidentified placeholder account that the next login would duplicate rather than update; re-running the login is the remedy. An identified profile with no email is named after its uuid. **Logging in again with an account you already have replaces the credentials in place and keeps the established local account name**, even if the profile email has since changed: operator pause, per-account limits, quota windows, cooldowns, in-flight leases and the sticky current selection are all keyed by that name, so a rename would silently resume a paused account and drop its ceilings. The account name is a stable local label, not a mirror of the current profile email. On a running daemon the re-login takes effect without a restart, and a credential that ACTUALLY changed also clears an authentication-failure bench back to healthy — re-applying byte-identical credentials (a pause toggle, an `import`, a re-inject of the same bytes) never resurrects a failed account. Work that started before the re-login and carries the retired credential — an in-flight request's 401, a dead refresh token, a background refresh or usage poll — is discarded rather than applied, so it can no longer re-bench the account or overwrite the fresh credential in memory or in the config file; a genuine 401 from the CURRENT credential still benches the account. Design detail and the races behind these guards: [re-login trace](keys-history/relogin-trace.md).
 
 ### Usage tab (calendar usage + cost)
 
@@ -131,6 +133,8 @@ just build
 
 `llmux run` spawns `claude` with only `ANTHROPIC_BASE_URL` set and passes arguments through after `--`. If nothing is listening on the configured port, `run` auto-starts a detached daemon and waits until it is ready.
 
+It also makes Claude Code's `/model` picker list the llmux catalog: `run` fetches `GET /llmux/models` from the proxy it is pointing `claude` at and prepends the lineup as `claude --settings '<modelPicker json>'` (no settings file is written, and the built-in Anthropic rows stay). `--no-model-picker` suppresses the injection, a `--settings` of your own in the pass-through args wins with one warning line, and a failed catalog fetch is a warning that never blocks the launch — see [`models.md`](models.md#claude-code-model-picker).
+
 Daemon stderr is written to `~/.local/state/llmux/server.log`, respecting `$XDG_STATE_HOME`. A port occupied by a foreign process is an error; llmux never overwrites it.
 
 Manual shell wiring:
@@ -166,13 +170,71 @@ usage is recorded per tenant (name + email) instead of one anonymous pool.
   `POST /llmux/keys/suspend` `{id, suspended}`, `POST /llmux/keys/remove`
   `{id}`, `POST /llmux/keys/rotate` `{id}`.
 - The dashboard's `keys` tab (`K`) is the admin view: every issued key with
-  its name/email, kind, state, requests, tokens, API-equivalent cost, the
+  its name (first column) and a ≤16-cell key cell (`<id>·<prefix>`, never a
+  secret), kind, state, requests, ok/err, tokens, API-equivalent cost, the
   used-from → used-to span, and a per-model breakdown — the builtin
   `local`/`legacy` buckets included, so every request is accounted for.
-  The dashboard document carries the same data as `tenant_usage` and
-  `client_keys` (metadata; never secrets). History persisted before this
-  feature shows as the `unknown` tenant — it is never folded into a live
-  bucket.
+  History persisted before multi-tenant keys shows as the `unknown` tenant —
+  it is never folded into a live bucket.
+
+### Keys usage: windows, model filter, durable history
+
+The numbers on the `keys` tab come from a durable per-tenant store, not from
+the in-memory activity fold, so they survive restarts and can be narrowed:
+
+| Key | Effect |
+|---|---|
+| `w` | Cycle the window: `all` → `1h` → `24h` → `7d` → `14d` → `30d` → `90d` → `all`. Each window is the exact closed interval `[now − duration, now]`; future-stamped rows are never counted. |
+| `f` | Multi-select the models observed in the current window — `↑/↓` move, `Space` toggles, `a` selects all, `c` clears, `Enter` applies, `Esc` cancels. No selection = every model. The offered list is the window's models, never narrowed by the filter already applied, so a selection can be changed and not just narrowed. |
+| `↑/↓`, `PgUp/PgDn`, `Home/End` | Scroll every row, key rows and their model rows alike; `End` stops on the last full page. |
+| `r` | Re-run the query. |
+
+On a narrow terminal the table sheds its widest, lowest-value columns (the
+`used` span first, then `kind`/`state`/`ok/err`) so the name column and the
+`└ group/model` labels stay readable down to 80 columns.
+
+The title always states the active question (`window 24h · 2 model(s) · N
+requests`). A pending query says `loading…` and a failed one says why — a
+filtered or failed view is never redrawn as unfiltered data or as zeros.
+With explicit models selected, requests that failed before routing (no model
+attributed) drop out; under `all models` they stay, so the admin view still
+accounts for every observed completion.
+
+- **Where it lives.** `~/.config/llmux/usage.sqlite3` for a stable/dev build,
+  `~/.config/llmux-preview/usage.sqlite3` for a preview build (the two
+  channels never share history). With `$LLMUX_CONFIG` pointing elsewhere the
+  store moves to a sibling directory named after that config file
+  (`/tmp/x/alt.json` → `/tmp/x/alt/usage.sqlite3`). File `0600`, directory
+  `0700`. It holds request METADATA only — when, tenant, group, model,
+  status, token counts — never prompts, responses, or credentials.
+- **Legacy history.** On startup the daemon imports the existing
+  `activity.jsonl` prefix once (transactional byte offset + per-request
+  identity), so a restart neither re-imports nor double-counts, and requests
+  that land while the import runs are recorded exactly once. The JSONL log is
+  NOT deleted or replaced — the activity feed, sessions, perf, and stats
+  surfaces keep using it. Rotation is detected by the source's file id AND its
+  head bytes, so a replaced or truncated-and-refilled log is re-read instead of
+  silently resumed at a stale offset.
+- **Migrating a large history.** The import runs in chunks and releases the
+  store between them, so a multi-hundred-megabyte `activity.jsonl` never blocks
+  live metering or admin queries. While it runs, every answer is partial by
+  construction and the panel title says `importing history N%` (the API carries
+  `health.importing` / `health.import_pct`). A failed import is counted in
+  `health.errors` / `health.last_error`, so an incomplete history can never
+  quietly read as a complete one.
+- **Coverage caveat.** Rows come from the same best-effort activity-event
+  stream the dashboard folds (`try_send`, dropped on a full channel). This is
+  faithful metering of observed completions, not an independent billing
+  ledger. Write failures are counted and surfaced instead of being swallowed.
+- **HTTP surface (admin):** `GET /llmux/keys/usage?window=<all|1h|24h|7d|14d|30d|90d>&models=<a,b,c>`
+  — `models` is one comma-separated, percent-encoded parameter; absent means
+  every model. An unknown window is a `400`. The answer carries the applied
+  `window`/`models`, the window's `available_models`, `from_ms`/`to_ms`, the
+  matched `rows`, per-tenant totals with their priced per-model cells, and
+  the store's `health` (`written`/`dropped`/`errors`/`last_error`/`importing`/
+  `import_pct`). The
+  attach-mode dashboard renders exactly this document, so local and remote
+  show identical rows.
 
 ## Daemon and dashboard
 
@@ -251,7 +313,7 @@ Scheduler knobs:
 | `usage_max_age_secs` | `600` | Usage older than this is stale; stale accounts are skipped unless all are stale. |
 | `refresh_ahead_secs` | `25200` | Background refresh threshold; default 7 hours before token expiry. |
 
-Codex request-shaping is also settable live from the dashboard's Codex group: `default_model` (the model slug sent upstream, default `gpt-5.6-sol`), `fast` (sends `service_tier: "priority"` when `true`), and `reasoning_effort` (`none`|`minimal`|`low`|`medium`|`high`|`xhigh`|`max`, plus `ultra` on `gpt-5.6-sol`/`-terra`; `max`/`ultra` clamp to `xhigh` below the gpt-5.6 family; omitted by default). Grok request-shaping is the same minus `fast` (xAI has no service tier): `default_model` (default `grok-4.6`) and `reasoning_effort` (`none`|`low`|`medium`|`high`|`xhigh`, clamped per model at request time; omitted by default).
+Codex request-shaping is also settable live from the dashboard's Codex group: `default_model` (the model slug sent upstream, default `gpt-5.6-sol`), `fast` (sends `service_tier: "priority"` when `true`), and `reasoning_effort` (`none`|`minimal`|`low`|`medium`|`high`|`xhigh`|`max`, plus `ultra` on `gpt-5.6-sol`/`-terra`; `max`/`ultra` clamp to `xhigh` below the gpt-5.6 family; omitted by default). Grok request-shaping is the same minus `fast` (xAI has no service tier): `default_model` (default `grok-4.7`) and `reasoning_effort` (`none`|`low`|`medium`|`high`|`xhigh`, clamped per model at request time; omitted by default).
 
 Accounts are `oauth` (Claude subscription), `apikey` (Anthropic API key), `codex` (ChatGPT/Codex subscription token), `grok` (xAI subscription token), or `openrouter` (an `sk-or-v1-…` API key). Claude accounts dedupe by `account_uuid`; Codex accounts dedupe by `account_id`; API keys and OpenRouter accounts dedupe by name. An `lm-...` proxy API key is generated on first run; localhost clients are exempt.
 
@@ -259,7 +321,8 @@ Accounts are `oauth` (Claude subscription), `apikey` (Anthropic API key), `codex
 
 ## Activity feed
 
-The dashboard's activity panel shows one row per completed request
+The dashboard's activity panel shows one row per request — running requests
+pinned on top, then completed ones newest first
 (2026-07-15 layout):
 
 ```text
@@ -284,6 +347,13 @@ The dashboard's activity panel shows one row per completed request
   is stripped (`claude-opus-4-8[1m]` → `opus-4-8[1m]`). Columns are padded
   to the widest visible value per frame, and the input excerpt takes the
   remaining terminal width.
+- **in flight** — a RUNNING request renders the same columns, so nothing
+  shifts when it finishes: a group-colored spinner in place of `▸`, `…` in
+  the status slot, the live elapsed time in the duration slot, and `—` for
+  tokens/throughput/cost. Name, badge and email therefore line up with the
+  completed rows, and the «session» label plus the "input" excerpt are already
+  there while the request runs — both are known at forward entry, not at the
+  finish.
 - **Clicking a row** expands its detail lines (full method+path, client id,
   account, token/cost breakdown). Clicking again collapses.
 - **Grouping** — only consecutive `count` probes fold, into
@@ -438,8 +508,10 @@ These are **subscription gateways**, not the public OpenAI or xAI API: Codex use
 
 | Messages input / behavior | Codex | Grok |
 | --- | --- | --- |
-| User PNG/JPEG base64 images | Supported as `input_image.image_url` data URIs | Same |
-| Images nested in user `tool_result.content` | Supported in `function_call_output.output` content arrays, preserving text/image order | Same |
+| User PNG/JPEG/**WebP** base64 images | Supported as `input_image.image_url` data URIs, bytes forwarded verbatim | Same |
+| User **GIF** base64 images | Forwarded verbatim — the gateway accepts GIF (live probe 2026-09-17) | Decoded and re-encoded as PNG; this gateway answers a GIF with `400 invalid_image` |
+| Animated GIF | Forwarded verbatim, all frames intact (nothing is parsed) | Local HTTP 400; a PNG cannot carry the frames and llmux will not forward only the first |
+| Images nested in user `tool_result.content` | Supported in `function_call_output.output` content arrays, preserving text/image order | Same (a GIF is converted in place) |
 | URL images, other media, unknown content blocks | Local HTTP 400; never fetched or silently dropped | Same |
 | `tool_choice` | `auto` → `"auto"`; `any` → `"required"`; `none` → `"none"`; `tool{name}` → `{"type":"function","name":name}` | Same |
 | Absent/empty tools | Omit `tools`, `tool_choice`, and `parallel_tool_calls` together (`auto`/`none` are vacuous) | Same |
@@ -451,7 +523,7 @@ These are **subscription gateways**, not the public OpenAI or xAI API: Codex use
 | Image `count_tokens` (top-level or nested) | Local HTTP 400: no reliable image-token estimate | Same |
 | Process-wide `prompt_cache_key` | Retained | Omitted; routing scope of a shared key is unproven |
 
-Image validation requires `source.type: "base64"`, `media_type: "image/png"` or `"image/jpeg"`, nonempty valid base64, and decoded size at most **20 MiB per image**. This is a bounded llmux contract, not support for every upstream image format. Images on assistant/system/developer roles, documents, audio/video, malformed structures, and nameless or server-side tools return a typed local 400 with a field path, not raw payload data. `tool_use` requires valid id/name/input; `tool_result` requires a nonempty `tool_use_id`, and `is_error: true` is preserved by an explicit error-text prefix. Named choices must refer to a declared tool; `any`/`tool` require nonempty tools. `disable_parallel_tool_use` must be boolean and maps to the inverse `parallel_tool_calls`; there is no fallback from an invalid choice to `auto`.
+Image validation requires `source.type: "base64"`, nonempty valid base64, a decoded size of at most **20 MiB per image**, and a `media_type` the target gateway accepts — measured, not assumed (live probes 2026-09-17): Codex answered 200 to `image/png`, `image/jpeg`, `image/webp` and `image/gif`; Grok answered 200 to the first three and refused GIF with `400 {"code":"invalid_image", … "Downloaded response does not contain a valid JPG, PNG, WebP, or ICO image."}`. Anything the gateway accepts is forwarded **byte-for-byte and never parsed**, so llmux cannot degrade an image it was not asked to change. The one conversion is **GIF on Grok**: the frame is decoded and re-encoded as PNG (transparency preserved), and the resulting PNG is subject to the same 20 MiB cap. That conversion is additionally bounded by a **128 MiB decode budget** (`width × height × 4`, checked from the GIF's logical screen descriptor before any pixel buffer is allocated, so a small file declaring huge dimensions is refused rather than decoded; this llmux-owned budget is the only size limit on the path — the `gif` backend imposes none when `image` hands it a caller-owned buffer — so an oversized image is always a typed 400 naming the dimensions, never a decoder-internal "not decodable"); an **animated** GIF (more than one frame in the container) or an undecodable one is refused outright on Grok, while Codex forwards it whole. A media type outside the gateway's set is a local 400 naming the field path, the flavor and that flavor's accepted list. Grok's own minimums (at least 8 px per side and 512 total pixels) are not enforced locally — such an image is forwarded and the gateway's 400 propagates. This is a bounded llmux contract, not support for every upstream image format. Images on assistant/system/developer roles, documents, audio/video, malformed structures, and nameless or server-side tools return a typed local 400 with a field path, not raw payload data. `tool_use` requires valid id/name/input; `tool_result` requires a nonempty `tool_use_id`, and `is_error: true` is preserved by an explicit error-text prefix. Named choices must refer to a declared tool; `any`/`tool` require nonempty tools. `disable_parallel_tool_use` must be boolean and maps to the inverse `parallel_tool_calls`; there is no fallback from an invalid choice to `auto`.
 
 **Compatibility policy and headers.** Omit `X-Llmux-Compatibility` or send `X-Llmux-Compatibility: compat` for the default policy. It permits only the enumerated semantic losses above; it does not make unsupported content acceptable. Successful translated responses advertise sorted, deduplicated field-name lists when relevant:
 
@@ -497,7 +569,7 @@ llmux login --openrouter --paste
 
 `--paste` requires `--openrouter`. The key is read from stdin, never printed back, and is masked in logs like every other credential.
 
-Unlike the Codex and Grok backends, the OpenRouter provider is a **passthrough, not a translator**: OpenRouter exposes a native Anthropic Messages endpoint (`POST {openrouter.upstream}/messages`), so llmux forwards the Messages body unchanged apart from its `model` field, plus dropping the Claude-Code-local `anthropic-beta` / `anthropic-dangerous-direct-browser-access` headers OpenRouter does not know. There is no SSE conversion on this path. `/v1/messages/count_tokens` is answered locally (OpenRouter has no equivalent endpoint).
+Unlike the Codex and Grok backends, the OpenRouter provider is a **passthrough, not a translator**: OpenRouter exposes a native Anthropic Messages endpoint (`POST {openrouter.upstream}/messages`), so the Messages format is not converted and there is no SSE conversion on this path. The body is still normalized twice, not forwarded byte-for-byte: the `model` field is rewritten to the wire slug, and `thinking` blocks with a missing or empty `signature` — the ones the Codex/Grok translators synthesize — are stripped, dropping any message the strip leaves with an empty content array, because OpenRouter's Messages schema requires that signature. The Claude-Code-local `anthropic-beta` / `anthropic-dangerous-direct-browser-access` headers are also dropped. `/v1/messages/count_tokens` is answered locally (OpenRouter has no equivalent endpoint). The per-backend difference matrix is [provider compatibility](provider-compatibility.md).
 
 Model selection is the `or-` prefix — `/model or-ox-alpha` routes to the openrouter group and reaches OpenRouter as `stealth/ox-alpha`. A bare `or` (or a model-less request) uses `openrouter.default_model`, `or-<vendor>/<slug>` passes through verbatim for the models llmux does not curate, and an unrecognized bare name is forwarded as typed so OpenRouter's own 404 reaches you. The curated rows, their wire slugs, and their context windows are in [models.md](models.md#alias-semantics).
 

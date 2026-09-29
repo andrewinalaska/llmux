@@ -10,7 +10,7 @@
 
 ![llmux demo](https://github.com/2lab-ai/llmux/releases/latest/download/llmux-demo.gif)
 
-**One agent harness, every model.** llmux is a local Anthropic-compatible proxy for [Claude Code](https://www.anthropic.com/claude-code): `claude` talks to `http://localhost:3456`, llmux decides which account/backend serves the request. Your subagents, slash commands, MCP servers, hooks, and `CLAUDE.md` conventions stay put while frontier models and subscription limits keep moving — `/model fable`, `/model gpt-5.6-sol`, `/model grok-4.6` are routing signals, not migrations.
+**One agent harness, every model.** llmux is a local Anthropic-compatible proxy for [Claude Code](https://www.anthropic.com/claude-code): `claude` talks to `http://localhost:3456`, llmux decides which account/backend serves the request. Your subagents, slash commands, MCP servers, hooks, and `CLAUDE.md` conventions stay put while frontier models and subscription limits keep moving — `/model fable`, `/model gpt-5.6-sol`, `/model grok-4.7` are routing signals, not migrations.
 
 - **one Rust binary** — daemon, live TUI dashboard, login/import, updater, and a Claude Code launcher (`llmux run`)
 - **four backend groups in one pool** — Claude (subscription + API key), Codex (`gpt-*` / ChatGPT), Grok (`grok-*` / xAI), OpenRouter (`or-*` / free models on an OpenRouter key), routed by model name ([models →](docs/models.md))
@@ -68,6 +68,8 @@ llmux run             # starts/reuses the daemon, then launches claude
 alias lx='llmux run'  # a convenient alias; args after -- pass through to claude
 ```
 
+Inside that session `/model` lists the llmux [catalog](docs/models.md#claude-code-model-picker) — every codex/grok/openrouter id too, not just the built-in Claude rows. The same launch exports `ANTHROPIC_DEFAULT_{OPUS,FABLE,SONNET,HAIKU}_MODEL` from the catalog's alias owners, so `/model opus` — which Claude Code resolves natively, before llmux ever sees it — lands on `claude-opus-5-5[1m]` and its 1M window instead of the client's 200k default ([alias exports](docs/models.md#alias-exports); a var you already export is left alone). `--no-model-picker` opts out of both.
+
 Want the foreground TUI dashboard instead:
 
 ```bash
@@ -84,7 +86,7 @@ Claude Code's model name becomes the routing signal:
 /model fable
 /model opus[1m]
 /model gpt-5.6-sol[1m]
-/model grok-4.6
+/model grok-4.7
 /model or-ox-alpha
 ```
 
@@ -96,6 +98,14 @@ Claude Code's model name becomes the routing signal:
 | `or` / `or-*` / `openrouter/*` | OpenRouter accounts |
 
 Curated catalog (ids, aliases, efforts, context windows): `GET /models` and [docs/models.md](docs/models.md). Routing config: [docs/configuration.md](docs/configuration.md).
+
+> **Same request, different backend — read [provider compatibility](docs/provider-compatibility.md) before you trust a field.** Claude and OpenRouter are passthrough; Codex and Grok are subscription gateways llmux translates onto, and they do not honor everything Claude Code sends.
+>
+> - **`gpt-*` (Codex): no output-limit guarantee — your `max_tokens` is not sent upstream at all.** The gateway answered `400 Unsupported parameter: max_output_tokens` (live probe 2026-09-14), and no supported alternative cap field **was found** in the current official Codex client or its docs (read 2026-09-14), so llmux omits the cap rather than faking one. That is a search result, not an allowlist: other field names are untested, not proven absent.
+> - **`grok-*`: the cap is forwarded, but it is not the budget you asked for.** A `max_output_tokens: 1` probe (2026-09-14) came back `incomplete` with one visible token and 168 reported output tokens, 167 of them reasoning. What it bounds in general — and what it costs — is unmeasured.
+> - **Both:** non-null `temperature` / `top_p` / `top_k` and **non-empty** `stop_sequences` are refused with a local 400, prior `thinking` blocks are dropped, and there is no reasoning continuity across turns.
+>
+> A translated response that lost something names it in `X-Llmux-Omitted-Fields` / `X-Llmux-Compatibility-Warnings` (a faithful one carries neither header); send `X-Llmux-Compatibility: strict` to turn any such loss into a 400 instead. Full matrix, receipts and known unknowns: [docs/provider-compatibility.md](docs/provider-compatibility.md).
 
 ## update
 
@@ -118,6 +128,7 @@ Details: [channels and updating](docs/operational-reference.md#channels-and-upda
 - [operational reference](docs/operational-reference.md) — commands, TUI keys, daemon/dashboard, multi-tenant keys
 - [configuration](docs/configuration.md) — config keys, proxy/scheduler/routing, account types
 - [models](docs/models.md) — catalog, aliases, context windows, group routing
+- [provider compatibility](docs/provider-compatibility.md) — per-backend difference matrix: dropped/refused request fields, `max_tokens` on Codex/Grok, diagnostic headers
 - [FAQ](docs/faq.md) — context-window workarounds (`gpt-*` → Claude 1M `/compact` → back)
 - [llmux Islands](docs/llmux-islands.md) — macOS menu-bar/notch companion
 - [system prompts (multi-model)](docs/system-prompts/README.md) — real captured wire system prompts
