@@ -246,8 +246,8 @@ pub(crate) fn absolute_label(at: SystemTime, now: SystemTime, offset_secs: i64) 
 }
 
 /// Label for a past instant: "14:30" when it falls on the same local calendar
-/// day as `now`, "06-15 09:00" (local month-day) otherwise — so multi-day
-/// spans stay unambiguous. Pure (offset injected) for unit tests.
+/// day as `now`, "06/15/2026 09:00" (local MM/DD/YYYY) otherwise — so
+/// multi-day spans stay unambiguous. Pure (offset injected) for unit tests.
 pub(crate) fn past_label(at: SystemTime, now: SystemTime, offset_secs: i64) -> String {
     let day_of = |t: SystemTime| {
         let epoch = t
@@ -259,8 +259,8 @@ pub(crate) fn past_label(at: SystemTime, now: SystemTime, offset_secs: i64) -> S
     if day_of(at) == day_of(now) {
         return clock_hm(at, offset_secs);
     }
-    let (_, month, day) = civil_from_days(day_of(at));
-    format!("{:02}-{:02} {}", month, day, clock_hm(at, offset_secs))
+    let (year, month, day) = civil_from_days(day_of(at));
+    format!("{month:02}/{day:02}/{year:04} {}", clock_hm(at, offset_secs))
 }
 
 /// Local "M/D HH:MM" for an event-banner deadline — unpadded month/day,
@@ -536,8 +536,8 @@ mod tests {
         assert_eq!(past_label(hour_ago, now, 0), clock_hm(hour_ago, 0));
         let three_days = now - Duration::from_secs(3 * 86_400);
         let label = past_label(three_days, now, off);
-        assert_eq!(label.len(), 11, "{label}");
-        assert_eq!(&label[2..3], "-");
+        // 1_781_000_000 s is 2026-06-09 10:13Z; 3 days earlier, in UTC-8.
+        assert_eq!(label, "06/06/2026 02:13");
     }
 
     #[test]
