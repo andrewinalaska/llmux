@@ -1216,7 +1216,7 @@ fn draw_logs_overlay(frame: &mut Frame, area: Rect, view: &DashboardView) {
     draw_logs(frame, area, view);
 }
 
-/// Sessions overlay (`s`, issue #34): the persisted raw-io log folded by
+/// Sessions overlay (`s`, issue #34): the persisted activity log folded by
 /// `metadata.user_id` into a confidence-labeled session timeline, above a
 /// per-session detail pane for the cursored row. Renders from the snapshot held
 /// on `Chrome` (taken when the overlay opened) — metadata only, no prompt
@@ -1264,7 +1264,7 @@ fn draw_sessions_overlay(
     }
     if chrome.sessions.is_empty() {
         let empty = Paragraph::new(Line::from(Span::styled(
-            "no sessions yet — enable raw-io capture and send requests through the proxy",
+            "no sessions yet — send requests through the proxy",
             Style::new().fg(Color::Yellow),
         )))
         .block(Block::new().borders(Borders::TOP).title(" sessions "));
@@ -1487,7 +1487,7 @@ fn draw_session_detail(frame: &mut Frame, area: Rect, ctx: &FrameCtx, chrome: &C
     let accounts = if s.accounts.is_empty() {
         "—".to_string()
     } else {
-        // Session accounts are emails from the raw-io log — same
+        // Session accounts are emails from the activity log — same
         // email-anonymous masking as every other account surface.
         s.accounts
             .iter()

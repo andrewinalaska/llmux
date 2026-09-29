@@ -313,8 +313,9 @@ pub(crate) enum Overlay {
     Usage,
     /// Full-screen log tail (was the `l` log-panel size cycle).
     Logs,
-    /// Session timeline (issue #34): persisted raw-io grouped by
-    /// `metadata.user_id` into confidence-labeled per-session aggregates.
+    /// Session timeline (issue #34): the persisted activity log
+    /// (`activity.jsonl`) grouped by `metadata.user_id` into
+    /// confidence-labeled per-session aggregates.
     Sessions,
     /// Observed-performance surface (perf telemetry v1): daily
     /// tokens/sec chart + provider health matrix + per-(model, fast) table.
@@ -880,16 +881,16 @@ struct App {
     /// Trailing window the Stats heatmap aggregates over (issue #23), cycled
     /// with `w` in the Stats overlay.
     stats_window: activity::StatsWindow,
-    /// Folded session timeline (issue #34), loaded from the persisted raw-io log
-    /// when the Sessions overlay is opened (`s`) and held until it is reopened.
+    /// Folded session timeline (issue #34), loaded from the persisted activity
+    /// log (`activity.jsonl`) when the Sessions overlay is opened (`s`) and held until it is reopened.
     /// A point-in-time snapshot — re-opening re-reads the file. Empty otherwise.
     sessions: Vec<crate::session::Session>,
     /// True while the background load kicked off by `open_sessions` is running
-    /// (streaming read+parse+fold of the multi-MB raw-io log). Cleared when the
+    /// (streaming read+parse+fold of `activity.jsonl`). Cleared when the
     /// final (`done`) partial arrives over `sessions_tx`. Drives the overlay
     /// loading spinner (while empty) and the `loading… N%` title (once filling).
     sessions_loading: bool,
-    /// Percent of the raw-io file the in-flight streaming load has consumed,
+    /// Percent of `activity.jsonl` the in-flight streaming load has consumed,
     /// carried on each partial and shown in the overlay title. 100 at rest.
     sessions_pct: u8,
     /// Sender handed to the `spawn_blocking` load task by `open_sessions`; the
@@ -3148,11 +3149,16 @@ impl App {
     }
 
     /// Open the Sessions overlay (`s`, issue #34): kick off a background read of
-    /// the persisted raw-io log from `$XDG_STATE_HOME/llmux/raw-io.jsonl`, fold it
-    /// into a confidence-labeled session timeline off the runtime, and open the
-    /// overlay immediately with a loading spinner. The read+parse+fold is blocking
-    /// IO/CPU over a potentially tens-of-GB log, so running it inline inside the async event
-    /// loop froze the whole TUI ~10s — it now runs on the blocking pool and the
+    /// the persisted activity log `$XDG_STATE_HOME/llmux/activity.jsonl`
+    /// (per-request metadata only — written for every finished request,
+    /// independent of `raw_io.enabled` and of raw-io retention), fold it into a
+    /// confidence-labeled session timeline off the runtime, and open the overlay
+    /// immediately with a loading spinner. It used to read raw-io.jsonl, whose
+    /// verbatim bodies made that tens of GB (~4.3 min per open on an 83.6 GB
+    /// log); activity.jsonl carries the same fold fields as plain JSON fields
+    /// at ~1/1,850th the size. The read+parse+fold is still blocking IO/CPU, so
+    /// it never runs inline in the async event loop (that once froze the whole
+    /// TUI ~10s) — it runs on the blocking pool and the
     /// timeline arrives over `sessions_tx` as a stream of progressive partials
     /// (`stream_sessions`), mirroring the remote-fetch pattern. Each partial
     /// replaces `sessions`, so the table fills in as the file is read rather than
@@ -3194,7 +3200,7 @@ impl App {
             KeyCode::Char('l') => self.overlay = Overlay::Logs,
             // Observed performance (perf telemetry v1): daily tok/s + health.
             KeyCode::Char('p') => self.overlay = Overlay::Perf,
-            // Session timeline (issue #34): read + fold the persisted raw-io log.
+            // Session timeline (issue #34): read + fold the persisted activity log.
             KeyCode::Char('s') => self.open_sessions(),
             // Calendar usage table (usage-stats): hourly/daily/monthly × model
             // tokens + API-equivalent cost.
@@ -5132,7 +5138,7 @@ async fn event_loop(
 ) -> std::io::Result<()> {
     let mut render = tokio::time::interval(RENDER_TICK);
     render.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    // Sessions overlay (`s`) loads the persisted raw-io log on the blocking pool
+    // Sessions overlay (`s`) loads the persisted activity log on the blocking pool
     // and delivers the folded timeline here — mirrors the remote fetch channel so
     // the read+parse+fold never blocks this select (it once froze the TUI ~10s).
     let (sess_tx, mut sess_rx) = mpsc::channel::<SessionsLoad>(4);
@@ -5412,13 +5418,6 @@ fn apply_event(
     }
 }
 
-/// Read the persisted raw-io log and fold it into a session timeline (issue #34).
-///
-/// The path is resolved exactly like the daemon's capture path
-/// (`$XDG_STATE_HOME/llmux/raw-io.jsonl`). A missing/unreadable file, or no state
-/// dir, yields an empty timeline — best-effort, never panics. Unparseable lines
-/// are skipped (the same tolerance `raw_io::prune` applies on rewrite). Only the
-/// metadata each record carries is folded; no prompt content is retained.
 /// UI-5 infinite-scroll knobs: how many FOLDED render rows past the current
 /// scroll depth [`App::grow_history_take`] targets, how many raw entries it
 /// appends per fold-recheck step, how many such steps ONE state transition
@@ -5589,12 +5588,28 @@ fn sessions_load_pct(bytes_read: u64, file_len: u64) -> u8 {
     (bytes_read.saturating_mul(100) / file_len).min(100) as u8
 }
 
-/// Streaming, progressive session load over the persisted raw-io log. Opens
-/// `$XDG_STATE_HOME/llmux/raw-io.jsonl` and hands it to
-/// [`stream_sessions_from`]. A missing/unreadable file delivers a single empty,
-/// done partial so the overlay's loading state always clears. Runs on the
-/// blocking pool.
+/// Streaming, progressive session load — the ONE production path feeding the
+/// Sessions overlay. Opens `$XDG_STATE_HOME/llmux/activity.jsonl` (the
+/// per-request METADATA log, written unconditionally for every finished
+/// request) and hands it to [`stream_sessions_from_activity`]. A missing /
+/// unreadable file, or no state dir, delivers a single empty, done partial so
+/// the overlay's loading state always clears. Runs on the blocking pool.
+///
+/// Why activity.jsonl and not raw-io.jsonl: raw-io stores verbatim request/
+/// response BODIES (tens of GB — 83.6 GB on one real install, where opening
+/// the overlay took ~4.3 min), while every field the fold needs is already a
+/// plain field on each activity line (45 MB for the same history, ~1,850x
+/// smaller). It is also independent of `raw_io.enabled` / retention: with
+/// capture off the overlay used to show nothing. See
+/// [`crate::session::RecordMeta::from_persisted`] for the documented
+/// differences between the two sources.
 fn stream_sessions(tx: &mpsc::Sender<SessionsLoad>) {
+    stream_sessions_at(crate::cli::daemon::activity_log_path().as_deref(), tx);
+}
+
+/// [`stream_sessions`] over an explicit path (`None` = no state dir). Split
+/// out so tests can drive the real open/stat/missing-file path.
+fn stream_sessions_at(path: Option<&std::path::Path>, tx: &mpsc::Sender<SessionsLoad>) {
     let send_empty_done = || {
         let _ = tx.blocking_send(SessionsLoad {
             sessions: Vec::new(),
@@ -5602,32 +5617,71 @@ fn stream_sessions(tx: &mpsc::Sender<SessionsLoad>) {
             pct: 100,
         });
     };
-    let Some(path) = crate::cli::daemon::raw_io_path() else {
+    let Some(path) = path else {
         send_empty_done();
         return;
     };
-    let Ok(file) = std::fs::File::open(&path) else {
+    let Ok(file) = std::fs::File::open(path) else {
         send_empty_done();
         return;
     };
     let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
-    stream_sessions_from(std::io::BufReader::new(file), file_len, tx);
+    stream_sessions_from_activity(std::io::BufReader::new(file), file_len, tx);
 }
 
-/// Bounded-memory core of [`stream_sessions`]: reads the log line by line,
-/// projects each parsed record to its [`crate::session::RecordMeta`] (the
-/// verbatim request/response bodies are dropped immediately), and every
-/// `SESSIONS_CHUNK_RECORDS` records folds the batch into an incremental
+/// Project one `activity.jsonl` line to the fold's metadata, with exactly the
+/// tolerance `ActivityLog::load_persisted_prefix` applies: a line that is not
+/// a valid [`activity::PersistedRequest`], or whose `v` is not the current
+/// [`activity::PERSIST_VERSION`], is skipped. Additive `#[serde(default)]`
+/// fields (e.g. `user_id` on pre-#32 lines) load as their defaults.
+fn session_meta_from_activity_line(line: &str) -> Option<crate::session::RecordMeta> {
+    let rec = serde_json::from_str::<activity::PersistedRequest>(line).ok()?;
+    if rec.v != activity::PERSIST_VERSION {
+        return None; // older/newer schema — skip rather than misread
+    }
+    Some(crate::session::RecordMeta::from_persisted(&rec))
+}
+
+/// Bounded-memory session fold over an `activity.jsonl`-shaped reader: the
+/// shared [`stream_session_metas`] core with each line parsed as an
+/// [`activity::PersistedRequest`] (a pure field projection — no body text to
+/// parse, so this reads ~MB where the raw-io log is ~GB).
+fn stream_sessions_from_activity<R: std::io::BufRead>(
+    reader: R,
+    file_len: u64,
+    tx: &mpsc::Sender<SessionsLoad>,
+) {
+    stream_session_metas(reader, file_len, tx, session_meta_from_activity_line);
+}
+
+/// The raw-io.jsonl flavour of the streaming fold (each line a
+/// [`crate::proxy::raw_io::RawIoRecord`], bodies parsed for `user_id` / usage
+/// and dropped). No longer the overlay's source — [`stream_sessions`] reads
+/// activity.jsonl — but kept (test-only) so the pre-existing raw-io stream
+/// tests keep exercising the shared [`stream_session_metas`] core unchanged.
+#[cfg(test)]
+fn stream_sessions_from<R: std::io::BufRead>(
+    reader: R,
+    file_len: u64,
+    tx: &mpsc::Sender<SessionsLoad>,
+) {
+    stream_session_metas(reader, file_len, tx, |line| {
+        serde_json::from_str::<crate::proxy::raw_io::RawIoRecord>(line)
+            .ok()
+            .map(|rec| crate::session::RecordMeta::from_record(&rec))
+    });
+}
+
+/// Bounded-memory core of the session load: reads the log line by line,
+/// projects each non-blank line through `parse` to its
+/// [`crate::session::RecordMeta`] (unparseable lines → `None`, skipped), and
+/// every `SESSIONS_CHUNK_RECORDS` records folds the batch into an incremental
 /// [`crate::session::SessionFolder`], clears the batch, and delivers a
 /// snapshot partial over `tx`. The final partial (after EOF or a read error)
 /// carries `done = true` and is always delivered, even for an empty log.
 ///
 /// Memory is O(one batch of metadata + one line + the number of sessions),
-/// independent of file size. The log is not a multi-MB file in practice: every
-/// record stores the verbatim request body, and Anthropic-style clients resend
-/// the whole growing conversation each turn, so logs of tens of GB exist. The
-/// previous version kept every parsed record alive until EOF and re-folded the
-/// full accumulator per chunk, which grew the TUI's RSS with the file size.
+/// independent of file size.
 ///
 /// Tradeoff: each batch is sorted by `(ts_ms, id)` before folding, but batches
 /// are not re-sorted against each other. The log is appended in
@@ -5636,11 +5690,15 @@ fn stream_sessions(tx: &mpsc::Sender<SessionsLoad>) {
 /// timestamp precedes, for its own session, one folded in an earlier batch can
 /// only shift that session's `account_rotations` — every other aggregate is
 /// order-independent and exact.
-fn stream_sessions_from<R: std::io::BufRead>(
+fn stream_session_metas<R, F>(
     mut reader: R,
     file_len: u64,
     tx: &mpsc::Sender<SessionsLoad>,
-) {
+    mut parse: F,
+) where
+    R: std::io::BufRead,
+    F: FnMut(&str) -> Option<crate::session::RecordMeta>,
+{
     let mut folder = crate::session::SessionFolder::new();
     let mut chunk: Vec<crate::session::RecordMeta> = Vec::with_capacity(SESSIONS_CHUNK_RECORDS);
     let mut line = String::new();
@@ -5658,9 +5716,8 @@ fn stream_sessions_from<R: std::io::BufRead>(
         if trimmed.is_empty() {
             continue;
         }
-        if let Ok(rec) = serde_json::from_str::<crate::proxy::raw_io::RawIoRecord>(trimmed) {
-            // Keep only the metadata; the full record (bodies) drops here.
-            chunk.push(crate::session::RecordMeta::from_record(&rec));
+        if let Some(meta) = parse(trimmed) {
+            chunk.push(meta);
         }
         if chunk.len() >= SESSIONS_CHUNK_RECORDS {
             folder.add_meta(std::mem::replace(
@@ -7063,6 +7120,162 @@ mod tests {
         let load = rx.blocking_recv().expect("one load");
         assert!(load.done && load.sessions.is_empty() && load.pct == 100);
         assert!(rx.blocking_recv().is_none());
+    }
+
+    /// Drain every partial a loader delivers (producer on its own thread, as
+    /// `spawn_blocking` runs it in production).
+    fn collect_session_loads(
+        produce: impl FnOnce(&mpsc::Sender<SessionsLoad>) + Send + 'static,
+    ) -> Vec<SessionsLoad> {
+        let (tx, mut rx) = mpsc::channel::<SessionsLoad>(4);
+        let producer = std::thread::spawn(move || produce(&tx));
+        let mut loads = Vec::new();
+        while let Some(load) = rx.blocking_recv() {
+            loads.push(load);
+        }
+        producer.join().expect("producer thread");
+        loads
+    }
+
+    /// End-to-end over the PRODUCTION loader (`stream_sessions_from_activity`):
+    /// an activity.jsonl-shaped file of more than `SESSIONS_CHUNK_RECORDS`
+    /// lines, interleaved with blank lines, corrupt JSON, a well-formed line
+    /// with an unknown (newer) `v`, and old-schema lines missing every
+    /// additive `#[serde(default)]` field. Junk degrades exactly as in
+    /// `ActivityLog::load_persisted_prefix` (skipped, never fatal); old-schema
+    /// lines still count. Every progressive partial — and the final `done` —
+    /// must equal `fold_sessions` over the raw-io twins of the same logical
+    /// requests, i.e. switching the source file changes nothing on screen.
+    #[test]
+    fn stream_sessions_from_activity_matches_raw_io_fold_and_skips_junk() {
+        use crate::session::test_support::{logical_requests, UserIdShape};
+        let n = 2 * SESSIONS_CHUNK_RECORDS + 777;
+        let logical = logical_requests(n as u64);
+        let raw: Vec<crate::proxy::raw_io::RawIoRecord> =
+            logical.iter().map(|l| l.raw_io()).collect();
+
+        let additive = [
+            "fast", "ttfb_ms", "ttft_ms", "gen_ms", "aborted", "user_id", "kind", "excerpt",
+            "tenant",
+        ];
+        let mut log = String::new();
+        let mut old_schema_lines = 0;
+        for (i, l) in logical.iter().enumerate() {
+            let mut value = serde_json::to_value(l.persisted()).expect("to_value");
+            // Old-schema (pre-additive-fields) line: only where dropping
+            // `user_id` keeps the meaning, so the raw-io twin still matches.
+            if !matches!(l.user_id, UserIdShape::Present(_)) {
+                let obj = value.as_object_mut().expect("object");
+                for key in additive {
+                    obj.remove(key);
+                }
+                old_schema_lines += 1;
+            }
+            log.push_str(&value.to_string());
+            log.push('\n');
+            if i % 1000 == 3 {
+                log.push_str("\n   \n{not json\n"); // blank + corrupt
+                                                    // Newer schema version: well-formed but skipped.
+                let mut newer = serde_json::to_value(l.persisted()).expect("to_value");
+                newer["v"] = serde_json::json!(activity::PERSIST_VERSION + 1);
+                newer["id"] = serde_json::json!(u64::MAX);
+                log.push_str(&newer.to_string());
+                log.push('\n');
+            }
+        }
+        assert!(old_schema_lines > 50, "fixture exercises old-schema lines");
+        let file_len = log.len() as u64;
+
+        let loads = collect_session_loads(move |tx| {
+            stream_sessions_from_activity(std::io::Cursor::new(log.into_bytes()), file_len, tx);
+        });
+
+        let full_batches = n / SESSIONS_CHUNK_RECORDS;
+        assert_eq!(
+            loads.len(),
+            full_batches + 1,
+            "one partial per batch + final"
+        );
+        for (k, load) in loads[..full_batches].iter().enumerate() {
+            assert!(!load.done);
+            let upto = (k + 1) * SESSIONS_CHUNK_RECORDS;
+            assert_eq!(
+                load.sessions,
+                crate::session::fold_sessions(&raw[..upto]),
+                "partial {k}"
+            );
+            assert!(load.pct < 100);
+        }
+        let last = loads.last().expect("final load");
+        assert!(last.done);
+        assert_eq!(last.pct, 100);
+        assert_eq!(last.sessions, crate::session::fold_sessions(&raw));
+        assert_eq!(
+            last.sessions.iter().map(|s| s.requests).sum::<u64>(),
+            n as u64,
+            "junk / newer-v lines are not counted"
+        );
+    }
+
+    /// No state dir, a missing activity.jsonl, and an empty one each deliver
+    /// exactly one empty `done` partial — the same as the raw-io loader's
+    /// missing-file behavior — so the overlay's loading state always clears.
+    #[test]
+    fn stream_sessions_at_missing_or_empty_activity_log_delivers_single_done() {
+        let dir = std::env::temp_dir().join(format!(
+            "llmux-sessions-activity-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("tempdir");
+        let missing = dir.join("activity.jsonl");
+        let empty = dir.join("empty-activity.jsonl");
+        std::fs::write(&empty, b"").expect("empty file");
+
+        for path in [None, Some(missing), Some(empty)] {
+            let label = format!("{path:?}");
+            let loads = collect_session_loads(move |tx| stream_sessions_at(path.as_deref(), tx));
+            assert_eq!(loads.len(), 1, "{label}: exactly one partial");
+            let load = &loads[0];
+            assert!(
+                load.done && load.sessions.is_empty() && load.pct == 100,
+                "{label}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `stream_sessions_at` reads a real on-disk activity.jsonl (open + stat +
+    /// stream), independent of any raw-io file.
+    #[test]
+    fn stream_sessions_at_reads_activity_file_on_disk() {
+        let logical = crate::session::test_support::logical_requests(300);
+        let raw: Vec<crate::proxy::raw_io::RawIoRecord> =
+            logical.iter().map(|l| l.raw_io()).collect();
+        let dir = std::env::temp_dir().join(format!(
+            "llmux-sessions-activity-disk-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("tempdir");
+        let path = dir.join("activity.jsonl");
+        let mut log = String::new();
+        for l in &logical {
+            log.push_str(&serde_json::to_string(&l.persisted()).expect("serialize"));
+            log.push('\n');
+        }
+        std::fs::write(&path, log).expect("write");
+        let loads = collect_session_loads(move |tx| stream_sessions_at(Some(&path), tx));
+        assert_eq!(loads.len(), 1);
+        assert!(loads[0].done);
+        assert_eq!(loads[0].sessions, crate::session::fold_sessions(&raw));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Reopening while a load is still in flight is a no-op guard, not a second
