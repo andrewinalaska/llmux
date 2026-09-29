@@ -7672,6 +7672,7 @@ mod tests {
                 user_id: None,
                 kind: Some("user".into()),
                 excerpt: None,
+                session_name: None,
             },
         };
         let first = req(7);
@@ -7895,6 +7896,7 @@ mod tests {
                 excerpt: None,
                 tenant: None,
                 client_name: None,
+                session_name: None,
             },
         };
         let note = |secs: u64| activity::Completed {
@@ -8008,6 +8010,7 @@ mod tests {
                 excerpt: None,
                 tenant: None,
                 client_name: None,
+                session_name: None,
             },
         };
         let mut app = remote_app();
@@ -8110,6 +8113,7 @@ mod tests {
                 excerpt: None,
                 tenant: None,
                 client_name: None,
+                session_name: None,
             },
         };
         let top_key =
@@ -8253,6 +8257,7 @@ mod tests {
             quota_display: crate::config::QuotaDisplay::default(),
             data_quality: crate::dashboard::DataQualityDoc::default(),
             events: Vec::new(),
+            session_usage: Vec::new(),
         }
     }
 

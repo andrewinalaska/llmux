@@ -124,6 +124,9 @@ pub struct SeenRequest {
     pub chatgpt_account_id: Option<String>,
     pub originator: Option<String>,
     pub body: Vec<u8>,
+    /// Every header received, `(lowercase name, lossy value)` in wire order —
+    /// for "this header must never reach the upstream" assertions.
+    pub headers: Vec<(String, String)>,
 }
 
 #[derive(Default)]
@@ -280,6 +283,18 @@ fn unified_headers(
     builder
 }
 
+fn all_headers(headers: &http::HeaderMap) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_string(),
+                String::from_utf8_lossy(value.as_bytes()).into_owned(),
+            )
+        })
+        .collect()
+}
+
 async fn catch_all(
     axum::extract::State(shared): axum::extract::State<Arc<Shared>>,
     req: axum::extract::Request,
@@ -303,6 +318,7 @@ async fn catch_all(
         chatgpt_account_id: header("chatgpt-account-id"),
         originator: header("originator"),
         body: body.to_vec(),
+        headers: all_headers(&parts.headers),
     });
 
     let next = shared
@@ -435,6 +451,7 @@ async fn token_endpoint(
             chatgpt_account_id: header("chatgpt-account-id"),
             originator: header("originator"),
             body: body.to_vec(),
+            headers: all_headers(&parts.headers),
         });
     shared.token_hits.fetch_add(1, Ordering::SeqCst);
     let delay = *shared.token_delay.lock().expect("delay lock");

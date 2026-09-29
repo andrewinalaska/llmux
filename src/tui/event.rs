@@ -90,6 +90,12 @@ pub enum ActivityEvent {
         /// input text as its completed row. Mirrors
         /// `RequestFinished.excerpt`.
         excerpt: Option<String>,
+        /// Operator-assigned session NAME from the `X-Llmux-Session` request
+        /// header (sanitized, see
+        /// [`crate::proxy::forward::sanitize_session_name`]). Mirrors
+        /// `RequestFinished.session_name`; `None` when the header was absent
+        /// or sanitized to empty.
+        session_name: Option<String>,
     },
     /// The scheduler leased an account for request `id`. Carries the served
     /// `(group, model, effort, fast)` identity decided at lease time so the
@@ -188,6 +194,14 @@ pub enum ActivityEvent {
         /// `None` ONLY for replayed history persisted before the field
         /// existed — displayed as `unknown`, never coerced into `local`.
         tenant: Option<String>,
+        /// Operator-assigned session NAME (`X-Llmux-Session` header,
+        /// sanitized). A LABEL only: it never gates, routes, or identifies a
+        /// tenant, and it is stripped before any upstream call. Keys the
+        /// per-session-name aggregate, which accumulates across Claude Code
+        /// resumes (a resume mints a new `user_id` session UUID but keeps the
+        /// name). `None` when absent — and for every record persisted before
+        /// the field existed.
+        session_name: Option<String>,
     },
     /// The scheduler committed a switch of the current account.
     AccountSwitched {

@@ -2167,6 +2167,10 @@ pub fn status_json(
         "current": snapshot.representative_current().map(|c| c.0.clone()),
         "current_by_group": current_by_group,
         "accounts": accounts,
+        // Capability tokens (additive): a launcher checks for
+        // `session-header` before sending `X-Llmux-Session`, so it never
+        // hands the header to a daemon that would forward it upstream.
+        "features": forward::FEATURES,
     })
 }
 
@@ -4182,6 +4186,100 @@ mod tests {
             "apikey has no token"
         );
         assert_eq!(k["last_refresh_ms"], serde_json::Value::Null);
+    }
+
+    /// Launchers gate sending `X-Llmux-Session` on this capability token.
+    #[test]
+    fn status_json_advertises_the_session_header_feature() {
+        let now = SystemTime::now();
+        let pool = AccountPool::new(&[oauth_account("a")]);
+        let meta = ServerMeta {
+            pid: 1,
+            uptime_secs: 0,
+            port: 0,
+            email_anonymous: false,
+            usage_controls: Default::default(),
+        };
+        let doc = status_json(
+            &pool.snapshot(),
+            &UsageTotals::default(),
+            &params(),
+            now,
+            &meta,
+        );
+        assert_eq!(doc["features"], serde_json::json!(["session-header"]));
+    }
+
+    /// The session header is a LABEL, never an authorization input: a
+    /// request carrying it without valid credentials gets exactly the answer
+    /// the same request gets without it — even when its value is a valid key.
+    #[tokio::test]
+    async fn session_header_grants_nothing_without_credentials() {
+        let dir = TempDir::new();
+        let path = dir.path().join("llmux.json");
+        let mut state = endpoint_state(&path, Vec::new());
+        // Never touch the real persistence files, even on a denied request.
+        state.activity_log_path = None;
+        state.raw_io_path = None;
+        state.config.proxy.api_key = Some("lm-admin".into());
+        crate::config::save_path(&path, &state.config).expect("seed key");
+        state.keys.reload(&state.config);
+        let serve = |app: axum::routing::IntoMakeService<axum::Router>| async move {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+            format!("http://{addr}")
+        };
+        // No ConnectInfo → the peer is NOT loopback-exempt: a keyless data-
+        // plane request must be denied, header or not.
+        let remote = serve(router(state.clone()).into_make_service()).await;
+        let client = reqwest::Client::new();
+        let send = |session: Option<&'static str>| {
+            let mut req = client
+                .post(format!("{remote}/v1/messages"))
+                .header("content-type", "application/json")
+                .body(r#"{"model":"m"}"#);
+            if let Some(v) = session {
+                req = req.header(forward::SESSION_HEADER, v);
+            }
+            async move {
+                let r = req.send().await.expect("send");
+                (r.status().as_u16(), r.text().await.expect("body"))
+            }
+        };
+        let baseline = send(None).await;
+        assert_eq!(baseline.0, 401);
+        assert_eq!(send(Some("orch")).await, baseline);
+        assert_eq!(
+            send(Some("lm-admin")).await,
+            baseline,
+            "a key-shaped session name is never read as a credential"
+        );
+
+        // Keyless loopback on the CONTROL plane: 403 with or without it.
+        let local = {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let app = router(state).into_make_service_with_connect_info::<SocketAddr>();
+            tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+            format!("http://{addr}")
+        };
+        for session in [None, Some("lm-admin")] {
+            let mut req = client.get(format!("{local}/llmux/status"));
+            if let Some(v) = session {
+                req = req.header(forward::SESSION_HEADER, v);
+            }
+            let r = req.send().await.expect("send");
+            assert_eq!(r.status().as_u16(), 403, "session={session:?}");
+        }
     }
 
     #[test]

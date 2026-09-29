@@ -53,6 +53,10 @@ pub(crate) struct DashboardView {
     /// Per-client request attribution rows (issue #32), already sorted by
     /// requests desc. One representation used by both document and renderer.
     pub client_usage: Vec<crate::dashboard::ClientUsageDoc>,
+    /// Per-session-NAME rows (`X-Llmux-Session`), priced server-side and
+    /// sorted most-recent first. Empty when no named request has landed (and
+    /// from an older daemon).
+    pub session_usage: Vec<crate::dashboard::SessionUsageDoc>,
     /// Issued client keys (metadata only — never secrets). The keys panel's
     /// NUMBERS no longer ride on the document: they come from the durable
     /// keys-usage query (`docs/keys-history/spec.md` K), so only the roster is
@@ -323,6 +327,7 @@ impl DashboardView {
                 tenant: r.tenant.clone(),
                 excerpt: r.excerpt.clone(),
                 client_name: r.client_name.clone(),
+                session_name: r.session_name.clone(),
                 started_at: ms_time(r.started_at_ms),
             })
             .collect();
@@ -353,6 +358,7 @@ impl DashboardView {
                     excerpt,
                     tenant,
                     client_name,
+                    session_name,
                     // Per-request cost is carried in the doc for downstream
                     // consumers (server.log, JSON); the in-process view-model
                     // does not surface it — ui.rs reads the doc field directly.
@@ -393,6 +399,7 @@ impl DashboardView {
                         // the cell renders blank, never coerced.
                         tenant: tenant.clone(),
                         client_name: client_name.clone(),
+                        session_name: session_name.clone(),
                     },
                 },
                 CompletedDoc::Note { at_ms, text, error } => Completed {
@@ -451,6 +458,7 @@ impl DashboardView {
             logs,
             model_usage: doc.model_usage.clone(),
             client_usage: doc.client_usage.clone(),
+            session_usage: doc.session_usage.clone(),
             client_keys: doc.client_keys.clone(),
             windowed: doc.windowed.clone(),
             codex: doc.codex.clone(),
