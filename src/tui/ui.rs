@@ -94,6 +94,9 @@ const MODEL_BAR_WIDTH: usize = 10;
 /// Rows shown in the compact per-client attribution panel in the stats overlay
 /// (issue #32) — the top N clients by request count.
 const CLIENT_PANEL_ROWS: usize = 6;
+/// Rows shown in the named-session panel atop the Sessions overlay
+/// (`X-Llmux-Session`) — the most recently seen names first.
+const NAMED_SESSION_PANEL_ROWS: usize = 6;
 /// A model used within this window counts as "recently active" (req15).
 const MODEL_RECENT_WINDOW: Duration = Duration::from_secs(60);
 /// Max heatmap cells shown at once (issue #23). The rows are sorted by tokens
@@ -253,7 +256,7 @@ pub(crate) fn draw(
         Overlay::Stats => draw_stats_overlay(frame, overlay_area, view, &ctx, chrome),
         Overlay::Usage => draw_usage_overlay(frame, overlay_area, view, chrome),
         Overlay::Logs => draw_logs_overlay(frame, overlay_area, view),
-        Overlay::Sessions => draw_sessions_overlay(frame, overlay_area, &ctx, chrome, hits),
+        Overlay::Sessions => draw_sessions_overlay(frame, overlay_area, view, &ctx, chrome, hits),
         Overlay::Misc => draw_misc_overlay(frame, overlay_area, view),
         Overlay::Perf => draw_perf_overlay(frame, overlay_area, view, &ctx, chrome),
         Overlay::Config => draw_config_overlay(frame, overlay_area, view, chrome, hits),
@@ -1222,11 +1225,27 @@ fn draw_logs_overlay(frame: &mut Frame, area: Rect, view: &DashboardView) {
 fn draw_sessions_overlay(
     frame: &mut Frame,
     area: Rect,
+    view: &DashboardView,
     ctx: &FrameCtx,
     chrome: &Chrome,
     hits: &mut Option<MainChrome>,
 ) {
     frame.render_widget(Clear, area);
+    // Named-session panel (`X-Llmux-Session`): the live, priced per-NAME
+    // rows from the document, reserved at the top only when a named request
+    // has landed — otherwise the overlay below is exactly the raw-io
+    // timeline it always was (same idiom as the stats overlay's clients panel).
+    let area = if view.session_usage.is_empty() {
+        area
+    } else {
+        let height = (view.session_usage.len().min(NAMED_SESSION_PANEL_ROWS) as u16)
+            .saturating_add(2)
+            .min(area.height.saturating_sub(3).max(2));
+        let [named_area, rest] =
+            Layout::vertical([Constraint::Length(height), Constraint::Min(0)]).areas(area);
+        draw_named_sessions(frame, named_area, view, ctx);
+        rest
+    };
     // The load runs on the blocking pool and streams progressive partials. Show
     // the full-screen spinner ONLY while loading AND no partial has arrived yet
     // (sessions still empty); once the table has content it renders below with a
@@ -1264,6 +1283,83 @@ fn draw_sessions_overlay(
     if let Some(hits) = hits.as_mut() {
         hits.sessions_table = table_chrome;
     }
+}
+
+/// Compact per-session-NAME table (`X-Llmux-Session`): name, requests,
+/// ok/err, fresh in/out, cache tokens (read + write), the API-equivalent cost
+/// priced server-side (tier- and 1h-aware — the sum of the rows' requests),
+/// and how long ago the name was last seen. Rows arrive sorted most-recent
+/// first. Stats key by NAME, so a resumed session (new session UUID, same
+/// name) stays one row.
+fn draw_named_sessions(frame: &mut Frame, area: Rect, view: &DashboardView, ctx: &FrameCtx) {
+    let total = view.session_usage.len();
+    let header = [
+        "session", "req", "ok/err", "in", "out", "cache", "cost", "last",
+    ];
+    let rows = view
+        .session_usage
+        .iter()
+        .take(NAMED_SESSION_PANEL_ROWS)
+        .map(|s| {
+            let ok_err = Line::from(vec![
+                Span::styled(format::human_count(s.ok), Style::new().fg(Color::Green)),
+                Span::raw("/"),
+                Span::styled(
+                    format::human_count(s.errors),
+                    if s.errors > 0 {
+                        Style::new().fg(Color::Red)
+                    } else {
+                        dim()
+                    },
+                ),
+            ]);
+            let cost = format_cost(s.cost_usd);
+            let cost_cell = if s.cost_usd >= 1.0 {
+                Cell::from(Span::styled(
+                    cost,
+                    Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                ))
+            } else {
+                Cell::from(cost)
+            };
+            let seen = UNIX_EPOCH + Duration::from_millis(s.last_seen_ms);
+            let ago = ctx.now.duration_since(seen).unwrap_or_default();
+            Row::new(vec![
+                Cell::from(Span::styled(
+                    masked_text(&s.name, view.email_anonymous),
+                    Style::new().fg(Color::Cyan),
+                )),
+                Cell::from(format::human_count(s.requests)),
+                Cell::from(ok_err),
+                Cell::from(format::human_count(s.tokens_in)),
+                Cell::from(format::human_count(s.tokens_out)),
+                Cell::from(format::human_count(
+                    s.cache_read.saturating_add(s.cache_creation),
+                )),
+                cost_cell,
+                Cell::from(Span::styled(format::age_unit(ago), dim())),
+            ])
+        })
+        .collect::<Vec<_>>();
+    let constraints = [
+        Constraint::Fill(1),
+        Constraint::Length(7),
+        Constraint::Length(9),
+        Constraint::Length(8),
+        Constraint::Length(8),
+        Constraint::Length(8),
+        Constraint::Length(9),
+        Constraint::Length(5),
+    ];
+    let shown = total.min(NAMED_SESSION_PANEL_ROWS);
+    let title = format!(
+        " named sessions — {shown} of {total} by recency (X-Llmux-Session) · {} ",
+        view.data_quality.cost
+    );
+    let table = Table::new(rows, constraints)
+        .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)))
+        .block(Block::new().borders(Borders::TOP).title(title));
+    frame.render_widget(table, area);
 }
 
 /// The session timeline table. Columns: confidence label, user_id, request
@@ -6607,13 +6703,14 @@ fn draw_activity(
                 " {}",
                 pad_cells_left(PENDING_CELL, metrics.cost_w)
             )));
-            // Derived session title (U2) — seeded at START time for exactly
-            // this reason, so it does not pop into existence at the finish.
-            if let Some(label) = request
-                .user_id
-                .as_deref()
-                .and_then(|id| view.session_labels.get(id))
-            {
+            // Session title (U2) — seeded at START time for exactly this
+            // reason, so it does not pop into existence at the finish. The
+            // row's own session name wins, as on the completed row.
+            if let Some(label) = row_session_label(
+                request.session_name.as_deref(),
+                request.user_id.as_deref(),
+                &view.session_labels,
+            ) {
                 spans.push(Span::styled(
                     format!(
                         " \u{ab}{}\u{bb}",
@@ -6896,6 +6993,18 @@ fn folded_run_line(
     Line::from(spans)
 }
 
+/// The «title» an activity row shows: its own operator session name when the
+/// request carried one, else its client id's label (the first-prompt-derived
+/// title, or a session name recorded for that id). Unnamed rows resolve
+/// exactly as before the session header existed.
+fn row_session_label<'a>(
+    session_name: Option<&'a str>,
+    user_id: Option<&str>,
+    labels: &'a std::collections::BTreeMap<String, String>,
+) -> Option<&'a str> {
+    session_name.or_else(|| user_id.and_then(|id| labels.get(id)).map(String::as_str))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn completed_line(
     entry: &Completed,
@@ -6930,6 +7039,7 @@ fn completed_line(
             excerpt,
             tenant: _,
             client_name,
+            session_name,
         } => {
             // Row layout (Z 2026-07-15): every column padded to the frame's
             // max width so rows line up, and the input excerpt LAST, spending
@@ -7034,8 +7144,11 @@ fn completed_line(
             } else {
                 spans.push(Span::raw(cost_cell));
             }
-            // Derived session title (U2), when this client id has one.
-            if let Some(label) = user_id.as_deref().and_then(|id| session_labels.get(id)) {
+            // Session title (U2): the row's own operator session name, else
+            // the client id's label (derived, or a name seen on a sibling).
+            if let Some(label) =
+                row_session_label(session_name.as_deref(), user_id.as_deref(), session_labels)
+            {
                 spans.push(Span::styled(
                     format!(
                         " \u{ab}{}\u{bb}",
@@ -7101,6 +7214,7 @@ fn completed_detail_lines(
         excerpt,
         tenant,
         client_name,
+        session_name,
     } = &entry.body
     else {
         return Vec::new();
@@ -7144,6 +7258,11 @@ fn completed_detail_lines(
             .map(|l| format!(" \u{ab}{}\u{bb}", masked_text(l, mask)))
             .unwrap_or_default();
         lines.push(indent("client", format!("{uid}{label}")));
+    }
+    // Operator session name (`X-Llmux-Session`) — the key the named-session
+    // stats accumulate under (across resumes, unlike the client id above).
+    if let Some(name) = session_name.as_deref() {
+        lines.push(indent("session", masked_text(name, mask)));
     }
     // Tenant identity (activity client-name): the FULL raw display name —
     // the detail row is the fidelity surface, the collapsed row clips to 4
@@ -8778,6 +8897,7 @@ mod tests {
             quota_display: crate::config::QuotaDisplay::default(),
             data_quality: crate::dashboard::DataQualityDoc::default(),
             events: Vec::new(),
+            session_usage: Vec::new(),
         }
     }
 
@@ -9851,6 +9971,7 @@ mod tests {
             excerpt: None,
             client_name: None,
             started_at: std::time::SystemTime::UNIX_EPOCH,
+            session_name: None,
         }];
         let text = render(&view, &chrome_overlay(Overlay::None), 160, 30);
         assert!(
@@ -10317,6 +10438,82 @@ mod tests {
         let chrome = chrome_overlay(Overlay::Sessions);
         let text = render(&view, &chrome, 160, 30);
         assert!(text.contains("no sessions yet"), "empty hint shown");
+    }
+
+    fn named_row(name: &str, requests: u64, cost_usd: f64) -> crate::dashboard::SessionUsageDoc {
+        let seen = SystemTime::now() - Duration::from_secs(300);
+        crate::dashboard::SessionUsageDoc {
+            name: name.into(),
+            requests,
+            ok: requests,
+            errors: 0,
+            tokens_in: 12_300,
+            tokens_out: 4_500,
+            cache_read: 100_000,
+            cache_creation: 20_000,
+            cache_creation_1h: 5_000,
+            cost_usd,
+            first_ms: 0,
+            last_seen_ms: seen
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+            models: Vec::new(),
+        }
+    }
+
+    /// Named sessions (`X-Llmux-Session`) render as a priced panel atop the
+    /// Sessions overlay — name, requests, tokens, the REAL cost — while the
+    /// raw-io timeline (and its empty hint) keeps rendering below it.
+    #[test]
+    fn sessions_overlay_shows_named_session_rows_with_cost() {
+        let mut view = view_with(Vec::new());
+        view.session_usage = vec![
+            named_row("orch", 42, 12.3456),
+            named_row("lander", 7, 0.0421),
+        ];
+        let chrome = chrome_overlay(Overlay::Sessions);
+        let text = render(&view, &chrome, 160, 30);
+        assert!(text.contains("named sessions"), "named panel titled");
+        assert!(
+            text.contains("orch") && text.contains("lander"),
+            "names shown"
+        );
+        assert!(text.contains("$12.35"), "row cost rendered (>= $1 at 2dp)");
+        assert!(text.contains("$0.0421"), "row cost rendered (< $1 at 4dp)");
+        assert!(
+            text.contains("12.3k") || text.contains("12k"),
+            "tokens shown: {text}"
+        );
+        assert!(text.contains("5m"), "last-seen age shown");
+        assert!(text.contains("no sessions yet"), "raw-io hint still below");
+    }
+
+    /// An activity row's «title» prefers its own session name; an unnamed row
+    /// resolves through the client-id labels exactly as before.
+    #[test]
+    fn row_session_label_prefers_the_rows_own_name() {
+        let mut labels = std::collections::BTreeMap::new();
+        labels.insert("u1".to_string(), "Hi".to_string());
+        assert_eq!(
+            row_session_label(Some("orch"), Some("u1"), &labels),
+            Some("orch")
+        );
+        assert_eq!(row_session_label(None, Some("u1"), &labels), Some("Hi"));
+        assert_eq!(row_session_label(None, Some("u2"), &labels), None);
+        assert_eq!(row_session_label(Some("orch"), None, &labels), Some("orch"));
+    }
+
+    /// Without named traffic the Sessions overlay is exactly as before: no
+    /// named panel, same frame bytes as a view that never had the field.
+    #[test]
+    fn sessions_overlay_without_named_rows_is_unchanged() {
+        let view = view_with(Vec::new());
+        let mut chrome = chrome_overlay(Overlay::Sessions);
+        chrome.sessions = vec![one_session()];
+        let text = render(&view, &chrome, 160, 30);
+        assert!(!text.contains("named sessions"));
+        assert!(text.contains("u-active"));
     }
 
     /// The full-screen spinner shows ONLY while loading AND no partial has
@@ -11121,6 +11318,7 @@ mod tests {
             excerpt: None,
             client_name: None,
             started_at: std::time::SystemTime::UNIX_EPOCH,
+            session_name: None,
         }];
         let text = render(&view, &chrome_overlay(Overlay::None), 160, 30);
         assert!(
@@ -11153,6 +11351,7 @@ mod tests {
             excerpt: None,
             client_name: None,
             started_at: std::time::SystemTime::UNIX_EPOCH,
+            session_name: None,
         }];
         let text = render(&view, &chrome_overlay(Overlay::None), 160, 30);
         // Z 2026-07-15: the served model now SHOWS on activity rows (group
@@ -11187,6 +11386,7 @@ mod tests {
             excerpt: None,
             client_name: None,
             started_at: std::time::SystemTime::UNIX_EPOCH,
+            session_name: None,
         }];
         let rows = render_rows(&view, &chrome_overlay(Overlay::None), 160, 30);
         let row = rows
@@ -11224,6 +11424,7 @@ mod tests {
             excerpt: Some("hello world".into()),
             client_name: Some("Z (U09F1M5MML1)".into()),
             started_at: std::time::SystemTime::now(),
+            session_name: None,
         }];
         let rows = render_rows(&view, &chrome_overlay(Overlay::None), 160, 30);
         let row = rows
@@ -11319,6 +11520,7 @@ mod tests {
             excerpt: Some("hello world".into()),
             client_name: Some(client_name.into()),
             started_at: std::time::SystemTime::now() - running_for,
+            session_name: None,
         }];
         view.completed = vec![Completed {
             at: UNIX_EPOCH + Duration::from_millis(1_000),
@@ -11343,6 +11545,7 @@ mod tests {
                 excerpt: Some("hello world".into()),
                 tenant: Some("k-t1".into()),
                 client_name: Some(client_name.into()),
+                session_name: None,
             },
         }];
         view
@@ -11442,6 +11645,7 @@ mod tests {
                 excerpt: None,
                 tenant: None,
                 client_name: None,
+                session_name: None,
             },
         };
         let labels = BTreeMap::new();
@@ -11810,6 +12014,7 @@ mod tests {
                 excerpt: Some("고쳐줘 빨리 제발 이거 진짜 마지막이다".into()),
                 tenant: None,
                 client_name: None,
+                session_name: None,
             },
         }];
         let rows = render_rows(&view, &chrome_overlay(Overlay::None), 200, 30);
@@ -12057,6 +12262,7 @@ mod tests {
                 excerpt: None,
                 tenant: None,
                 client_name: None,
+                session_name: None,
             },
         }
     }
@@ -14399,6 +14605,7 @@ mod tests {
             excerpt: None,
             client_name: None,
             started_at: UNIX_EPOCH,
+            session_name: None,
         }];
         view.completed = vec![
             Completed {
@@ -14424,6 +14631,7 @@ mod tests {
                     excerpt: None,
                     tenant: None,
                     client_name: None,
+                    session_name: None,
                 },
             },
             Completed {

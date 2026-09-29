@@ -897,6 +897,7 @@ impl Proxy {
                 kind: None,
                 excerpt: None,
                 tenant: Some(tenant.into()),
+                session_name: None,
             })
             .await
             .expect("event accepted");

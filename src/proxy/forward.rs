@@ -187,6 +187,60 @@ pub fn strip_hop_by_hop(headers: &mut HeaderMap) {
     }
     headers.remove(header::ACCEPT_ENCODING);
     headers.remove(header::CONTENT_LENGTH);
+    // Defense in depth: `forward` already removed the llmux-only session
+    // header at entry, but every passthrough builder runs this strip too, so
+    // a future path that bypasses the entry strip still never forwards it.
+    headers.remove(SESSION_HEADER);
+}
+
+/// Request header carrying an operator-assigned session NAME (e.g. Claude
+/// Code's `ANTHROPIC_CUSTOM_HEADERS="X-Llmux-Session: orch"`). llmux-only
+/// metadata: parsed once at forward entry, then REMOVED from the request so
+/// no provider path can forward it upstream. It is a display/stats label —
+/// never a credential, never a routing or tenant input.
+pub const SESSION_HEADER: &str = "x-llmux-session";
+
+/// Longest session name kept, in characters (after sanitizing).
+pub const SESSION_NAME_MAX_CHARS: usize = 64;
+
+/// Capability tokens advertised on `GET /llmux/status` (`features`), so a
+/// launcher can gate sending optional request headers on the daemon actually
+/// understanding (and stripping) them.
+pub const FEATURES: &[&str] = &["session-header"];
+
+/// Sanitize one raw `X-Llmux-Session` value into a session name. Pure.
+///
+/// Trim surrounding whitespace, keep at most [`SESSION_NAME_MAX_CHARS`]
+/// characters, and map every character outside `[A-Za-z0-9._:@/-]` to `_`
+/// (one `_` per character — a multi-byte UTF-8 scalar is one character;
+/// invalid UTF-8 decodes lossily first). Empty after trimming → `None`
+/// (treated exactly like an absent header). The allowed set contains no
+/// whitespace, control, quote, or bracket character, so a name is safe to
+/// print on a log line or terminal, and it can never collide with the
+/// `(overflow)` aggregate bucket.
+pub fn sanitize_session_name(raw: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(raw);
+    let name: String = text
+        .trim()
+        .chars()
+        .take(SESSION_NAME_MAX_CHARS)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '@' | '/' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    (!name.is_empty()).then_some(name)
+}
+
+/// The session name a request carries: the FIRST `X-Llmux-Session` value,
+/// sanitized by [`sanitize_session_name`]. Later duplicates are ignored.
+pub fn session_name_from_headers(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(SESSION_HEADER)
+        .and_then(|value| sanitize_session_name(value.as_bytes()))
 }
 
 /// Rewrite client headers for upstream: strip client `x-api-key` /
@@ -257,6 +311,10 @@ struct ForwardContext {
     /// #22): client-key id / `legacy` / `local`. Counting only; the gate
     /// already enforced access before forward ran.
     tenant: Option<String>,
+    /// Operator-assigned session name from the `X-Llmux-Session` header
+    /// ([`session_name_from_headers`]), parsed once at entry; the header
+    /// itself is already gone from `headers`. Label only; never gates routing.
+    session_name: Option<String>,
     /// Message-kind classification + input excerpt (TUI UI-3 U1), decided once
     /// at entry from the buffered body by [`crate::proxy::classify`]. Display
     /// only; never gates routing.
@@ -469,6 +527,7 @@ impl ForwardContext {
             kind: self.kind.clone(),
             excerpt: self.excerpt.clone(),
             tenant: self.tenant.clone(),
+            session_name: self.session_name.clone(),
         });
     }
 }
@@ -933,7 +992,15 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
         .extensions()
         .get::<crate::proxy::keys::Tenant>()
         .map(|t| t.id.clone());
-    let (parts, body) = req.into_parts();
+    let (mut parts, body) = req.into_parts();
+    // Operator session name (`X-Llmux-Session`): read the FIRST value, then
+    // remove EVERY value from the request before anything else sees it. This
+    // is the single choke point that keeps the llmux-only header off every
+    // provider path — anthropic/openrouter copy `ctx.headers`, codex/grok
+    // build fresh header maps — and out of the request log / raw-io capture.
+    // Parsed before the body read so even a body-read failure is labeled.
+    let session_name = session_name_from_headers(&parts.headers);
+    parts.headers.remove(SESSION_HEADER);
     let path_query = parts
         .uri
         .path_and_query()
@@ -988,6 +1055,7 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
                 kind: None,
                 excerpt: None,
                 tenant,
+                session_name,
             });
             return error_response(status, error_type, &message);
         }
@@ -1027,6 +1095,7 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
         user_id: user_id.clone(),
         tenant: tenant.clone(),
         excerpt: classified.excerpt.clone(),
+        session_name: session_name.clone(),
     });
     let mut ctx = ForwardContext {
         method: parts.method,
@@ -1046,6 +1115,7 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
         model,
         user_id,
         tenant,
+        session_name,
         kind: Some(classified.kind.to_string()),
         excerpt: classified.excerpt,
         group,
@@ -2530,6 +2600,7 @@ async fn relay(
         } = ctx.finished_meta(state);
         let user_id = ctx.user_id.clone();
         let tenant = ctx.tenant.clone();
+        let session_name = ctx.session_name.clone();
         let kind = ctx.kind.clone();
         let excerpt = ctx.excerpt.clone();
         // Raw-io capture (Feature B) for the Claude SSE passthrough: the request
@@ -2639,6 +2710,7 @@ async fn relay(
                         kind,
                         excerpt,
                         tenant,
+                        session_name,
                     });
                 }
                 // The lease (and its in-flight pin) lives exactly as long as
@@ -2897,6 +2969,7 @@ async fn relay_translate(
         } = ctx.finished_meta(state);
         let user_id = ctx.user_id.clone();
         let tenant = ctx.tenant.clone();
+        let session_name = ctx.session_name.clone();
         let kind = ctx.kind.clone();
         let excerpt = ctx.excerpt.clone();
         // Raw-io capture (Feature B) for the codex streaming path: the request
@@ -3053,6 +3126,7 @@ async fn relay_translate(
                         kind,
                         excerpt,
                         tenant,
+                        session_name,
                     });
                 }
                 // Lease pinned for the stream's whole lifetime, as always.
@@ -3519,6 +3593,7 @@ mod tests {
             kind: None,
             excerpt: None,
             tenant: None,
+            session_name: None,
             group: Some(group),
             served_by: None,
             compatibility: None,
@@ -3723,6 +3798,65 @@ mod tests {
             headers.get("content-type").expect("kept"),
             "application/json"
         );
+    }
+
+    #[test]
+    fn sanitize_session_name_keeps_the_allowed_set_and_neutralizes_the_rest() {
+        let s = |raw: &[u8]| sanitize_session_name(raw);
+        // Allowed alphabet passes through untouched.
+        assert_eq!(s(b"orch").as_deref(), Some("orch"));
+        assert_eq!(s(b"Team.A_b:c@d/e-9").as_deref(), Some("Team.A_b:c@d/e-9"));
+        // Surrounding whitespace trimmed; inner whitespace mapped.
+        assert_eq!(s(b"  orch lead \t").as_deref(), Some("orch_lead"));
+        // Empty / whitespace-only → absent (same as no header).
+        assert_eq!(s(b""), None);
+        assert_eq!(s(b"   \t  "), None);
+        assert_eq!(s(b"\r\n"), None);
+        // Control characters (incl. an embedded CRLF / ESC / NUL) are
+        // neutralized, never passed through to a log line or terminal.
+        assert_eq!(s(b"a\r\nX-Evil: 1").as_deref(), Some("a__X-Evil:_1"));
+        assert_eq!(s(b"a\x1b[31mred\x00").as_deref(), Some("a__31mred_"));
+        // Unicode: one `_` per character; invalid UTF-8 decodes lossily.
+        assert_eq!(s("séance☃".as_bytes()).as_deref(), Some("s_ance_"));
+        assert_eq!(s(b"ok\xff\xfe").as_deref(), Some("ok__"));
+        assert_eq!(
+            s("☃".as_bytes()).as_deref(),
+            Some("_"),
+            "non-empty after mapping"
+        );
+        // Quotes / brackets / parens are outside the set, so no real name can
+        // spell the `(overflow)` bucket.
+        assert_eq!(s(b"(overflow)").as_deref(), Some("_overflow_"));
+        // 10k characters → truncated to the cap.
+        let long = "x".repeat(10_000);
+        let out = s(long.as_bytes()).expect("non-empty");
+        assert_eq!(out.len(), SESSION_NAME_MAX_CHARS);
+        let long_uni = "é".repeat(10_000);
+        assert_eq!(
+            s(long_uni.as_bytes()).expect("non-empty"),
+            "_".repeat(SESSION_NAME_MAX_CHARS)
+        );
+    }
+
+    #[test]
+    fn session_name_from_headers_takes_the_first_value() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(session_name_from_headers(&headers), None);
+        headers.append("X-Llmux-Session", HeaderValue::from_static(" orch "));
+        headers.append("x-llmux-session", HeaderValue::from_static("second"));
+        assert_eq!(session_name_from_headers(&headers).as_deref(), Some("orch"));
+        let mut blank = HeaderMap::new();
+        blank.insert(SESSION_HEADER, HeaderValue::from_static("   "));
+        assert_eq!(session_name_from_headers(&blank), None);
+    }
+
+    #[test]
+    fn rewrite_strips_the_session_header() {
+        let mut headers = HeaderMap::new();
+        headers.append(SESSION_HEADER, HeaderValue::from_static("orch"));
+        headers.append(SESSION_HEADER, HeaderValue::from_static("dup"));
+        rewrite_headers(&mut headers, &oauth_credential("at-x"));
+        assert!(headers.get_all(SESSION_HEADER).iter().next().is_none());
     }
 
     #[test]
@@ -3939,6 +4073,9 @@ mod tests {
         authorization: Option<String>,
         x_api_key: Option<String>,
         path: String,
+        /// Every `x-llmux-session` value the upstream received (must be
+        /// empty — the header is llmux-only).
+        session_header: Vec<String>,
     }
 
     #[derive(Clone, Default)]
@@ -3961,10 +4098,17 @@ mod tests {
             .get("x-api-key")
             .and_then(|v| v.to_str().ok())
             .map(str::to_string);
+        let session_header = req
+            .headers()
+            .get_all(SESSION_HEADER)
+            .iter()
+            .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
+            .collect();
         shared.seen.lock().expect("seen lock").push(Seen {
             authorization: auth.clone(),
             x_api_key: key,
             path: req.uri().path().to_string(),
+            session_header,
         });
         let next = shared
             .script
@@ -5553,6 +5697,50 @@ mod tests {
             "first output delta cannot precede first byte"
         );
         assert_eq!(tokens.expect("usage").output, 42);
+    }
+
+    /// The session header is read at entry (first value, sanitized), carried
+    /// on the start AND finish activity events, and never reaches the
+    /// upstream — every value is removed before the passthrough copies
+    /// `ctx.headers`.
+    #[tokio::test]
+    async fn session_header_is_recorded_on_events_and_never_forwarded() {
+        let shared = MockShared::default();
+        shared.script.lock().expect("lock").push_back(Scripted::Ok {
+            body: r#"{"id":"m","usage":{"input_tokens":3,"output_tokens":2}}"#,
+        });
+        let upstream = spawn_mock(shared.clone()).await;
+        let mut state = test_state(&upstream, vec![oauth_account("a", "at-a")]);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        state.events = Some(tx);
+        let mut request = client_request(r#"{"model":"m"}"#);
+        request
+            .headers_mut()
+            .append(SESSION_HEADER, HeaderValue::from_static(" orch\t"));
+        request
+            .headers_mut()
+            .append(SESSION_HEADER, HeaderValue::from_static("ignored"));
+        let response = forward(&state, request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = response_body(response).await;
+
+        let seen = shared.seen.lock().expect("lock").clone();
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0].session_header.is_empty(), "{:?}", seen[0]);
+
+        let mut started = None;
+        let mut finished = None;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                ActivityEvent::RequestStarted { session_name, .. } => started = Some(session_name),
+                ActivityEvent::RequestFinished { session_name, .. } => {
+                    finished = Some(session_name)
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(started, Some(Some("orch".to_string())));
+        assert_eq!(finished, Some(Some("orch".to_string())));
     }
 
     #[tokio::test]

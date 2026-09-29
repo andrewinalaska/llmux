@@ -4727,3 +4727,143 @@ async fn compatibility_codex_strict_mode_rejects_thinking_config() {
 async fn compatibility_grok_strict_mode_rejects_thinking_config() {
     compat_strict_rejects_thinking_config(CompatFlavor::Grok).await;
 }
+
+// ---------------------------------------------------------------------------
+// Operator session names (`X-Llmux-Session`)
+// ---------------------------------------------------------------------------
+
+const SESSION_HEADER: &str = "x-llmux-session";
+
+/// POST a Claude-Code-shaped request carrying the session header (twice —
+/// only the first value counts, and neither may leave the proxy).
+async fn post_named(proxy: &Proxy, body: &str) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(proxy.url("/v1/messages"))
+        .header("content-type", "application/json")
+        .header("anthropic-version", "2023-06-01")
+        .header(SESSION_HEADER, "orch")
+        .header(SESSION_HEADER, "second")
+        .body(body.to_string())
+        .send()
+        .await
+        .expect("proxy reachable")
+}
+
+/// Every request the upstream saw is free of the llmux-only header.
+fn assert_session_header_not_forwarded(mock: &MockUpstream, provider: &str) {
+    let seen = mock.seen();
+    assert!(
+        !seen.is_empty(),
+        "{provider}: the request reached the upstream"
+    );
+    for request in &seen {
+        assert!(
+            request
+                .headers
+                .iter()
+                .all(|(name, _)| !name.eq_ignore_ascii_case(SESSION_HEADER)),
+            "{provider}: {SESSION_HEADER} leaked upstream: {:?}",
+            request.headers
+        );
+    }
+}
+
+/// Anthropic passthrough: the header is stripped, the request is recorded
+/// under the name, and the priced named row + capability token are served.
+#[tokio::test]
+async fn session_header_is_not_forwarded_on_the_anthropic_path() {
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::ok(
+        r#"{"id":"msg_1","type":"message","usage":{"input_tokens":1000,"output_tokens":500}}"#,
+    ));
+    let proxy = Proxy::spawn(&mock.base_url(), vec![oauth_account("a", "at-a")]).await;
+    let response = post_named(
+        &proxy,
+        r#"{"model":"claude-opus-5-5","max_tokens":8,"metadata":{"user_id":"uuid-A"},"messages":[{"role":"user","content":"hi"}]}"#,
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    assert_session_header_not_forwarded(&mock, "anthropic");
+
+    let mut row = serde_json::Value::Null;
+    for _ in 0..100 {
+        let doc: serde_json::Value = get_dashboard(&proxy, Some(E2E_ADMIN_KEY))
+            .await
+            .json()
+            .await
+            .expect("dashboard json");
+        if let Some(found) = doc["session_usage"]
+            .as_array()
+            .and_then(|rows| rows.iter().find(|r| r["name"] == "orch"))
+        {
+            row = found.clone();
+            assert_eq!(
+                doc["session_labels"]["uuid-A"], "orch",
+                "name wins as label"
+            );
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(row["requests"], 1, "named row served: {row}");
+    // claude-opus-5-5: $4/M in + $20/M out → 0.004 + 0.010.
+    let cost = row["cost_usd"].as_f64().expect("cost");
+    assert!((cost - 0.014).abs() < 1e-9, "real cost, not 0.0: {cost}");
+
+    let status: serde_json::Value = reqwest::Client::new()
+        .get(proxy.url("/llmux/status"))
+        .header("x-api-key", E2E_ADMIN_KEY)
+        .send()
+        .await
+        .expect("status")
+        .json()
+        .await
+        .expect("status json");
+    assert_eq!(status["features"], serde_json::json!(["session-header"]));
+}
+
+#[tokio::test]
+async fn session_header_is_not_forwarded_on_the_openrouter_path() {
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::ok(r#"{"id":"msg_or","type":"message"}"#));
+    let proxy = Proxy::spawn_config(openrouter_config(
+        &mock,
+        vec![openrouter_account("or", "sk-or-v1-test")],
+    ))
+    .await;
+    let response = post_named(
+        &proxy,
+        r#"{"model":"or-ox-alpha","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}"#,
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    assert_session_header_not_forwarded(&mock, "openrouter");
+}
+
+#[tokio::test]
+async fn session_header_is_not_forwarded_on_the_codex_path() {
+    let mock = MockUpstream::spawn().await;
+    let proxy = Proxy::spawn_config(CompatFlavor::Codex.config(&mock)).await;
+    // The upstream answer is irrelevant here: whatever it says, the request
+    // it RECEIVED must not carry the header.
+    let _ = post_named(
+        &proxy,
+        r#"{"model":"gpt-5.5","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}"#,
+    )
+    .await;
+    assert_session_header_not_forwarded(&mock, "codex");
+    assert!(mock.seen()[0].path.ends_with("/responses"), "codex leg");
+}
+
+#[tokio::test]
+async fn session_header_is_not_forwarded_on_the_grok_path() {
+    let mock = MockUpstream::spawn().await;
+    let proxy = Proxy::spawn_config(CompatFlavor::Grok.config(&mock)).await;
+    let _ = post_named(
+        &proxy,
+        r#"{"model":"grok-4.5","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}"#,
+    )
+    .await;
+    assert_session_header_not_forwarded(&mock, "grok");
+    assert!(mock.seen()[0].path.ends_with("/responses"), "grok leg");
+}

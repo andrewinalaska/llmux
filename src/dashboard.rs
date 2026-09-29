@@ -267,6 +267,7 @@ impl DashboardHub {
             model_usage: state.log.model_usage(),
             client_usage: state.log.client_usage(),
             tenant_stats: state.log.tenant_stats().clone(),
+            session_stats: state.log.session_stats().clone(),
             // Windowed heatmap rows per window (issue #23). Computed under the
             // same lock as the rest of the view so one read is consistent.
             windowed: StatsWindow::ALL
@@ -304,6 +305,9 @@ pub(crate) struct HubView {
     /// (`k-…` / `legacy` / `local` / `unknown`): counts + per-model token
     /// sums + first/last-seen span. Priced into the doc at build time.
     pub tenant_stats: std::collections::BTreeMap<String, super::tui::activity::TenantStats>,
+    /// Per-session-NAME aggregates (`X-Llmux-Session`), keyed by name. Priced
+    /// into the doc at build time, like the tenant rows.
+    pub session_stats: std::collections::BTreeMap<String, super::tui::activity::SessionStats>,
     /// Windowed heatmap rows per window (issue #23): one `(window, rows)` pair
     /// per [`StatsWindow`], each already sorted by total tokens desc.
     pub windowed: Vec<(StatsWindow, Vec<WindowedRow>)>,
@@ -433,6 +437,7 @@ fn trace_event(event: &ActivityEvent) {
             gen_ms: _,
             aborted: _,
             tenant,
+            session_name,
         } => {
             // API-equivalent USD cost for this request (Feature D). The fold
             // task has no config handle, so the log line uses the built-in
@@ -457,6 +462,7 @@ fn trace_event(event: &ActivityEvent) {
                 fast = fast.unwrap_or(false),
                 client = user_id.as_deref().unwrap_or("unknown"),
                 tenant = tenant.as_deref().unwrap_or("unknown"),
+                session = session_name.as_deref().unwrap_or("-"),
                 kind = kind.as_deref().unwrap_or("-"),
                 "request finished"
             );
@@ -548,6 +554,14 @@ pub struct DashboardDoc {
     /// pre-tenant history). Additive: absent in older docs → parses empty.
     #[serde(default)]
     pub tenant_usage: Vec<TenantUsageDoc>,
+    /// Per-session-NAME rows (`X-Llmux-Session` request header): lifetime
+    /// counts keyed by the operator-assigned name, accumulating across Claude
+    /// Code resumes (which mint a new `user_id` session UUID but keep the
+    /// name), priced server-side like `tenant_usage`. Unnamed traffic never
+    /// appears here. Additive: absent in older docs → parses empty, and
+    /// `skip_serializing_if` keeps it off the wire until a named request lands.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub session_usage: Vec<SessionUsageDoc>,
     /// Issued client keys (metadata ONLY — secrets are never stored, let
     /// alone serialized). Additive: absent in older docs → parses empty.
     #[serde(default)]
@@ -1256,6 +1270,41 @@ pub struct TenantModelDoc {
     pub cost_usd: f64,
 }
 
+/// One per-session-NAME row (`X-Llmux-Session`). `name` is the sanitized
+/// header value, or `(overflow)` for names first seen after the
+/// distinct-name cap (see `docs/operational-reference.md`). Metadata only —
+/// a label, never a credential or tenant.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionUsageDoc {
+    pub name: String,
+    pub requests: u64,
+    pub ok: u64,
+    pub errors: u64,
+    /// Fresh (non-cached) input + output tokens.
+    pub tokens_in: u64,
+    pub tokens_out: u64,
+    #[serde(default)]
+    pub cache_read: u64,
+    #[serde(default)]
+    pub cache_creation: u64,
+    /// 1-hour-TTL subset of `cache_creation`.
+    #[serde(default)]
+    pub cache_creation_1h: u64,
+    /// API-equivalent USD cost: the sum of the per-model cells, each priced
+    /// tier- and TTL-aware with the daemon's overrides — equal to the sum of
+    /// the row's per-request costs.
+    #[serde(default)]
+    pub cost_usd: f64,
+    /// First / most recent finished-request stamps (epoch ms).
+    #[serde(default)]
+    pub first_ms: u64,
+    #[serde(default)]
+    pub last_seen_ms: u64,
+    /// Per-(group, model) breakdown, sorted by cost desc.
+    #[serde(default)]
+    pub models: Vec<TenantModelDoc>,
+}
+
 /// One issued client key's metadata for the dashboard (multi-tenant #22).
 /// NEVER carries the secret or digest — display fields only.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1353,6 +1402,10 @@ pub struct InFlightDoc {
     pub excerpt: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_name: Option<String>,
+    /// Operator session name (`X-Llmux-Session`), known at start time.
+    /// Additive; skipped when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_name: Option<String>,
 }
 
 // Request dwarfs Note by design (see `tui::activity::CompletedBody`): almost
@@ -1432,6 +1485,10 @@ pub enum CompletedDoc {
         tenant: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         client_name: Option<String>,
+        /// Operator session name (`X-Llmux-Session`, sanitized). Additive:
+        /// absent in older docs, and `None` is skipped on the wire.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_name: Option<String>,
     },
     Note {
         at_ms: u64,
@@ -1718,6 +1775,82 @@ fn model_usage_docs(
     (docs, total_cost)
 }
 
+/// Price the per-session-name aggregates (`X-Llmux-Session`) into document
+/// rows. Each (group, model) cell goes through
+/// [`crate::pricing::aggregate_cost`] with its own long-context subset and 1h
+/// cache-write split — the same path as the model and tenant rows — so a
+/// row's cost equals the sum of its requests' per-request costs; the row cost
+/// is the sum of its cells. Sorted most-recently-seen first (then name), the
+/// order the TUI panel renders.
+pub(crate) fn session_usage_docs(
+    stats: &BTreeMap<String, super::tui::activity::SessionStats>,
+    pricing_overrides: &HashMap<String, crate::pricing::ModelPrice>,
+) -> Vec<SessionUsageDoc> {
+    let mut rows: Vec<SessionUsageDoc> = stats
+        .iter()
+        .map(|(name, s)| {
+            let mut models: Vec<TenantModelDoc> = s
+                .models
+                .iter()
+                .map(|((group, model), cell)| {
+                    let all = crate::pricing::TokenParts {
+                        input: cell.input,
+                        output: cell.output,
+                        cache_read: cell.cache_read,
+                        cache_creation: cell.cache_creation,
+                        cache_creation_1h: cell.cache_creation_1h,
+                    };
+                    TenantModelDoc {
+                        group: group.clone(),
+                        model: model.clone(),
+                        requests: cell.requests,
+                        tokens_in: cell.input,
+                        tokens_out: cell.output,
+                        cache_read: cell.cache_read,
+                        cache_creation: cell.cache_creation,
+                        cache_creation_1h: cell.cache_creation_1h,
+                        cost_usd: crate::pricing::aggregate_cost(
+                            group,
+                            model,
+                            &all,
+                            &cell.long,
+                            pricing_overrides,
+                        )
+                        .unwrap_or(0.0),
+                    }
+                })
+                .collect();
+            models.sort_by(|a, b| {
+                b.cost_usd
+                    .total_cmp(&a.cost_usd)
+                    .then(a.group.cmp(&b.group))
+                    .then(a.model.cmp(&b.model))
+            });
+            SessionUsageDoc {
+                name: name.clone(),
+                requests: s.totals.requests,
+                ok: s.totals.ok,
+                errors: s.totals.errors,
+                tokens_in: s.totals.tokens_in,
+                tokens_out: s.totals.tokens_out,
+                cache_read: s.cache_read,
+                cache_creation: s.cache_creation,
+                cache_creation_1h: s.cache_creation_1h,
+                cost_usd: models.iter().map(|m| m.cost_usd).sum(),
+                first_ms: s.first_ms,
+                last_seen_ms: s.last_ms,
+                models,
+            }
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        b.last_seen_ms
+            .cmp(&a.last_seen_ms)
+            .then(a.name.cmp(&b.name))
+    });
+    rows
+}
+
 /// Build the windowed heatmap document rows from the hub view (issue #23): one
 /// [`WindowedStatsDoc`] per retained window, each carrying every in-window
 /// `(group, model, account)` cell. The rows are already sorted by the hub.
@@ -1879,6 +2012,7 @@ pub(crate) fn dashboard_doc(
                 tenant: r.tenant.clone(),
                 excerpt: r.excerpt.clone(),
                 client_name: resolve_client_name(r.tenant.as_ref(), &meta.client_keys),
+                session_name: r.session_name.clone(),
             })
             .collect(),
         completed: hub
@@ -1909,6 +2043,7 @@ pub(crate) fn dashboard_doc(
                     // Fold-time name is always None (no key metadata at the
                     // fold) — the doc resolves it below from `meta`.
                     client_name: _,
+                    session_name,
                 } => CompletedDoc::Request {
                     id: *id,
                     at_ms: epoch_ms(entry.at),
@@ -1948,6 +2083,7 @@ pub(crate) fn dashboard_doc(
                     // join as `tenant_usage` below and as the in-flight rows
                     // above.
                     client_name: resolve_client_name(tenant.as_ref(), &meta.client_keys),
+                    session_name: session_name.clone(),
                 },
                 CompletedBody::Note { text, error } => CompletedDoc::Note {
                     at_ms: epoch_ms(entry.at),
@@ -2079,6 +2215,8 @@ pub(crate) fn dashboard_doc(
             .then(a.tenant.cmp(&b.tenant))
     });
 
+    let session_usage = session_usage_docs(&hub.session_stats, &meta.pricing_overrides);
+
     DashboardDoc {
         version: crate::build_info::version_string(),
         pid: meta.pid,
@@ -2112,6 +2250,7 @@ pub(crate) fn dashboard_doc(
         model_usage,
         client_usage,
         tenant_usage,
+        session_usage,
         client_keys: meta.client_keys.clone(),
         windowed: windowed_docs(hub),
         activity,
@@ -2436,6 +2575,7 @@ mod tests {
                 user_id: None,
                 tenant: None,
                 excerpt: None,
+                session_name: None,
             },
             now() - Duration::from_secs(60),
         );
@@ -2466,6 +2606,7 @@ mod tests {
                 kind: None,
                 excerpt: None,
                 tenant: None,
+                session_name: None,
             },
             now() - Duration::from_secs(58),
         );
@@ -2478,6 +2619,7 @@ mod tests {
                 user_id: None,
                 tenant: None,
                 excerpt: None,
+                session_name: None,
             },
             now() - Duration::from_secs(3),
         );
@@ -2580,6 +2722,7 @@ mod tests {
                     kind: None,
                     excerpt: None,
                     tenant: tenant.map(str::to_string),
+                    session_name: None,
                 },
                 at,
             )
@@ -2719,6 +2862,7 @@ mod tests {
                     kind: None,
                     excerpt: None,
                     tenant: Some((*tenant).into()),
+                    session_name: None,
                 },
                 now() - Duration::from_secs(60 - i as u64),
             );
@@ -2919,6 +3063,7 @@ mod tests {
                     kind: None,
                     excerpt: None,
                     tenant: tenant.map(str::to_string),
+                    session_name: None,
                 },
                 at,
             )
@@ -2993,6 +3138,7 @@ mod tests {
             user_id: Some("u1".into()),
             tenant: tenant.map(str::to_string),
             excerpt: Some("hello world".into()),
+            session_name: None,
         };
         hub.apply_event(started(1, Some("k-t1")), now() - Duration::from_secs(3));
         hub.apply_event(started(2, None), now() - Duration::from_secs(2));
@@ -3810,6 +3956,7 @@ mod tests {
                     kind: None,
                     excerpt: None,
                     tenant: None,
+                    session_name: None,
                 },
                 now() - Duration::from_secs(seeded - i),
             );
@@ -3862,6 +4009,7 @@ mod tests {
             kind: None,
             excerpt: None,
             tenant: None,
+            session_name: None,
         }
     }
 
@@ -3971,5 +4119,286 @@ mod tests {
         let view = hub.view(now());
         assert_eq!(view.global_totals.requests, 0);
         assert!(view.completed.is_empty(), "no notes, no rows");
+    }
+
+    // ---- operator session names (`X-Llmux-Session`) ----
+
+    fn named_finish(
+        id: u64,
+        user_id: &str,
+        session_name: Option<&str>,
+        route: Option<(&str, &str)>,
+        tokens: Option<TokenCounts>,
+    ) -> ActivityEvent {
+        ActivityEvent::RequestFinished {
+            id,
+            method: "POST".into(),
+            path: "/v1/messages".into(),
+            account: Some("a".into()),
+            status: 200,
+            duration: Duration::from_millis(900),
+            tokens,
+            group: route.map(|(g, _)| g.to_string()),
+            model: route.map(|(_, m)| m.to_string()),
+            effort: None,
+            fast: Some(false),
+            ttfb_ms: None,
+            ttft_ms: None,
+            gen_ms: None,
+            aborted: false,
+            user_id: Some(user_id.into()),
+            kind: Some("user".into()),
+            excerpt: Some("hello".into()),
+            tenant: Some("local".into()),
+            session_name: session_name.map(str::to_string),
+        }
+    }
+
+    fn parts(input: u64, output: u64, cr: u64, cc: u64, cc_1h: Option<u64>) -> TokenCounts {
+        TokenCounts {
+            input,
+            output,
+            cache_read: Some(cr),
+            cache_creation: Some(cc),
+            cache_creation_1h: cc_1h,
+        }
+    }
+
+    /// The named-session row cost is REAL and equals the sum of its requests'
+    /// per-request costs across a mix of short/long-context (tiered codex +
+    /// grok) and 5-minute/1-hour cache-write (claude) requests on several
+    /// models, priced with the config overrides. Two naive stubs — pricing
+    /// the summed totals with no long-context subset, and dropping the 1h
+    /// split — must both miss, proving the fixture discriminates.
+    #[test]
+    fn session_usage_cost_equals_the_sum_of_per_request_costs() {
+        type Req = (&'static str, &'static str, TokenCounts);
+        let reqs: [Req; 6] = [
+            // Claude: mixed 5m + 1h writes, then 5m-only, then 1h-only.
+            (
+                "claude",
+                "claude-opus-5-5",
+                parts(1_000, 2_000, 50_000, 10_000, Some(6_000)),
+            ),
+            (
+                "claude",
+                "claude-opus-5-5",
+                parts(500, 900, 20_000, 20_000, Some(0)),
+            ),
+            (
+                "claude",
+                "claude-sonnet-4-6",
+                parts(300, 700, 1_000, 8_000, Some(8_000)),
+            ),
+            // gpt-6-sol: one short, one long (prompt 300k >= 272k).
+            ("codex", "gpt-6-sol", parts(10_000, 1_000, 50_000, 0, None)),
+            (
+                "codex",
+                "gpt-6-sol",
+                parts(100_000, 5_000, 200_000, 0, None),
+            ),
+            // grok-4.5 long (prompt 210k >= 200k).
+            ("grok", "grok-4.5", parts(150_000, 3_000, 60_000, 0, None)),
+        ];
+        // Config overrides are honored server-side: re-price gpt-6-sol (tier
+        // kept) so the default table alone could not produce the total.
+        let mut meta = meta();
+        let mut sol =
+            crate::pricing::price_for("codex", "gpt-6-sol", &HashMap::new()).expect("built-in sol");
+        sol.input *= 3.0;
+        meta.pricing_overrides.insert("gpt-6-sol".into(), sol);
+
+        let hub = DashboardHub::default();
+        let base = now() - Duration::from_secs(600);
+        for (i, (g, m, t)) in reqs.iter().enumerate() {
+            // Alternate resumed session UUIDs under ONE name.
+            let uid = if i % 2 == 0 { "uuid-A" } else { "uuid-B" };
+            hub.apply_event(
+                named_finish(i as u64 + 1, uid, Some("orch"), Some((g, m)), Some(*t)),
+                base + Duration::from_secs(i as u64),
+            );
+        }
+        // A pre-routing failure under the name: counted, never priced.
+        hub.apply_event(named_finish(50, "uuid-A", Some("orch"), None, None), base);
+        // Unnamed traffic never reaches the named rows.
+        hub.apply_event(
+            named_finish(
+                60,
+                "uuid-Z",
+                None,
+                Some(("claude", "claude-opus-5-5")),
+                Some(parts(9, 9, 9, 9, None)),
+            ),
+            base,
+        );
+
+        let pool = AccountPool::new(&[oauth_account("a")]);
+        let doc = dashboard_doc(
+            &pool.snapshot(),
+            &hub.view(now()),
+            &UsageTotals::default(),
+            &params(),
+            now(),
+            &meta,
+        );
+        assert_eq!(
+            doc.session_usage.len(),
+            1,
+            "one named row, unnamed excluded"
+        );
+        let row = &doc.session_usage[0];
+        assert_eq!(row.name, "orch");
+        assert_eq!(row.requests, 7);
+
+        let truth: f64 = reqs
+            .iter()
+            .map(|(g, m, t)| crate::pricing::cost_usd(g, m, t, &meta.pricing_overrides))
+            .sum();
+        assert!(truth > 0.0);
+        assert!(
+            (row.cost_usd - truth).abs() <= 1e-9 * truth,
+            "row {} != Σ per-request {truth}",
+            row.cost_usd
+        );
+        let cells: f64 = row.models.iter().map(|m| m.cost_usd).sum();
+        assert!((cells - row.cost_usd).abs() < 1e-12, "row = Σ cells");
+        assert_eq!(row.models.len(), 4);
+        assert_eq!(
+            row.cache_creation_1h, 14_000,
+            "1h subset summed across the claude writes"
+        );
+
+        // Stubs that MUST disagree (so the equality above bites).
+        let summed = |drop_long: bool, drop_1h: bool| -> f64 {
+            let mut cells: BTreeMap<
+                (&str, &str),
+                (crate::pricing::TokenParts, crate::pricing::TokenParts),
+            > = BTreeMap::new();
+            for (g, m, t) in &reqs {
+                let mut all = crate::pricing::TokenParts::from(t);
+                let mut long = crate::pricing::long_part(m, t);
+                if drop_1h {
+                    all.cache_creation_1h = 0;
+                    long.cache_creation_1h = 0;
+                }
+                if drop_long {
+                    long = crate::pricing::TokenParts::default();
+                }
+                let e = cells.entry((g, m)).or_default();
+                e.0.add(&all);
+                e.1.add(&long);
+            }
+            cells
+                .iter()
+                .map(|((g, m), (all, long))| {
+                    crate::pricing::aggregate_cost(g, m, all, long, &meta.pricing_overrides)
+                        .expect("priced")
+                })
+                .sum()
+        };
+        assert!(
+            (summed(false, false) - truth).abs() <= 1e-9 * truth,
+            "the faithful aggregation reproduces the truth"
+        );
+        assert!(
+            (summed(true, false) - truth).abs() > 1e-3,
+            "pricing summed totals without the long subset must miss"
+        );
+        assert!(
+            (summed(false, true) - truth).abs() > 1e-3,
+            "ignoring the 1h cache-write split must miss"
+        );
+    }
+
+    /// The session name rides the in-flight and completed doc rows, is omitted
+    /// from the wire when absent, and a doc from an older daemon (no
+    /// `session_usage` / `session_name` keys) still parses.
+    #[test]
+    fn doc_rows_carry_session_name_additively() {
+        let hub = DashboardHub::default();
+        hub.apply_event(
+            ActivityEvent::RequestStarted {
+                id: 9,
+                method: "POST".into(),
+                path: "/v1/messages".into(),
+                kind: Some("user".into()),
+                user_id: Some("u1".into()),
+                tenant: None,
+                excerpt: None,
+                session_name: Some("orch".into()),
+            },
+            now(),
+        );
+        hub.apply_event(named_finish(1, "u1", Some("orch"), None, None), now());
+        hub.apply_event(named_finish(2, "u2", None, None, None), now());
+        let pool = AccountPool::new(&[oauth_account("a")]);
+        let doc = dashboard_doc(
+            &pool.snapshot(),
+            &hub.view(now()),
+            &UsageTotals::default(),
+            &params(),
+            now(),
+            &meta(),
+        );
+        assert_eq!(
+            doc.activity.in_flight[0].session_name.as_deref(),
+            Some("orch")
+        );
+        let name = |i: usize| match &doc.activity.completed[i] {
+            CompletedDoc::Request { session_name, .. } => session_name.clone(),
+            other => panic!("expected request, got {other:?}"),
+        };
+        assert_eq!(name(0), None);
+        assert_eq!(name(1), Some("orch".into()));
+        let unnamed = serde_json::to_value(&doc.activity.completed[0]).expect("json");
+        assert!(unnamed.get("session_name").is_none());
+        assert_eq!(
+            doc.session_labels.get("u1").map(String::as_str),
+            Some("orch")
+        );
+
+        // Old-daemon doc: strip every new key and parse.
+        let mut json = serde_json::to_value(&doc).expect("json");
+        json.as_object_mut().expect("obj").remove("session_usage");
+        for row in json["activity"]["completed"].as_array_mut().expect("rows") {
+            row.as_object_mut().expect("row").remove("session_name");
+        }
+        for row in json["activity"]["in_flight"].as_array_mut().expect("rows") {
+            row.as_object_mut().expect("row").remove("session_name");
+        }
+        let parsed: DashboardDoc = serde_json::from_value(json).expect("old doc parses");
+        assert!(parsed.session_usage.is_empty());
+        assert_eq!(parsed.activity.in_flight[0].session_name, None);
+    }
+
+    /// Unnamed traffic is unchanged on the wire: no `session_usage` key.
+    #[test]
+    fn unnamed_traffic_emits_no_session_usage_key() {
+        let hub = DashboardHub::default();
+        hub.apply_event(
+            named_finish(
+                1,
+                "u1",
+                None,
+                Some(("claude", "claude-opus-5-5")),
+                Some(parts(1, 1, 0, 0, None)),
+            ),
+            now(),
+        );
+        let pool = AccountPool::new(&[oauth_account("a")]);
+        let doc = dashboard_doc(
+            &pool.snapshot(),
+            &hub.view(now()),
+            &UsageTotals::default(),
+            &params(),
+            now(),
+            &meta(),
+        );
+        let json = serde_json::to_value(&doc).expect("json");
+        assert!(json.get("session_usage").is_none());
+        assert_eq!(
+            doc.session_labels.get("u1").map(String::as_str),
+            Some("hello")
+        );
     }
 }

@@ -1785,6 +1785,7 @@ mod tests {
                 kind: None,
                 excerpt: None,
                 tenant: Some("k-1".into()),
+                session_name: None,
             };
             let at = UNIX_EPOCH + std::time::Duration::from_millis(1_000 + i as u64);
             let row = UsageRow::from_event(&event, at).expect("row");

@@ -206,6 +206,8 @@ An entry replaces the model's whole built-in row, **long-context tier included**
 
 `cache_creation` is the cache-write rate: for Claude, the 5-minute-TTL rate. The optional `cache_creation_1h` is the rate for 1-hour-TTL writes, applied to the 1-hour share Anthropic reports per request (see [Cache-write TTL split](operational-reference.md#cache-write-ttl-split)). When it is omitted, every write is billed at `cache_creation`, including in entries written before the field existed. The built-in Claude rows carry both rates. Because an entry replaces the whole row, an override for a Claude model that leaves out `cache_creation_1h` bills its 1-hour writes at the 5-minute rate. A `long_context` block may carry its own `cache_creation_1h`; without it, 1-hour writes on a long request are billed at that block's `cache_creation`.
 
+The same overrides price the per-session-name rows (`session_usage`, see [Naming a session](operational-reference.md#naming-a-session-x-llmux-session)). Session names need no configuration, and their 1,024-name cap is a built-in limit, not a config key.
+
 ## TUI cosmetic effects
 
 `tui_effects` (default `true`) gates the dashboard's cosmetic animations: the `max` effort token's rainbow marquee and the headline-model name gradient (`fable-5*`, `gpt-5.6-sol*`). Set it to `false` for a calmer board — those tokens keep a distinct static color and bold instead of cycling. Working spinners animate regardless of this setting. Like `email_anonymous`, the flag is carried on the dashboard document so both the local TUI and `llmux attach` honor it.

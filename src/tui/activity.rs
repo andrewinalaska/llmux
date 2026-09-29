@@ -24,6 +24,18 @@ pub(crate) const MAX_CLIENTS: usize = 1024;
 /// The bucket name for requests with no `metadata.user_id` (issue #32). These
 /// are attributed here, never dropped.
 pub(crate) const UNKNOWN_CLIENT: &str = "unknown";
+/// Distinct-name cap for the per-session-NAME aggregate (`X-Llmux-Session`).
+/// Same bound and same overflow policy as [`MAX_CLIENTS`]: once this many
+/// names are tracked, a brand-new name is folded into [`SESSION_OVERFLOW`]
+/// instead of allocating a row (already-tracked names keep accumulating, and
+/// nothing is ever evicted). The overflow bucket never counts against the cap.
+pub(crate) const MAX_SESSION_NAMES: usize = MAX_CLIENTS;
+/// The bucket that absorbs requests from session names first seen after
+/// [`MAX_SESSION_NAMES`] was reached — visible as its own row, so overflow is
+/// never silent. Parentheses are outside the sanitized name alphabet
+/// ([`crate::proxy::forward::sanitize_session_name`]), so no real session name
+/// can collide with it.
+pub(crate) const SESSION_OVERFLOW: &str = "(overflow)";
 /// In-flight rows are bounded too: if the proxy never sends a finish (bug or
 /// dropped event), the oldest in-flight entry is retired as an error note
 /// instead of leaking forever.
@@ -76,6 +88,8 @@ pub(crate) struct InFlight {
     /// `None` — key metadata lives in config, not here — and the doc builder
     /// resolves it, exactly like `CompletedBody::Request::client_name`.
     pub client_name: Option<String>,
+    /// Operator session name (`X-Llmux-Session`), known at start time.
+    pub session_name: Option<String>,
     pub started_at: SystemTime,
 }
 
@@ -135,6 +149,9 @@ pub(crate) enum CompletedBody {
         /// (src/tui/mod.rs Backend::Local/Remote), so the renderer never
         /// sees a fold-time name.
         client_name: Option<String>,
+        /// Operator session name (`X-Llmux-Session`, sanitized). `None` when
+        /// the request carried none, and for pre-field replayed history.
+        session_name: Option<String>,
     },
     Note {
         text: String,
@@ -959,6 +976,12 @@ pub(crate) struct PersistedRequest {
     /// pre-tenant history can never inflate a live bucket.
     #[serde(default)]
     pub tenant: Option<String>,
+    /// Operator session name (`X-Llmux-Session`, sanitized). Additive both
+    /// ways: pre-field lines load `None` (and contribute nothing to the
+    /// per-session-name rows), and `None` is skipped on write, so an
+    /// unnamed request persists byte-identically to the pre-field format.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_name: Option<String>,
 }
 
 impl PersistedRequest {
@@ -986,6 +1009,7 @@ impl PersistedRequest {
             kind,
             excerpt,
             tenant,
+            session_name,
         } = event
         else {
             return None;
@@ -1016,6 +1040,7 @@ impl PersistedRequest {
             kind: kind.clone(),
             excerpt: excerpt.clone(),
             tenant: tenant.clone(),
+            session_name: session_name.clone(),
         })
     }
 
@@ -1043,6 +1068,12 @@ impl PersistedRequest {
             kind: self.kind,
             excerpt: self.excerpt,
             tenant: self.tenant,
+            // Re-sanitized on load: the file is local and append-only, but a
+            // hand-edited line must not smuggle an unsanitized label (control
+            // characters) into log lines or the terminal.
+            session_name: self
+                .session_name
+                .and_then(|n| crate::proxy::forward::sanitize_session_name(n.as_bytes())),
         };
         (event, ts)
     }
@@ -1082,8 +1113,14 @@ pub(crate) struct ActivityLog {
     in_flight: Vec<InFlight>,
     /// Derived session titles (TUI UI-3 U2): client `user_id` → the first
     /// plain user-input excerpt seen for it (≤48 chars). Insert-only, bounded
-    /// by [`MAX_CLIENTS`].
+    /// by [`MAX_CLIENTS`]. A request carrying an operator session name sets
+    /// its client's label to that NAME instead (name wins over the derived
+    /// text; see [`Self::note_session_label`]).
     session_labels: HashMap<String, String>,
+    /// The client ids whose `session_labels` entry came from a session NAME
+    /// (not a prompt excerpt), so the history merge keeps "name wins" across
+    /// the live/history seam.
+    named_labels: std::collections::HashSet<String>,
     /// Tokens-per-day chart data (UI-3 U14): day (epoch days) → (group,
     /// model) → summed token counts. Fed by the same RequestFinished fold
     /// (startup replay of the persisted request log fills history), pruned to
@@ -1137,6 +1174,14 @@ pub(crate) struct ActivityLog {
     /// Carries the counts plus the per-model breakdown and first/last-seen
     /// stamps the admin keys panel renders ("언제부터 언제까지").
     tenants: BTreeMap<String, TenantStats>,
+    /// Per-session-NAME aggregate (`X-Llmux-Session`), keyed by the sanitized
+    /// name — NOT by the `user_id` session UUID, so a Claude Code resume (new
+    /// UUID, same name) keeps accumulating into the same row. Unnamed
+    /// requests never land here. Rebuilt from the persisted request log on
+    /// startup through the same fold (pre-field history has no names and
+    /// contributes nothing). Bounded by [`MAX_SESSION_NAMES`] with the
+    /// [`SESSION_OVERFLOW`] bucket.
+    sessions: BTreeMap<String, SessionStats>,
     /// Rolling hourly bucket ring for the windowed (24h/72h) per-account
     /// per-model heatmap (issue #23). In-memory only — durable persistence is a
     /// follow-up. Keyed by (group, normalized_model, account).
@@ -1214,6 +1259,49 @@ pub(crate) struct TenantModelStats {
     pub cache_creation_1h: u64,
     /// Long-context subset of the four counters (see [`UsageCell::long`]).
     pub long: crate::pricing::TokenParts,
+}
+
+/// Per-session-NAME aggregate (`X-Llmux-Session`): lifetime counts, the
+/// token classes, first/last-seen stamps, and a per-(group, model)
+/// [`UsageCell`] breakdown carrying the long-context subset — so the doc
+/// builder prices it through [`crate::pricing::aggregate_cost`] and the row
+/// cost equals the sum of its requests' costs (tier- and 1h-aware).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct SessionStats {
+    /// Every finished request under this name (ok = status < 400, same rule
+    /// as the per-client rows), with fresh input/output token sums.
+    pub totals: Totals,
+    pub cache_read: u64,
+    pub cache_creation: u64,
+    /// 1-hour-TTL subset of `cache_creation`.
+    pub cache_creation_1h: u64,
+    /// First/last finished-request stamps (epoch ms; replay passes each
+    /// record's persisted stamp).
+    pub first_ms: u64,
+    pub last_ms: u64,
+    /// (group, normalized model) → cell. Only model-attributed requests land
+    /// here (pre-routing failures count in `totals` only, like tenants).
+    pub models: BTreeMap<(String, String), UsageCell>,
+}
+
+impl SessionStats {
+    /// Fold another aggregate (history-behind hydration): sums add, the span
+    /// widens.
+    fn merge(&mut self, other: &SessionStats) {
+        self.totals.add(&other.totals);
+        self.cache_read = self.cache_read.saturating_add(other.cache_read);
+        self.cache_creation = self.cache_creation.saturating_add(other.cache_creation);
+        self.cache_creation_1h = self
+            .cache_creation_1h
+            .saturating_add(other.cache_creation_1h);
+        if other.first_ms != 0 && (self.first_ms == 0 || other.first_ms < self.first_ms) {
+            self.first_ms = other.first_ms;
+        }
+        self.last_ms = self.last_ms.max(other.last_ms);
+        for (key, cell) in &other.models {
+            self.models.entry(key.clone()).or_default().merge(cell);
+        }
+    }
 }
 
 /// A finished per-client attribution row (issue #32): one client identity
@@ -1349,6 +1437,12 @@ impl ActivityLog {
             };
             self.clients.entry(key).or_default().add(&totals);
         }
+        // Per-session-name rows: summed, under the same MAX_SESSION_NAMES
+        // bound + overflow bucket as the live fold (never evicted).
+        for (name, stats) in &history.sessions {
+            let key = self.session_key(name);
+            self.sessions.entry(key).or_default().merge(stats);
+        }
         self.windowed.merge_behind(history.windowed);
         // Tokens-per-day buckets (UI-3 U14) merge BY DAY so history lands on
         // its original days — same reasoning as the hourly buckets above.
@@ -1401,9 +1495,19 @@ impl ActivityLog {
         self.usage_daily.retain(|d, _| *d >= day_cutoff);
         // Session labels (UI-3 U2): first-seen wins, so a LIVE label beats the
         // replayed history for the same client; history fills the gaps under
-        // the same MAX_CLIENTS bound as the live fold.
+        // the same MAX_CLIENTS bound as the live fold. A session NAME always
+        // beats a prompt-derived label (the live fold's rule), so a named
+        // history label replaces a live DERIVED one; a live name stays.
         for (uid, label) in history.session_labels {
-            if !self.session_labels.contains_key(&uid) && self.session_labels.len() < MAX_CLIENTS {
+            let history_named = history.named_labels.contains(&uid);
+            let replace = match self.session_labels.contains_key(&uid) {
+                true => history_named && !self.named_labels.contains(&uid),
+                false => self.session_labels.len() < MAX_CLIENTS,
+            };
+            if replace {
+                if history_named {
+                    self.named_labels.insert(uid.clone());
+                }
                 self.session_labels.insert(uid, label);
             }
         }
@@ -1798,12 +1902,27 @@ impl ActivityLog {
     /// finish fold (activity in-flight identity) so a running row and the
     /// completed row it becomes show the SAME label — a label that only
     /// appeared at finish time would make the row visibly change identity.
+    ///
+    /// A request carrying an operator session NAME (`X-Llmux-Session`) sets
+    /// its client's label to the name instead, of any kind and overriding a
+    /// derived label already recorded — the name is the operator's own title
+    /// for the session and wins over prompt text. Without a name this is
+    /// exactly the derived-title rule above.
     fn note_session_label(
         &mut self,
         user_id: Option<&str>,
         kind: Option<&str>,
         excerpt: Option<&str>,
+        session_name: Option<&str>,
     ) {
+        if let (Some(uid), Some(name)) = (user_id, session_name) {
+            if self.session_labels.contains_key(uid) || self.session_labels.len() < MAX_CLIENTS {
+                self.session_labels
+                    .insert(uid.to_string(), name.to_string());
+                self.named_labels.insert(uid.to_string());
+            }
+            return;
+        }
         let (Some(uid), Some("user"), Some(text)) = (user_id, kind, excerpt) else {
             return;
         };
@@ -1811,6 +1930,78 @@ impl ActivityLog {
             self.session_labels
                 .insert(uid.to_string(), text.chars().take(48).collect());
         }
+    }
+
+    /// The aggregate row a session name folds into: itself when already
+    /// tracked or under [`MAX_SESSION_NAMES`], otherwise [`SESSION_OVERFLOW`]
+    /// (the same never-evict policy as the per-client cap).
+    fn session_key(&self, name: &str) -> String {
+        if name == SESSION_OVERFLOW
+            || self.sessions.contains_key(name)
+            || self.sessions.len() < MAX_SESSION_NAMES
+        {
+            name.to_string()
+        } else {
+            SESSION_OVERFLOW.to_string()
+        }
+    }
+
+    /// Fold one finished NAMED request into its per-session-name row. Unnamed
+    /// requests are not folded at all. Model-attributed requests also land in
+    /// the per-(group, model) [`UsageCell`] with their long-context subset, so
+    /// the row prices exactly like the sum of its requests.
+    #[allow(clippy::too_many_arguments)]
+    fn record_session(
+        &mut self,
+        session_name: Option<&str>,
+        status: u16,
+        tokens: Option<TokenCounts>,
+        group: Option<&str>,
+        model: Option<&str>,
+        now: SystemTime,
+    ) {
+        let Some(name) = session_name.filter(|n| !n.is_empty()) else {
+            return;
+        };
+        let key = self.session_key(name);
+        let row = self.sessions.entry(key).or_default();
+        row.totals.requests = row.totals.requests.saturating_add(1);
+        if status < 400 {
+            row.totals.ok = row.totals.ok.saturating_add(1);
+        } else {
+            row.totals.errors = row.totals.errors.saturating_add(1);
+        }
+        if let Some(t) = tokens {
+            row.totals.tokens_in = row.totals.tokens_in.saturating_add(t.input);
+            row.totals.tokens_out = row.totals.tokens_out.saturating_add(t.output);
+            row.cache_read = row.cache_read.saturating_add(t.cache_read.unwrap_or(0));
+            row.cache_creation = row
+                .cache_creation
+                .saturating_add(t.cache_creation.unwrap_or(0));
+            row.cache_creation_1h = row
+                .cache_creation_1h
+                .saturating_add(t.cache_creation_1h.unwrap_or(0));
+        }
+        let at_ms = now
+            .duration_since(UNIX_EPOCH)
+            .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or(0);
+        if row.first_ms == 0 || at_ms < row.first_ms {
+            row.first_ms = at_ms;
+        }
+        row.last_ms = row.last_ms.max(at_ms);
+        if let (Some(group), Some(model)) = (group, model) {
+            row.models
+                .entry((group.to_string(), normalize_model(model)))
+                .or_default()
+                .add(model, tokens);
+        }
+    }
+
+    /// Full per-session-name aggregates, for the dashboard document build
+    /// (priced there — the log holds no pricing overrides).
+    pub(crate) fn session_stats(&self) -> &BTreeMap<String, SessionStats> {
+        &self.sessions
     }
 
     /// Fold one finished request into its per-client bucket (issue #32).
@@ -2044,6 +2235,7 @@ impl ActivityLog {
                 user_id,
                 tenant,
                 excerpt,
+                session_name,
             } => {
                 if self.in_flight.len() >= MAX_IN_FLIGHT {
                     let lost = self.in_flight.remove(0);
@@ -2056,7 +2248,12 @@ impl ActivityLog {
                         now,
                     );
                 }
-                self.note_session_label(user_id.as_deref(), kind.as_deref(), excerpt.as_deref());
+                self.note_session_label(
+                    user_id.as_deref(),
+                    kind.as_deref(),
+                    excerpt.as_deref(),
+                    session_name.as_deref(),
+                );
                 self.in_flight.push(InFlight {
                     id,
                     method,
@@ -2074,6 +2271,7 @@ impl ActivityLog {
                     // lives in config, not in the fold (same contract as
                     // `CompletedBody::Request::client_name`).
                     client_name: None,
+                    session_name,
                     started_at: now,
                 });
             }
@@ -2113,6 +2311,7 @@ impl ActivityLog {
                 kind,
                 excerpt,
                 tenant,
+                session_name,
             } => {
                 let routed = self
                     .in_flight
@@ -2135,9 +2334,24 @@ impl ActivityLog {
                     model.as_deref(),
                     now,
                 );
+                // Per-session-NAME attribution (`X-Llmux-Session`): named
+                // requests only, same independence from routing.
+                self.record_session(
+                    session_name.as_deref(),
+                    status,
+                    tokens,
+                    group.as_deref(),
+                    model.as_deref(),
+                    now,
+                );
                 // Same derived-title rule as the start fold (a finish whose
                 // start was dropped must still name its session).
-                self.note_session_label(user_id.as_deref(), kind.as_deref(), excerpt.as_deref());
+                self.note_session_label(
+                    user_id.as_deref(),
+                    kind.as_deref(),
+                    excerpt.as_deref(),
+                    session_name.as_deref(),
+                );
                 let bucket = match &account {
                     Some(name) => self.totals.entry(name.clone()).or_default(),
                     None => &mut self.unrouted,
@@ -2242,6 +2456,7 @@ impl ActivityLog {
                         tenant,
                         // Resolved at doc-build time (needs key metadata).
                         client_name: None,
+                        session_name,
                     },
                 });
             }
@@ -2371,6 +2586,7 @@ mod tests {
                 user_id: Some(uid.into()),
                 kind: Some("user".into()),
                 excerpt: Some(excerpt.into()),
+                session_name: None,
             };
         let _ = day;
         let mut live = ActivityLog::new(16);
@@ -2418,6 +2634,7 @@ mod tests {
             user_id: None,
             tenant: None,
             excerpt: None,
+            session_name: None,
         }
     }
 
@@ -2431,6 +2648,7 @@ mod tests {
             user_id: Some(user_id.into()),
             tenant: None,
             excerpt: Some(excerpt.into()),
+            session_name: None,
         }
     }
 
@@ -2485,6 +2703,7 @@ mod tests {
             kind: None,
             excerpt: None,
             tenant: None,
+            session_name: None,
         }
     }
 
@@ -2521,6 +2740,7 @@ mod tests {
             kind: None,
             excerpt: None,
             tenant: None,
+            session_name: None,
         }
     }
 
@@ -2556,6 +2776,7 @@ mod tests {
             kind: None,
             excerpt: None,
             tenant: None,
+            session_name: None,
         }
     }
 
@@ -2672,6 +2893,7 @@ mod tests {
                 user_id: Some("u1".into()),
                 tenant: Some("k-t1".into()),
                 excerpt: Some("hello".into()),
+                session_name: None,
             },
             at(0),
         );
@@ -3261,6 +3483,7 @@ mod tests {
                 kind,
                 excerpt,
                 tenant: _,
+                session_name: _,
             } => ActivityEvent::RequestFinished {
                 id,
                 method,
@@ -3281,6 +3504,7 @@ mod tests {
                 kind,
                 excerpt,
                 tenant: tenant.map(str::to_string),
+                session_name: None,
             },
             other => other,
         }
@@ -3718,6 +3942,7 @@ mod tests {
             kind: None,
             excerpt: None,
             tenant: None,
+            session_name: None,
         }
     }
 
@@ -3816,6 +4041,7 @@ mod tests {
             kind: None,
             excerpt: None,
             tenant: None,
+            session_name: None,
         }
     }
 
@@ -4147,6 +4373,7 @@ mod tests {
             kind: None,
             excerpt: None,
             tenant: None,
+            session_name: None,
         };
         let at = UNIX_EPOCH + Duration::from_secs(2);
         persist_request(Some(&path), &event(2, None), at);
@@ -4211,6 +4438,7 @@ mod tests {
                 kind: None,
                 excerpt: None,
                 tenant: None,
+                session_name: None,
             }
         };
         let now = at(1_000);
@@ -4306,6 +4534,7 @@ mod tests {
             kind: None,
             excerpt: None,
             tenant: None,
+            session_name: None,
         };
         let now = SystemTime::now();
         let day = |off_back: u64| now - Duration::from_secs(off_back * 86_400);
@@ -4851,5 +5080,377 @@ mod tests {
             0,
             "post-cut line not replayed"
         );
+    }
+
+    // ---- operator session names (`X-Llmux-Session`) ----
+
+    /// A finished request carrying a client id, an optional operator session
+    /// name, and an optional served `(group, model)` + token usage.
+    #[allow(clippy::too_many_arguments)]
+    fn finished_named(
+        id: u64,
+        user_id: &str,
+        session_name: Option<&str>,
+        group: Option<&str>,
+        model: Option<&str>,
+        tokens: Option<TokenCounts>,
+        status: u16,
+        excerpt: &str,
+    ) -> ActivityEvent {
+        ActivityEvent::RequestFinished {
+            id,
+            method: "POST".into(),
+            path: "/v1/messages".into(),
+            account: Some("a".into()),
+            status,
+            duration: Duration::from_millis(900),
+            tokens,
+            group: group.map(str::to_string),
+            model: model.map(str::to_string),
+            effort: None,
+            fast: Some(false),
+            ttfb_ms: None,
+            ttft_ms: None,
+            gen_ms: None,
+            aborted: false,
+            user_id: Some(user_id.into()),
+            kind: Some("user".into()),
+            excerpt: Some(excerpt.into()),
+            tenant: Some("local".into()),
+            session_name: session_name.map(str::to_string),
+        }
+    }
+
+    fn tok(input: u64, output: u64) -> Option<TokenCounts> {
+        Some(TokenCounts {
+            input,
+            output,
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn session_name_label_wins_over_the_prompt_derived_label() {
+        let mut log = ActivityLog::new(16);
+        // Unnamed first request: today's derived title (the first prompt).
+        log.apply(
+            finished_named(1, "u1", None, None, None, None, 200, "Hi"),
+            at(1),
+        );
+        assert_eq!(
+            log.session_labels().get("u1").map(String::as_str),
+            Some("Hi")
+        );
+        // A named request for the same client id overrides it with the NAME.
+        log.apply(
+            finished_named(2, "u1", Some("orch"), None, None, None, 200, "next"),
+            at(2),
+        );
+        assert_eq!(
+            log.session_labels().get("u1").map(String::as_str),
+            Some("orch")
+        );
+        // A later UNNAMED request never demotes the name back to prompt text.
+        log.apply(
+            finished_named(3, "u1", None, None, None, None, 200, "later"),
+            at(3),
+        );
+        assert_eq!(
+            log.session_labels().get("u1").map(String::as_str),
+            Some("orch")
+        );
+        // The start fold applies the same rule (running rows label identically).
+        log.apply(
+            ActivityEvent::RequestStarted {
+                id: 4,
+                method: "POST".into(),
+                path: "/v1/messages".into(),
+                kind: Some("user".into()),
+                user_id: Some("u2".into()),
+                tenant: None,
+                excerpt: Some("what model is this?".into()),
+                session_name: Some("lander".into()),
+            },
+            at(4),
+        );
+        assert_eq!(
+            log.session_labels().get("u2").map(String::as_str),
+            Some("lander")
+        );
+        assert_eq!(log.in_flight()[0].session_name.as_deref(), Some("lander"));
+    }
+
+    #[test]
+    fn named_history_label_beats_a_live_derived_one_on_merge() {
+        let mut live = ActivityLog::new(16);
+        live.apply(
+            finished_named(10, "u1", None, None, None, None, 200, "live prompt"),
+            at(100),
+        );
+        live.apply(
+            finished_named(11, "u2", Some("live-name"), None, None, None, 200, "x"),
+            at(101),
+        );
+        let mut history = ActivityLog::new(16);
+        history.apply(
+            finished_named(1, "u1", Some("orch"), None, None, None, 200, "old"),
+            at(1),
+        );
+        history.apply(
+            finished_named(2, "u2", Some("old-name"), None, None, None, 200, "y"),
+            at(2),
+        );
+        live.merge_history_behind(history);
+        let labels = live.session_labels();
+        assert_eq!(
+            labels.get("u1").map(String::as_str),
+            Some("orch"),
+            "name beats derived"
+        );
+        assert_eq!(
+            labels.get("u2").map(String::as_str),
+            Some("live-name"),
+            "a live NAME is not replaced by an older one"
+        );
+    }
+
+    /// The resume case: Claude Code mints a NEW `user_id` session UUID on
+    /// resume but keeps the session name, so the stats must key by NAME.
+    #[test]
+    fn resumed_session_with_a_new_uuid_accumulates_into_one_named_row() {
+        let mut log = ActivityLog::new(16);
+        let model = Some("claude-opus-5-5");
+        log.apply(
+            finished_named(
+                1,
+                "uuid-A",
+                Some("orch"),
+                Some("claude"),
+                model,
+                tok(10, 5),
+                200,
+                "a",
+            ),
+            at(10),
+        );
+        log.apply(
+            finished_named(
+                2,
+                "uuid-B",
+                Some("orch"),
+                Some("claude"),
+                model,
+                tok(7, 3),
+                529,
+                "b",
+            ),
+            at(20),
+        );
+        log.apply(
+            finished_named(
+                3,
+                "uuid-C",
+                None,
+                Some("claude"),
+                model,
+                tok(100, 100),
+                200,
+                "c",
+            ),
+            at(30),
+        );
+        let rows = log.session_stats();
+        assert_eq!(rows.len(), 1, "one row per NAME; unnamed never lands here");
+        let orch = &rows["orch"];
+        assert_eq!(orch.totals.requests, 2);
+        assert_eq!((orch.totals.ok, orch.totals.errors), (1, 1));
+        assert_eq!((orch.totals.tokens_in, orch.totals.tokens_out), (17, 8));
+        assert_eq!((orch.first_ms, orch.last_ms), (10_000, 20_000));
+        let cell = &orch.models[&("claude".to_string(), "claude-opus-5-5".to_string())];
+        assert_eq!(cell.requests, 2);
+        // Two client ids (the per-client metering is unchanged) …
+        assert_eq!(log.client_totals("uuid-A").requests, 1);
+        assert_eq!(log.client_totals("uuid-B").requests, 1);
+    }
+
+    #[test]
+    fn named_sessions_are_capped_and_overflow_is_a_visible_bucket() {
+        let mut log = ActivityLog::new(4);
+        for i in 0..MAX_SESSION_NAMES {
+            log.apply(
+                finished_named(
+                    i as u64,
+                    "u",
+                    Some(&format!("s{i}")),
+                    None,
+                    None,
+                    tok(1, 1),
+                    200,
+                    "x",
+                ),
+                at(1),
+            );
+        }
+        assert_eq!(log.session_stats().len(), MAX_SESSION_NAMES);
+        // A brand-new name past the cap folds into the overflow bucket …
+        log.apply(
+            finished_named(9_000, "u", Some("late-1"), None, None, tok(5, 5), 200, "x"),
+            at(2),
+        );
+        log.apply(
+            finished_named(9_001, "u", Some("late-2"), None, None, tok(5, 5), 200, "x"),
+            at(2),
+        );
+        // … while an already-tracked name keeps accumulating, never evicted.
+        log.apply(
+            finished_named(9_002, "u", Some("s0"), None, None, tok(1, 1), 200, "x"),
+            at(3),
+        );
+        let rows = log.session_stats();
+        assert_eq!(
+            rows.len(),
+            MAX_SESSION_NAMES + 1,
+            "cap + the overflow bucket"
+        );
+        assert!(!rows.contains_key("late-1") && !rows.contains_key("late-2"));
+        assert_eq!(rows[SESSION_OVERFLOW].totals.requests, 2);
+        assert_eq!(rows["s0"].totals.requests, 2);
+        // Hydration honors the same bound: a history-only name overflows too.
+        let mut history = ActivityLog::new(4);
+        history.apply(
+            finished_named(1, "u", Some("hist-only"), None, None, tok(1, 1), 200, "x"),
+            at(0),
+        );
+        log.merge_history_behind(history);
+        assert!(!log.session_stats().contains_key("hist-only"));
+        assert_eq!(log.session_stats()[SESSION_OVERFLOW].totals.requests, 3);
+    }
+
+    #[test]
+    fn named_rows_hydrate_from_history_and_old_lines_contribute_nothing() {
+        let dir = TempDir::new();
+        let path = dir.file();
+        // A line persisted before the field existed: parses, no name.
+        let old = r#"{"v":1,"ts_ms":1000,"id":1,"method":"POST","path":"/v1/messages","account":"a","status":200,"duration_ms":1500,"tokens":{"input":10,"output":30,"cache_read":null,"cache_creation":null},"group":"claude","model":"claude-opus-5-5","effort":null,"user_id":"u0","kind":"user","excerpt":"Hi","tenant":"local"}"#;
+        let record: PersistedRequest = serde_json::from_str(old).expect("old line parses");
+        assert_eq!(record.session_name, None);
+        std::fs::write(&path, format!("{old}\n")).expect("seed");
+        let events = [
+            (
+                finished_named(
+                    2,
+                    "uuid-A",
+                    Some("orch"),
+                    Some("claude"),
+                    Some("claude-opus-5-5"),
+                    tok(3, 4),
+                    200,
+                    "a",
+                ),
+                at(2),
+            ),
+            (
+                finished_named(
+                    3,
+                    "uuid-B",
+                    Some("orch"),
+                    Some("claude"),
+                    Some("claude-opus-5-5"),
+                    tok(5, 6),
+                    200,
+                    "b",
+                ),
+                at(3),
+            ),
+        ];
+        for (event, ts) in &events {
+            persist_request(Some(&path), event, *ts);
+        }
+        let mut history = ActivityLog::new(LOG_CAPACITY);
+        history.load_persisted(Some(&path));
+        // Round trip: the name survives into the completed entry …
+        let names: Vec<Option<String>> = history
+            .completed()
+            .map(|c| match &c.body {
+                CompletedBody::Request { session_name, .. } => session_name.clone(),
+                CompletedBody::Note { .. } => None,
+            })
+            .collect();
+        assert_eq!(names, vec![Some("orch".into()), Some("orch".into()), None]);
+        // … the old line contributes nothing to named rows …
+        assert_eq!(history.session_stats().len(), 1);
+        assert_eq!(history.session_stats()["orch"].totals.requests, 2);
+        // … and hydration behind a live log sums with live traffic.
+        let mut live = ActivityLog::new(LOG_CAPACITY);
+        live.apply(
+            finished_named(
+                1,
+                "uuid-C",
+                Some("orch"),
+                Some("claude"),
+                Some("claude-opus-5-5"),
+                tok(1, 1),
+                200,
+                "c",
+            ),
+            at(50),
+        );
+        live.merge_history_behind(history);
+        let orch = &live.session_stats()["orch"];
+        assert_eq!(orch.totals.requests, 3);
+        assert_eq!(orch.totals.tokens_in, 9);
+        assert_eq!((orch.first_ms, orch.last_ms), (2_000, 50_000));
+        // And the persisted-then-replayed fold equals the live fold exactly.
+        let replayed = persisted_then_loaded(&TempDir::new().file(), &events);
+        assert_eq!(replayed.session_stats(), live_log(&events).session_stats());
+    }
+
+    /// Unnamed traffic is bit-for-bit unchanged: the persisted line carries no
+    /// new key (byte-identical to the pre-field format), no named row is
+    /// created, and the derived session label follows the old rule.
+    #[test]
+    fn unnamed_traffic_is_unchanged_by_the_session_name_field() {
+        let event = finished_named(
+            7,
+            "u1",
+            None,
+            Some("claude"),
+            Some("claude-opus-5-5"),
+            tok(10, 20),
+            200,
+            "Hi",
+        );
+        let record = PersistedRequest::from_event(&event, at(1)).expect("record");
+        let line = serde_json::to_string(&record).expect("json");
+        assert!(!line.contains("session_name"), "{line}");
+        let expected = r#"{"v":1,"ts_ms":1000,"id":7,"method":"POST","path":"/v1/messages","account":"a","status":200,"duration_ms":900,"tokens":{"input":10,"output":20,"cache_read":null,"cache_creation":null},"group":"claude","model":"claude-opus-5-5","effort":null,"fast":false,"ttfb_ms":null,"ttft_ms":null,"gen_ms":null,"aborted":false,"user_id":"u1","kind":"user","excerpt":"Hi","tenant":"local"}"#;
+        assert_eq!(line, expected, "unnamed line is the pre-field format");
+        let mut log = ActivityLog::new(8);
+        log.apply(event, at(1));
+        assert!(log.session_stats().is_empty());
+        assert_eq!(
+            log.session_labels().get("u1").map(String::as_str),
+            Some("Hi")
+        );
+        // A named line adds exactly the one key and round-trips it.
+        let named = finished_named(8, "u1", Some("orch"), None, None, None, 200, "x");
+        let line =
+            serde_json::to_string(&PersistedRequest::from_event(&named, at(1)).expect("record"))
+                .expect("json");
+        assert!(
+            line.ends_with(r#","tenant":"local","session_name":"orch"}"#),
+            "{line}"
+        );
+        let back: PersistedRequest = serde_json::from_str(&line).expect("parses");
+        assert_eq!(back.into_event().0, named);
+        // A hand-edited line cannot smuggle an unsanitized name back in.
+        let tampered = line.replace(r#""orch""#, r#""a\u001b[2Jb""#);
+        let back: PersistedRequest = serde_json::from_str(&tampered).expect("parses");
+        match back.into_event().0 {
+            ActivityEvent::RequestFinished { session_name, .. } => {
+                assert_eq!(session_name.as_deref(), Some("a__2Jb"))
+            }
+            other => panic!("expected finish, got {other:?}"),
+        }
     }
 }

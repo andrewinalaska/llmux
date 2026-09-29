@@ -840,6 +840,7 @@ mod tests {
             data_quality: Default::default(),
             events: Vec::new(),
             health: Some(health),
+            session_usage: Vec::new(),
         }
     }
 
@@ -945,6 +946,7 @@ mod tests {
                 excerpt: None,
                 tenant: None,
                 client_name: None,
+                session_name: None,
             },
         }
     }

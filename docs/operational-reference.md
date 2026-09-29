@@ -148,6 +148,32 @@ eval "$(llmux env)"
 claude
 ```
 
+### Naming a session (`X-Llmux-Session`)
+
+Give a Claude Code session a human name and llmux labels its activity rows with it and keeps real per-name stats. Claude Code sends extra request headers from `ANTHROPIC_CUSTOM_HEADERS` (one `Name: Value` per line), so no llmux client change is needed:
+
+```bash
+ANTHROPIC_CUSTOM_HEADERS="X-Llmux-Session: orch" llmux run
+# or, with manual wiring:
+eval "$(llmux env)"; ANTHROPIC_CUSTOM_HEADERS="X-Llmux-Session: orch" claude
+```
+
+Launchers can check for support first: `GET /llmux/status` carries `"features": ["session-header"]` on daemons that understand (and strip) the header. An older daemon has no `features` key, and it would forward the header upstream unchanged.
+
+Header contract:
+
+- **Name**: `X-Llmux-Session` (case-insensitive) on data-plane requests. If it is sent more than once, the first value wins.
+- **Sanitizing**: surrounding whitespace is trimmed, the value is cut to 64 characters, and every character outside `[A-Za-z0-9._:@/-]` becomes `_` (one `_` per character, Unicode included). A value that is empty after trimming counts as no header.
+- **Never forwarded**: llmux removes every value of the header at forward entry, before any provider path (anthropic, openrouter, codex, grok) builds its upstream request. The passthrough header strip removes it again as a backstop. It also never reaches the request log or the raw-io capture.
+- **Metadata only**: the name is a label. It grants nothing, identifies no tenant, and never affects authentication, routing, or account selection. A request with the header but without valid credentials gets exactly the response it would get without the header.
+
+What the name drives:
+
+- **Activity label**: the row's `«session»` title shows the name instead of the text derived from the first prompt. That client id's label switches to the name, and a later unnamed request from the same client does not switch it back. Requests without the header are labeled as before. The expanded row has a `session` detail line.
+- **Per-name stats**: requests, ok/err, fresh input/output, cache read/write (with the 1-hour subset), first/last seen, and a per-model breakdown. Stats are keyed by the **name**, not by Claude Code's `metadata.user_id` session UUID, so a resumed session (new UUID, same name) keeps adding to the same row. Cost is the API-equivalent estimate, priced by the daemon with its `pricing` overrides. Long-context tiering and the 5m/1h cache-write split are applied per request, so a row's cost equals the sum of its requests' costs. The rows are served on `GET /llmux/dashboard` as `session_usage` (omitted until a named request lands) and appear as a **named sessions** panel at the top of the TUI Sessions tab (`s`). Unnamed traffic never creates a row, and the per-client (`metadata.user_id`) panel is unchanged.
+- **Cardinality**: up to 1,024 distinct names are tracked (the same bound as the per-client rows). A name first seen after that limit is added to a visible `(overflow)` row. Existing rows are never evicted and keep accumulating. `(overflow)` cannot collide with a real name, because parentheses are outside the sanitized alphabet.
+- **Persistence**: the name is stored in `activity.jsonl` as `session_name`. The key is left out for unnamed requests, so their lines are byte-identical to the older format. At startup the per-name rows are rebuilt from that history, the same way the per-client rows are. Lines written before the field existed have no name and add nothing to named rows. There is no durable SQLite per-session history: the per-name rows are rebuilt by replaying `activity.jsonl`, not stored in the keys-usage database.
+
 ## Multi-tenant client keys
 
 One llmux server can serve several machines, each with its OWN issued key, so
