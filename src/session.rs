@@ -545,6 +545,7 @@ pub(crate) mod test_support {
                     output,
                     cache_read: Some(999),
                     cache_creation: Some(7),
+                    cache_creation_1h: None,
                 }),
                 group: Some("claude".into()),
                 model: self.model.clone(),
@@ -558,6 +559,7 @@ pub(crate) mod test_support {
                 kind: None,
                 excerpt: None,
                 tenant: None,
+                session_name: None,
             };
             let rec = PersistedRequest::from_event(
                 &event,
