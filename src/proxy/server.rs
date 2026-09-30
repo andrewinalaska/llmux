@@ -4576,8 +4576,9 @@ mod tests {
         // Static codex alias and context survive serialization.
         assert_eq!(
             by_id("gpt-5.6-sol")["aliases"],
-            serde_json::json!(["sol", "gpt-5.6"])
+            serde_json::json!(["gpt-5.6"])
         );
+        assert_eq!(by_id("gpt-6.1-sol")["aliases"], serde_json::json!(["sol"]));
         assert_eq!(by_id("gpt-5.6-sol")["max_context"], 372_000);
         // The codex `[1m]` opt-in rows ride the same serialization: 1M window,
         // no aliases (those stay on the base rows), base sol unchanged.

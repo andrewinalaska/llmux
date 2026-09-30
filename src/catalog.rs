@@ -441,7 +441,8 @@ pub fn catalog(grok_pin: &str, _codex_pin: &str, openrouter_pin: &str) -> Vec<Mo
         "GPT-6.1-Sol",
         CODEX_EFFORTS_FULL,
         Some(272_000),
-        Vec::new(),
+        // Fork-only: the bare `sol` alias (see `SOL_ALIAS_TARGET` in the codex provider).
+        vec!["sol".into()],
     ));
     entries.push(codex_entry(
         "gpt-6-luna",
@@ -462,7 +463,7 @@ pub fn catalog(grok_pin: &str, _codex_pin: &str, openrouter_pin: &str) -> Vec<Mo
         "GPT-5.6-Sol",
         CODEX_EFFORTS_FULL,
         Some(372_000),
-        vec!["sol".into(), "gpt-5.6".into()],
+        vec!["gpt-5.6".into()],
     ));
     entries.push(codex_entry(
         "gpt-5.6-terra[1m]",
@@ -1052,7 +1053,12 @@ mod tests {
     fn gpt_5_6_sol_aliases_context_and_effort_count() {
         let entries = catalog("grok-4.6", "gpt-5.6-sol", "stealth/ox-alpha");
         let sol = find(&entries, "gpt-5.6-sol");
-        assert_eq!(sol.aliases, vec!["sol".to_string(), "gpt-5.6".to_string()]);
+        assert_eq!(sol.aliases, vec!["gpt-5.6".to_string()]);
+        assert_eq!(
+            find(&entries, "gpt-6.1-sol").aliases,
+            vec!["sol".to_string()],
+            "fork-only: bare sol lives on gpt-6.1-sol"
+        );
         assert_eq!(sol.max_context, Some(372_000));
         assert_eq!(sol.efforts.len(), 6);
     }
