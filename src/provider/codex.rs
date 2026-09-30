@@ -295,6 +295,12 @@ const GPT_6_ALIAS: &str = "astra";
 /// so it resolves to [`GPT_6_FLAGSHIP`].
 const GPT_6_GENERATION: &str = "gpt-6";
 
+/// Where the bare `sol` alias points. FORK-ONLY (2026-09-29, operator's call):
+/// bare `sol` follows the newest sol tier (`gpt-6.1-sol`) while `terra` /
+/// `luna` and the bare `gpt-5.6` id stay on [`LATEST_GPT_GENERATION`]. Upstream
+/// keeps `sol` on 5.6 — do not send this upstream.
+const SOL_ALIAS_TARGET: &str = "gpt-6.1-sol";
+
 /// The client-side context-window suffix (`gpt-5.6-sol[1m]`), mirroring the
 /// claude convention (`crate::provider::anthropic`'s
 /// `strip_client_context_suffix`). It is display metadata Claude Code parses
@@ -321,6 +327,10 @@ fn resolve_upstream_model(requested: Option<&str>, pinned: &str) -> String {
         .strip_suffix(CLIENT_CONTEXT_SUFFIX)
         .map(str::to_string)
         .unwrap_or(req);
+    // Fork-only: bare `sol` → the newest sol tier (see [`SOL_ALIAS_TARGET`]).
+    if req == "sol" {
+        return SOL_ALIAS_TARGET.to_string();
+    }
     // Bare variant alias → latest gpt generation of that variant.
     if VARIANT_ALIASES.contains(&req.as_str()) {
         return format!("{LATEST_GPT_GENERATION}-{req}");
@@ -600,7 +610,7 @@ mod tests {
         // launched as a single tier, so `astra` and the bare `gpt-6` both land
         // on `gpt-6-astra` while the bare sol/terra/luna STAY on 5.6.
         for (alias, expected) in [
-            ("sol", "gpt-5.6-sol"),
+            ("sol", "gpt-6.1-sol"),
             ("terra", "gpt-5.6-terra"),
             ("luna", "gpt-5.6-luna"),
             ("LUNA", "gpt-5.6-luna"),
@@ -624,7 +634,7 @@ mod tests {
         for (requested, expected) in [
             ("gpt-5.6-sol[1m]", "gpt-5.6-sol"),
             ("gpt-5.6-terra[1m]", "gpt-5.6-terra"),
-            ("sol[1m]", "gpt-5.6-sol"),
+            ("sol[1m]", "gpt-6.1-sol"),
             ("gpt-5.6[1m]", "gpt-5.6-sol"),
             ("gpt-5.5[1m]", "gpt-5.5"),
             ("  GPT-5.6-Sol[1M]  ", "gpt-5.6-sol"),
@@ -699,7 +709,7 @@ mod tests {
             "messages": [{"role":"user","content":"hi"}],
         });
         let (model, effort, _) = effective_request_meta(&body, &pinned);
-        assert_eq!(model, "gpt-5.6-sol", "alias resolved in the recorded meta");
+        assert_eq!(model, "gpt-6.1-sol", "alias resolved in the recorded meta");
         assert_eq!(
             effort.as_deref(),
             Some("low"),
@@ -787,9 +797,17 @@ mod tests {
                 "{slug} passes through"
             );
         }
-        // The bare `sol` / `luna` aliases still mean generation 5.6.
+        // Fork-only: bare `sol` means gpt-6.1-sol; `luna` and `gpt-5.6` stay 5.6.
         assert_eq!(
             resolve_upstream_model(Some("sol"), CODEX_MODEL),
+            "gpt-6.1-sol"
+        );
+        assert_eq!(
+            resolve_upstream_model(Some("sol[1m]"), CODEX_MODEL),
+            "gpt-6.1-sol"
+        );
+        assert_eq!(
+            resolve_upstream_model(Some("gpt-5.6"), CODEX_MODEL),
             "gpt-5.6-sol"
         );
         // No `gpt-6-terra` is listed upstream: an unknown id keeps the pin.

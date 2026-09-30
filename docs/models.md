@@ -60,7 +60,13 @@ not that it is zero.
   exactly like `grok`. The same strip applies to the PIN itself, so a pinned
   `grok-4.7[1m]` also leaves llmux as `grok-4.7` — the suffix is display
   metadata on both sides.
-- **codex variant aliases** — `sol` / `terra` / `luna` resolve to the latest gpt
+- **FORK-ONLY: bare `sol` → `gpt-6.1-sol`** (2026-09-29). Upstream keeps `sol`
+  on `gpt-5.6-sol`; this fork points it at the newest sol tier, so `sol` (and
+  `sol[1m]`) resolve to `gpt-6.1-sol` and the alias is advertised on that row.
+  `terra` / `luna` and bare `gpt-5.6` are unchanged. Revert = drop
+  `SOL_ALIAS_TARGET` in `src/provider/codex.rs` and move the alias back in
+  `src/catalog.rs`. Do not send this upstream.
+- **codex variant aliases** — `terra` / `luna` resolve to the latest gpt
   generation of that variant (`gpt-5.6-sol` / `-terra` / `-luna`), and the bare
   `gpt-5.6` id resolves to the `sol` flagship. `astra` and the bare `gpt-6` id
   resolve to `gpt-6-astra[1m]` — deliberate asymmetry with the 5.6 rows: on
@@ -72,7 +78,8 @@ not that it is zero.
   a bare `astra` / `gpt-6` — an id it does not know — gets its 200k assumption.
   Type `astra[1m]` (or pick the `[1M]` picker row) to move the client-side
   denominator too.
-  The bare `sol` / `terra` / `luna` aliases stay on 5.6: the full ids
+  The bare `terra` / `luna` aliases stay on 5.6 (bare `sol` is fork-only
+  `gpt-6.1-sol`, above): the full ids
   `gpt-6-sol` / `gpt-6-luna` (listed by the openai/codex catalog since it was
   re-fetched 2026-09-28) are reachable and pass through verbatim, but own no
   bare alias. These are advertised statically on the corresponding entries. The provider always
