@@ -339,9 +339,10 @@ async fn refresh_usage_records_the_weekly_billing_window_for_grok() {
         Some("sub-grok:g"),
         "x-userid carries the credential subject"
     );
-    assert!(
-        seen.client_version.is_some(),
-        "the grok client version rides along: {seen:?}"
+    assert_eq!(
+        seen.client_version.as_deref(),
+        Some("1.0.46"),
+        "billing uses the same supported client version as inference"
     );
     assert_eq!(seen.accept.as_deref(), Some("application/json"));
 
