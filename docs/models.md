@@ -99,13 +99,13 @@ not that it is zero.
   | `opus-5`         | `claude-opus-5[1m]`   | `claude-opus-5`    |
   | `sonnet`, `sonnet-5-5` | `claude-sonnet-5-5[1m]` | `claude-sonnet-5-5` |
   | `sonnet-5`       | `claude-sonnet-5[1m]` | `claude-sonnet-5`  |
-  | `haiku`          | `claude-haiku-4-5`    | `claude-haiku-4-5` |
+  | `haiku`, `haiku-5-5` | `claude-haiku-5-5` | `claude-haiku-5-5` |
 
   Matching is trimmed and case-insensitive (`"  OPUS  "` resolves), and an
   alias may carry the client-side `[1m]` context suffix — `fable[1m]` resolves
   exactly like `fable`, because alias resolution runs before the suffix strip.
   That strip is syntactic only — it does not promise a 1M-capable target
-  (`haiku[1m]` resolves to the ordinary `claude-haiku-4-5` row).
+  (`haiku[1m]` resolves to the ordinary `claude-haiku-5-5` row).
   Only aliases are rewritten: a real catalog id is not an alias and passes
   through untouched — the `[1m]` suffix strip is a separate, subsequent step,
   which is why `claude-opus-5[1m]` still reaches upstream as `claude-opus-5` —
@@ -206,7 +206,8 @@ model it does not curate.
 | claude-sonnet-5-5   | —            | Claude Sonnet 5.5   | low, medium, high, xhigh, max        | 200000      | claude |
 | claude-sonnet-5[1m] | sonnet-5     | Claude Sonnet 5 [1M]| low, medium, high, xhigh, max        | 1000000     | claude |
 | claude-sonnet-5     | —            | Claude Sonnet 5     | low, medium, high, xhigh, max        | 200000      | claude |
-| claude-haiku-4-5    | haiku        | Claude Haiku 4.5    | low, medium, high, xhigh, max        | 200000      | claude |
+| claude-haiku-5-5    | haiku, haiku-5-5 | Claude Haiku 5.5 | low, medium, high, xhigh, max        | 200000      |
+| claude-haiku-4-5    | —            | Claude Haiku 4.5    | low, medium, high, xhigh, max        | 200000      | claude |
 | gpt-6-astra[1m]     | astra, gpt-6 | GPT-6-Astra [1M]    | low, medium, high, xhigh, max, ultra | 1000000     | codex  |
 | gpt-6-astra         | —            | GPT-6-Astra         | low, medium, high, xhigh, max, ultra | 272000      | codex  |
 | gpt-6.1-sol[1m]     | —            | GPT-6.1-Sol [1M]    | low, medium, high, xhigh, max, ultra | 1000000     | codex  |
@@ -390,7 +391,7 @@ So the same fetch that builds the lineup also exports, for the same launch:
 | `ANTHROPIC_DEFAULT_OPUS_MODEL`   | `opus` owner (`claude-opus-5-5[1m]`)    |
 | `ANTHROPIC_DEFAULT_FABLE_MODEL`  | `fable` owner (`claude-fable-5-1[1m]`)  |
 | `ANTHROPIC_DEFAULT_SONNET_MODEL` | `sonnet` owner (`claude-sonnet-5-5[1m]`) |
-| `ANTHROPIC_DEFAULT_HAIKU_MODEL`  | `haiku` owner (`claude-haiku-4-5`)      |
+| `ANTHROPIC_DEFAULT_HAIKU_MODEL`  | `haiku` owner (`claude-haiku-5-5`)      |
 
 The values are DERIVED from the catalog alias owners at launch, never
 hardcoded: re-curating an alias onto a new row moves the export with it, and an

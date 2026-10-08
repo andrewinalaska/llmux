@@ -353,6 +353,12 @@ const SONNET_5: ModelPrice = ModelPrice::new(2.0, 10.0, 0.2, 2.5).with_cache_cre
 /// Claude Sonnet 4.6, 4.5, 4: 3 / 3.75 / 6 / 0.30 / 15. Also the default for a
 /// Sonnet version this table does not list.
 const SONNET_TIER: ModelPrice = ModelPrice::new(3.0, 15.0, 0.3, 3.75).with_cache_creation_1h(6.0);
+/// Claude Haiku 5.5: 0.125 / 0.20 / 0.01 / 0.10 / 0.50 (claude.com/pricing,
+/// read 2026-10-08, prompts <= 100K). The page also lists a > 100K tier
+/// (0.50 in / 2.50 out / 0.625 write / 0.05 read) that is NOT modeled here, so
+/// long Haiku 5.5 prompts are under-costed. The 1-hour write rate (2x input)
+/// is not on the page; it follows Anthropic's usual 2x convention.
+const HAIKU_5_5: ModelPrice = ModelPrice::new(0.1, 0.5, 0.01, 0.125).with_cache_creation_1h(0.2);
 /// Claude Haiku 4.5: 1 / 1.25 / 2 / 0.10 / 5. Also the default for a Haiku
 /// version this table does not list.
 const HAIKU_4_5: ModelPrice = ModelPrice::new(1.0, 5.0, 0.1, 1.25).with_cache_creation_1h(2.0);
@@ -676,6 +682,7 @@ fn claude_price(slug: &str) -> Option<ModelPrice> {
         ("opus", _) => OPUS_TIER,
         ("sonnet", Some((5, None | Some(5)))) => SONNET_5,
         ("sonnet", _) => SONNET_TIER,
+        ("haiku", Some((5, Some(5)))) => HAIKU_5_5,
         ("haiku", _) => HAIKU_4_5,
         ("fable", Some((5, Some(1)))) => FABLE_5_1,
         ("fable", _) => FABLE_5,
@@ -1316,6 +1323,7 @@ mod tests {
             ("claude-sonnet-4-5", sonnet_4),
             ("claude-sonnet-4", sonnet_4),
             ("claude-sonnet-4-0", sonnet_4),
+            ("claude-haiku-5-5", (0.1, 0.5, 0.01, 0.125)),
             ("claude-haiku-4-5", (1.0, 5.0, 0.1, 1.25)),
             ("claude-3-5-haiku-20241022", (0.8, 4.0, 0.08, 1.0)),
         ] {
@@ -1331,7 +1339,7 @@ mod tests {
             "sonnet → claude-sonnet-5-5"
         );
         assert_eq!(claude_rates("fable").2, 0.25, "fable → claude-fable-5-1");
-        assert_eq!(claude_rates("haiku"), (1.0, 5.0, 0.1, 1.25));
+        assert_eq!(claude_rates("haiku"), (0.1, 0.5, 0.01, 0.125));
     }
 
     /// Dated snapshots price exactly like their bare id — including the
