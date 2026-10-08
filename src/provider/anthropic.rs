@@ -365,7 +365,7 @@ mod tests {
     /// compose rather than both always firing.
     #[test]
     fn normalize_body_resolves_an_alias_whose_id_has_no_context_suffix() {
-        assert_eq!(normalized_model("haiku"), "claude-haiku-4-5");
+        assert_eq!(normalized_model("haiku"), "claude-haiku-5-5");
     }
 
     #[test]
