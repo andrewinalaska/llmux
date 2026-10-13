@@ -606,9 +606,8 @@ again 2026-09-23 (the new `grok-4.7` row, and the default pin moved 4.6 → 4.7
   through the daemon. Both join the provider passthrough list. Pricing (standard
   tier, per 1M tokens, launched 2026-09-22; OpenAI API pricing page, read
   2026-09-28): `gpt-6-sol` $2 in / $10 out / $0.20 cached input; `gpt-6-luna`
-  $0.10 in / $0.50 out / $0.01 cached input; no cache-creation charge, per the
-  codex convention (the page lists cache writes at $2.50 / $0.125, which do not
-  apply to subscription traffic). The >272k-prompt tier (sol $4 in / $15 out,
+  $0.10 in / $0.50 out / $0.01 cached input; cache writes $2.50 / $0.125 (1.25×
+  input, per the page; the wire reports `cache_write_tokens`, 0 today). The >272k-prompt tier (sol $4 in / $15 out,
   luna $0.20 in / $0.75 out) is not modeled. The `[1m]` twin for sol reuses
   astra's 1000000 client denominator and has not been probed.
 - **gpt-6.1-sol** — released 2026-09-29. Codex catalog: `gpt-6.1-sol`
@@ -616,8 +615,7 @@ again 2026-09-23 (the new `grok-4.7` row, and the default pin moved 4.6 → 4.7
   effort low, `supported_in_api`, low→ultra. Joins the provider passthrough
   list and owns no bare alias. Pricing (standard tier, per 1M tokens; OpenAI
   API pricing page, read 2026-09-29): $2 in / $10 out / $0.10 cached input
-  (gpt-6-sol's cached input is $0.20); no cache-creation charge per the codex
-  convention. The >272k-prompt tier ($4 / $15 / $0.20 cached) is not modeled.
+  (gpt-6-sol's cached input is $0.20); cache write $2.50 (1.25× input). The >272k-prompt tier ($4 / $15 / $0.20 cached) is not modeled.
   The `[1m]` twin reuses gpt-6-sol's 1000000 client denominator and has not
   been probed.
 - **Codex `[1m]` context window** — live probes through the daemon against the

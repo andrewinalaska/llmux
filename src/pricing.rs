@@ -13,7 +13,8 @@
 //! OpenAI/codex bills cached input at a flat discounted rate and has no
 //! cache-creation charge. A per-model [`ModelPrice`] with four independent
 //! rates (input / output / cache_read / cache_creation) expresses both
-//! providers uniformly — codex models simply carry `cache_creation: 0.0`.
+//! providers uniformly — codex models carry the page's cache-write rate (1.25× input) —
+//! the wire reports `cache_write_tokens` (0 today).
 //!
 //! ## Cache-write TTL split (5-minute vs 1-hour)
 //! Anthropic prices a cache write by its TTL: a 5-minute write at 1.25× input
@@ -71,8 +72,8 @@ use crate::tui::activity::normalize_model;
 use crate::tui::TokenCounts;
 
 /// Per-model price table entry. All four rates are **USD per 1,000,000
-/// tokens**. A zero rate means "free / not charged" (e.g. codex has no
-/// cache-creation charge → `cache_creation: 0.0`).
+/// tokens**. A zero rate means "free / not charged" (e.g. the gpt-5.5
+/// rows, whose page lists no cache-write price → `cache_creation: 0.0`).
 ///
 /// Also the config `pricing` override shape. An override REPLACES the whole
 /// entry, tier included: one without `long_context` prices every request at
@@ -416,44 +417,44 @@ const GPT_5_5_FLAT: ModelPrice = ModelPrice::new(5.0, 30.0, 0.5, 0.0);
 /// $0.40 cached input (OpenAI model page developers.openai.com/api/docs/models/
 /// gpt-5.6-sol and the pricing page, read 2026-09-28). OpenAI calls this
 /// promotional pricing "available at least through November 21, 2026", so
-/// re-check it after that date. Codex: no cache-creation charge (the page's
-/// $5 cache-write rate does not apply to subscription traffic). Prompts over
+/// re-check it after that date. Cache write is $5 (1.25× input; 2× that
+/// over 272k, as with every long-context rate). Prompts over
 /// 272k bill the whole request at $8 in / $30 out / $0.80 cached.
-const GPT_5_6_SOL: ModelPrice = ModelPrice::new(4.0, 20.0, 0.4, 0.0).with_long_context_at(
+const GPT_5_6_SOL: ModelPrice = ModelPrice::new(4.0, 20.0, 0.4, 5.0).with_long_context_at(
     OPENAI_LONG_CONTEXT_THRESHOLD,
     8.0,
     30.0,
     0.8,
-    0.0,
+    10.0,
 );
 /// gpt-5.6-terra (mid tier): $2 in / $12 out / $0.20 cached input (OpenAI
 /// pricing page, read 2026-09-28; same promotional caveat and conventions as
 /// [`GPT_5_6_SOL`]).
-const GPT_5_6_TERRA: ModelPrice = ModelPrice::new(2.0, 12.0, 0.2, 0.0).with_long_context_at(
+const GPT_5_6_TERRA: ModelPrice = ModelPrice::new(2.0, 12.0, 0.2, 2.5).with_long_context_at(
     OPENAI_LONG_CONTEXT_THRESHOLD,
     4.0,
     18.0,
     0.4,
-    0.0,
+    5.0,
 );
 /// gpt-5.6-luna (budget tier): $0.20 in / $1.20 out / $0.02 cached input
 /// (OpenAI pricing page, read 2026-09-28; same caveats as [`GPT_5_6_SOL`]).
-const GPT_5_6_LUNA: ModelPrice = ModelPrice::new(0.2, 1.2, 0.02, 0.0).with_long_context_at(
+const GPT_5_6_LUNA: ModelPrice = ModelPrice::new(0.2, 1.2, 0.02, 0.25).with_long_context_at(
     OPENAI_LONG_CONTEXT_THRESHOLD,
     0.4,
     1.8,
     0.04,
-    0.0,
+    0.5,
 );
 /// gpt-6-astra (generation-6 flagship, 2026-09 launch, standard tier): $10 in
 /// / $50 out / $1 cached input (OpenAI API pricing page, read 2026-09-28).
-/// Codex: no cache-creation charge, same convention as the other codex rows.
-const GPT_6_ASTRA: ModelPrice = ModelPrice::new(10.0, 50.0, 1.0, 0.0).with_long_context_at(
+/// Cache write $12.50 (1.25× input), $25 over 272k.
+const GPT_6_ASTRA: ModelPrice = ModelPrice::new(10.0, 50.0, 1.0, 12.5).with_long_context_at(
     OPENAI_LONG_CONTEXT_THRESHOLD,
     20.0,
     75.0,
     2.0,
-    0.0,
+    25.0,
 );
 /// gpt-6-sol (2026-09-22 launch, standard tier, prompts <=272k): $2 in / $10
 /// out / $0.20 cached input (OpenAI API pricing page,
@@ -461,36 +462,35 @@ const GPT_6_ASTRA: ModelPrice = ModelPrice::new(10.0, 50.0, 1.0, 0.0).with_long_
 /// cache-creation charge, same convention as the other codex rows (the page's
 /// separate $2.50 cache-write rate does not apply to subscription traffic).
 /// Prompts over 272k bill the whole request at $4 in / $15 out / $0.40 cached.
-const GPT_6_SOL: ModelPrice = ModelPrice::new(2.0, 10.0, 0.2, 0.0).with_long_context_at(
+const GPT_6_SOL: ModelPrice = ModelPrice::new(2.0, 10.0, 0.2, 2.5).with_long_context_at(
     OPENAI_LONG_CONTEXT_THRESHOLD,
     4.0,
     15.0,
     0.4,
-    0.0,
+    5.0,
 );
 /// gpt-6.1-sol (2026-09-29 launch, standard tier, prompts <=272k): $2 in / $10
 /// out / $0.10 cached input (OpenAI API pricing page,
 /// developers.openai.com/api/docs/pricing, read 2026-09-29). Same conventions
-/// as [`GPT_6_SOL`]: no cache-creation charge for codex traffic (the page's
-/// $2.50 cache-write rate does not apply to subscription traffic). Prompts
+/// as [`GPT_6_SOL`]: cache write $2.50 (1.25× input), $5 over 272k. Prompts
 /// over 272k bill the whole request at $4 in / $15 out / $0.20 cached. Cached
 /// input is half of gpt-6-sol's.
-const GPT_6_1_SOL: ModelPrice = ModelPrice::new(2.0, 10.0, 0.1, 0.0).with_long_context_at(
+const GPT_6_1_SOL: ModelPrice = ModelPrice::new(2.0, 10.0, 0.1, 2.5).with_long_context_at(
     OPENAI_LONG_CONTEXT_THRESHOLD,
     4.0,
     15.0,
     0.2,
-    0.0,
+    5.0,
 );
 /// gpt-6-luna (2026-09-22 launch, standard tier): $0.10 in / $0.50 out /
 /// $0.01 cached input; over 272k: $0.20 in / $0.75 out / $0.02 cached.
 /// Same sourcing and conventions as [`GPT_6_SOL`].
-const GPT_6_LUNA: ModelPrice = ModelPrice::new(0.1, 0.5, 0.01, 0.0).with_long_context_at(
+const GPT_6_LUNA: ModelPrice = ModelPrice::new(0.1, 0.5, 0.01, 0.125).with_long_context_at(
     OPENAI_LONG_CONTEXT_THRESHOLD,
     0.2,
     0.75,
     0.02,
-    0.0,
+    0.25,
 );
 /// grok-4.5 (docs.x.ai, read 2026-09-28): $2 in / $6 out / $0.30 cached input
 /// (the row previously carried $0.50 — the page lists $0.30), no
@@ -1157,9 +1157,9 @@ mod tests {
             let cached = per_m("codex", model, 2);
             approx(cached, 1.00);
         }
-        // Codex convention: no cache-creation charge.
+        // Cache write is the page's 1.25× input.
         let creation = per_m("codex", "gpt-6-astra", 3);
-        approx(creation, 0.0);
+        approx(creation, 12.5);
         // The bare ALIAS is deliberately absent from the price table: the
         // codex provider resolves `astra` to `gpt-6-astra` BEFORE the request
         // (and the recorded model) leaves llmux, so pricing only ever sees the
@@ -1189,8 +1189,8 @@ mod tests {
             approx(per_m("codex", model, 0), input);
             approx(per_m("codex", model, 1), output);
             approx(per_m("codex", model, 2), cached);
-            // Codex convention: no cache-creation charge.
-            approx(per_m("codex", model, 3), 0.0);
+            // Cache write is the page's 1.25× input.
+            approx(per_m("codex", model, 3), input * 1.25);
         }
         // A future gpt-6 tier we have no row for still takes the astra default.
         assert_eq!(builtin_price("gpt-6-terra"), Some(GPT_6_ASTRA));
@@ -1228,9 +1228,12 @@ mod tests {
     }
 
     #[test]
-    fn gpt_5_6_has_no_cache_creation_charge() {
-        let cost = per_m("codex", "gpt-5.6-sol", 3);
-        approx(cost, 0.0);
+    fn gpt_5_6_cache_write_is_1_25x_input() {
+        // developers.openai.com/api/docs/pricing lists a cache-write price on
+        // every gpt-5.6 row, 1.25x that model's input rate.
+        approx(per_m("codex", "gpt-5.6-sol", 3), 5.0);
+        approx(per_m("codex", "gpt-5.6-terra", 3), 2.5);
+        approx(per_m("codex", "gpt-5.6-luna", 3), 0.25);
     }
 
     #[test]
