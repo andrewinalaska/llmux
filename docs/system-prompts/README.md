@@ -1,5 +1,9 @@
 # Claude Code system prompts (multi-model, real wire captures)
 
+Scope: these dated captures concern Claude Code/SDK **as a Messages client**,
+not the later Codex → llmux → Claude Agent SDK transport. They do not capture the
+new bridge’s private SDK HTTP prompt; see [raw transport boundaries](../codex-frontend/README.md#http-and-activity).
+
 **This directory ships the actual system-prompt text** captured from llmux
 `raw-io.jsonl` on 2026-07-14, lightly sanitized (paths / host identity /
 session memory). Not a taxonomy essay.
@@ -129,3 +133,17 @@ approx_used ≈ input + cache_read + cache_creation
 Sanitization applied to samples: `$HOME` path rewrite, session UUID wipe,
 monitor user-id placeholder, SDK L1 memory body redacted, session `gitStatus`
 snapshot redacted. Prompt **logic text is intact**.
+
+## Session-title drift (2026-10-07)
+
+Claude Code **2.1.292** sends a dedicated no-tools title request whose system block
+starts `You are naming a coding session so the user can pick it out of a long list
+of sessions.` Its input wraps the session in `<session>…</session>`, followed by a
+predominant-language instruction. The captured request uses temperature 1,
+`max_tokens:32000`, streaming, disabled thinking, and a JSON schema requiring only
+`title:string`. This supersedes the older `5-10 word title` user-text fingerprint.
+The exact quota shape remains one user string `quota`, `max_tokens:1`, no system/tools.
+
+Evidence: local raw-io records 50/55 captured on 2026-10-07, sanitized acceptance
+fixtures `internal_quota` / `internal_title` in `tests/e2e.rs`; no private session
+text is retained here. See [the internal-task contract](../provider-compatibility.md#claude-code-internal-tasks).

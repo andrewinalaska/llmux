@@ -1,5 +1,9 @@
 # Prompt families (wire contracts)
 
+Scope: these are dated Messages-client prompt families. They are not a catalog of
+Codex-native prompts or the private prompts added by the Claude SDK bridge; see
+[the capture scope](README.md).
+
 Each family is a **different system-prompt contract**. Model swap reuses the
 family; it does not invent a new one.
 
@@ -152,6 +156,21 @@ Session Context.
 **Routing:** agent model ≠ monitor model is normal. Grok agent turns are often
 followed by Claude or grok monitor. **gpt-5.6-sol:** 0/163 `agent_full` in the
 2.5GB window carried this family — do not assume monitor ran.
+
+---
+
+**2026-10-07 drift (CLI 2.1.290/2.1.292).** The current monitor uses two severity
+stages. Observed Stage 1: `max_tokens: 64`, `thinking: disabled`, no tools,
+`stop_sequences: ["</severity>"]`, nonstream; actual reply `<severity>5` with
+`stop_reason: stop_sequence`. Installed 2.1.292 client inspection also shows a
+no-stop fast variant and Stage 2 with `max_tokens: 8192`, optional closed
+`<thinking>`, `<severity>N</severity>` (integer 0–100), and optional category.
+The client removes closed thinking spans before reading the verdict. The July
+block XML sample above remains historical; it has not been replaced by invented
+full policy text. Sanitized shape fixtures live in `tests/e2e.rs`
+(`auto_classifier_request` / `auto_classifier_stage_two_streaming_and_nonstreaming_preserve_real_verdict`).
+For known GPT main sessions, the [monitor adapter](../provider-compatibility.md#claude-code-auto-mode-monitors)
+routes both stages to Luna while preserving these output boundaries.
 
 ---
 

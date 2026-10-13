@@ -735,11 +735,15 @@ async fn expired_token_refreshes_once_for_concurrent_requests_and_persists() {
 
     let mock = MockUpstream::spawn().await;
     mock.set_token_delay(Duration::from_millis(200)); // widen the race window
-    let proxy = Proxy::spawn(
-        &mock.base_url(),
-        vec![oauth_account_expiring("a", "at-stale", 1_000)], // long expired
-    )
-    .await;
+    let mut config = Config {
+        upstream: mock.base_url(),
+        accounts: vec![oauth_account_expiring("a", "at-stale", 1_000)], // long expired
+        ..Default::default()
+    };
+    // Count request-owned refreshes only. The mock returns a 1h token, inside
+    // the default 7h background window; a later first sweep could refresh again.
+    config.scheduler.refresh_ahead_secs = 0;
+    let proxy = Proxy::spawn_config(config).await;
 
     let client = reqwest::Client::new();
     let url = proxy.url("/v1/messages");
@@ -1327,6 +1331,110 @@ async fn codex_account_aggregates_non_streaming_requests() {
     assert_eq!(message["usage"]["output_tokens"], 11);
 }
 
+/// Claude Code auto mode's server-side tool-use review request, as a body
+/// fragment. `stream` is spliced in so the same request drives both legs.
+fn safeguarded_request(stream: bool, safeguards: bool) -> String {
+    let safeguards = if safeguards {
+        r#","safeguards":[{"type":"dangerous_tool_use","classifier_context":{}}]"#
+    } else {
+        ""
+    };
+    format!(
+        r#"{{"model":"claude-sonnet-4-5","max_tokens":1024,"stream":{stream},
+            "messages":[{{"role":"user","content":"weather in Seoul?"}}]{safeguards}}}"#
+    )
+}
+
+/// The only honest answer a translated backend can give: review `available`,
+/// every tool call per-call `unavailable` (`unsupported`) so the client
+/// classifies that call locally without latching the session, never an
+/// invented verdict.
+fn unavailable_call_w1() -> serde_json::Value {
+    serde_json::json!([{
+        "type": "dangerous_tool_use",
+        "status": {
+            "type": "available",
+            "tool_uses": {"call_w1": {"type": "unavailable", "reason": "unsupported"}},
+        },
+    }])
+}
+
+/// A codex-served streaming turn answers a `dangerous_tool_use` safeguard on
+/// its terminal `message_delta`, so the client does not latch the session to
+/// local classification.
+#[tokio::test]
+async fn codex_stream_answers_requested_safeguards_with_unavailable() {
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::sse_plain(CODEX_RESPONSES_SSE, 9));
+    let proxy =
+        Proxy::spawn_config(codex_config(&mock, vec![codex_account("cx", "at-codex")])).await;
+
+    let client = reqwest::Client::new();
+    let response = post_messages(&client, &proxy, &safeguarded_request(true, true)).await;
+    assert_eq!(response.status(), 200);
+    let body = String::from_utf8(response.bytes().await.expect("body").to_vec()).expect("utf8");
+    let events = parse_anthropic_sse(&body);
+    let delta = &events
+        .iter()
+        .find(|(t, _)| t == "message_delta")
+        .unwrap_or_else(|| panic!("no message_delta in:\n{body}"))
+        .1["delta"];
+    assert_eq!(delta["stop_reason"], "tool_use");
+    assert_eq!(
+        delta["safeguard_results"],
+        unavailable_call_w1(),
+        "full body:\n{body}"
+    );
+}
+
+/// Non-stream twin: the aggregate carries a top-level `safeguard_results`.
+#[tokio::test]
+async fn codex_aggregate_answers_requested_safeguards_with_unavailable() {
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::sse_plain(CODEX_RESPONSES_SSE, 16));
+    let proxy =
+        Proxy::spawn_config(codex_config(&mock, vec![codex_account("cx", "at-codex")])).await;
+
+    let client = reqwest::Client::new();
+    let response = post_messages(&client, &proxy, &safeguarded_request(false, true)).await;
+    assert_eq!(response.status(), 200);
+    let message: serde_json::Value = response.json().await.expect("json");
+    assert_eq!(message["content"][1]["id"], "call_w1");
+    assert_eq!(
+        message["safeguard_results"],
+        unavailable_call_w1(),
+        "{message}"
+    );
+}
+
+/// Without a safeguard in the request, neither leg grows the field.
+#[tokio::test]
+async fn codex_without_safeguards_emits_no_safeguard_results() {
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::sse_plain(CODEX_RESPONSES_SSE, 9));
+    mock.push(ScriptedResponse::sse_plain(CODEX_RESPONSES_SSE, 16));
+    let proxy =
+        Proxy::spawn_config(codex_config(&mock, vec![codex_account("cx", "at-codex")])).await;
+
+    let client = reqwest::Client::new();
+    let response = post_messages(&client, &proxy, &safeguarded_request(true, false)).await;
+    assert_eq!(response.status(), 200);
+    let body = String::from_utf8(response.bytes().await.expect("body").to_vec()).expect("utf8");
+    assert!(
+        parse_anthropic_sse(&body)
+            .iter()
+            .any(|(t, _)| t == "message_delta"),
+        "stream completed:\n{body}"
+    );
+    assert!(!body.contains("safeguard_results"), "full body:\n{body}");
+
+    let response = post_messages(&client, &proxy, &safeguarded_request(false, false)).await;
+    assert_eq!(response.status(), 200);
+    let message: serde_json::Value = response.json().await.expect("json");
+    assert_eq!(message["stop_reason"], "tool_use");
+    assert!(message.get("safeguard_results").is_none(), "{message}");
+}
+
 /// The codex twin of `client_context_window_suffix_is_stripped_before_upstream`:
 /// a raw client (curl / an SDK) sends the `[1m]` context-window annotation
 /// VERBATIM — Claude Code strips it client-side, nothing else does. Without the
@@ -1372,11 +1480,11 @@ async fn codex_401_refreshes_once_and_retries() {
     let mock = MockUpstream::spawn().await;
     mock.push(ScriptedResponse::AuthRejected);
     mock.push(ScriptedResponse::sse_plain(CODEX_RESPONSES_SSE, 32));
-    let proxy = Proxy::spawn_config(codex_config(
-        &mock,
-        vec![codex_account("cx", "at-codex-stale")],
-    ))
-    .await;
+    let mut config = codex_config(&mock, vec![codex_account("cx", "at-codex-stale")]);
+    // Keep this 401 contract independent of the startup background sweep. The
+    // refreshed mock token lasts 1h, less than the default 7h refresh-ahead window.
+    config.scheduler.refresh_ahead_secs = 0;
+    let proxy = Proxy::spawn_config(config).await;
 
     let client = reqwest::Client::new();
     let response = post_messages(
@@ -1446,7 +1554,7 @@ async fn codex_count_tokens_is_estimated_locally() {
     );
 
     let response = client
-        .get(proxy.url("/v1/models"))
+        .get(proxy.url("/v1/unsupported"))
         .send()
         .await
         .expect("reachable");
@@ -1457,8 +1565,8 @@ async fn codex_count_tokens_is_estimated_locally() {
     );
 }
 
-/// PROXY-17 / PROV-19: a codex account only serves `/v1/messages`. Any other
-/// path (here `/v1/models`) is refused locally with HTTP 501 and never reaches
+/// PROXY-17 / PROV-19: the legacy Codex Messages adapter accepts only its supported data routes. Any other
+/// path (here `/v1/unsupported`) is refused locally with HTTP 501 and never reaches
 /// the codex upstream. Focused regression anchor for the `path != "/v1/messages"`
 /// branch (forward.rs), independent of the count_tokens path.
 #[tokio::test]
@@ -1469,7 +1577,7 @@ async fn codex_non_messages_endpoint_is_501_without_upstream_call() {
 
     let client = reqwest::Client::new();
     let response = client
-        .get(proxy.url("/v1/models"))
+        .get(proxy.url("/v1/unsupported"))
         .send()
         .await
         .expect("reachable");
@@ -4929,4 +5037,1281 @@ async fn session_header_is_not_forwarded_on_the_grok_path() {
     .await;
     assert_session_header_not_forwarded(&mock, "grok");
     assert!(mock.seen()[0].path.ends_with("/responses"), "grok leg");
+}
+
+// .prd/codex-frontend/trace.md T1: full native protocol survives the real HTTP boundary.
+#[tokio::test]
+async fn responses_native_preserves_custom_tools_reasoning_and_usage() {
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::sse_codex(CODEX_RESPONSES_SSE, 7, &[]));
+    let proxy =
+        Proxy::spawn_config(codex_config(&mock, vec![codex_account("cx", "at-codex")])).await;
+    let body = serde_json::json!({"model":"gpt-6-astra","stream":true,"store":false,"input":[{"type":"additional_tools","role":"developer","tools":[{"type":"namespace","name":"functions","tools":[{"type":"custom","name":"exec"}]}]},{"type":"reasoning","encrypted_content":"opaque"},{"role":"user","content":"hi"},{"type":"custom_tool_call","call_id":"c1","name":"apply_patch","input":"patch"},{"type":"custom_tool_call_output","call_id":"c1","output":"ok"}],"tools":[{"type":"custom","name":"apply_patch"}],"reasoning":{"effort":"high"}});
+    let response = reqwest::Client::new()
+        .post(proxy.url("/v1/responses"))
+        .bearer_auth(E2E_ADMIN_KEY)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert!(!response.headers().contains_key("x-llmux-native-responses"));
+    assert_eq!(response.text().await.unwrap(), CODEX_RESPONSES_SSE);
+    let requests = mock.seen();
+    assert_eq!(requests.len(), 1);
+    let upstream: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(upstream["input"], body["input"]);
+    assert_eq!(upstream["tools"], body["tools"]);
+    assert_eq!(upstream["reasoning"], body["reasoning"]);
+    assert_eq!(
+        requests[0].authorization.as_deref().unwrap(),
+        "Bearer at-codex"
+    );
+}
+
+#[tokio::test]
+async fn responses_rejects_bad_bearer_and_invalid_stored_history_without_upstream() {
+    let mock = MockUpstream::spawn().await;
+    let proxy =
+        Proxy::spawn_config(codex_config(&mock, vec![codex_account("cx", "at-codex")])).await;
+    let client = reqwest::Client::new();
+    for authorization in ["Basic invalid", "Bearer invalid", "Bearer "] {
+        let r = client
+            .post(proxy.url("/v1/responses"))
+            .header("authorization", authorization)
+            .json(&serde_json::json!({"model":"sol","input":"hi"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 401, "{authorization}");
+    }
+    let r = client
+        .post(proxy.url("/v1/responses"))
+        .bearer_auth(E2E_ADMIN_KEY)
+        .header("x-api-key", "different")
+        .json(&serde_json::json!({"model":"sol","input":"hi"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 401);
+    let r = client
+        .post(proxy.url("/v1/responses"))
+        .bearer_auth(E2E_ADMIN_KEY)
+        .json(&serde_json::json!({"model":"sol","input":"hi","previous_response_id":"r1"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+    assert!(mock.seen().is_empty());
+}
+
+#[tokio::test]
+async fn responses_nonstream_aggregates_real_terminal_envelope() {
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::sse_codex(CODEX_RESPONSES_SSE, 3, &[]));
+    let proxy =
+        Proxy::spawn_config(codex_config(&mock, vec![codex_account("cx", "at-codex")])).await;
+    let r = reqwest::Client::new()
+        .post(proxy.url("/v1/responses"))
+        .bearer_auth(E2E_ADMIN_KEY)
+        .json(&serde_json::json!({"model":"sol","input":"hi","stream":false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let value: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(value["id"], "resp_e2e");
+    assert_eq!(value["usage"]["output_tokens"], 11);
+}
+
+#[tokio::test]
+async fn responses_disconnect_releases_lease_without_waiting_for_idle_timeout() {
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::SseThenStall{prefix:"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"r1\"}}\n\n".into()});
+    let proxy =
+        Proxy::spawn_config(codex_config(&mock, vec![codex_account("cx", "at-codex")])).await;
+    let r = reqwest::Client::new()
+        .post(proxy.url("/v1/responses"))
+        .bearer_auth(E2E_ADMIN_KEY)
+        .json(&serde_json::json!({"model":"sol","input":"hi","stream":true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(proxy.pool.snapshot().accounts[0].in_flight, 1);
+    drop(r);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while proxy.pool.snapshot().accounts[0].in_flight != 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("disconnect releases the account before the 120s idle timer");
+}
+
+#[tokio::test]
+async fn responses_native_cap_is_reported_or_rejected_under_strict() {
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::sse_codex(CODEX_RESPONSES_SSE, 7, &[]));
+    let proxy =
+        Proxy::spawn_config(codex_config(&mock, vec![codex_account("cx", "at-codex")])).await;
+    let client = reqwest::Client::new();
+    let body = serde_json::json!({"model":"sol","input":"hi","max_output_tokens":20});
+    let r = client
+        .post(proxy.url("/v1/responses"))
+        .bearer_auth(E2E_ADMIN_KEY)
+        .header("x-llmux-compatibility", "strict")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+    assert!(mock.seen().is_empty());
+    let r = client
+        .post(proxy.url("/v1/responses"))
+        .bearer_auth(E2E_ADMIN_KEY)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.headers()["x-llmux-omitted-fields"], "max_output_tokens");
+    let _ = r.bytes().await.unwrap();
+    let sent: serde_json::Value = serde_json::from_slice(&mock.seen()[0].body).unwrap();
+    assert!(sent.get("max_output_tokens").is_none());
+    assert_eq!(sent["input"][0]["content"][0]["text"], "hi");
+}
+
+#[tokio::test]
+async fn responses_native_aggregate_uses_done_items_when_terminal_output_is_empty() {
+    let mock = MockUpstream::spawn().await;
+    let events=concat!("data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"m1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"real answer\"}]}}\n\n","data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}}\n\n");
+    mock.push(ScriptedResponse::sse_codex(events, 5, &[]));
+    let proxy =
+        Proxy::spawn_config(codex_config(&mock, vec![codex_account("cx", "at-codex")])).await;
+    let r = reqwest::Client::new()
+        .post(proxy.url("/v1/responses"))
+        .bearer_auth(E2E_ADMIN_KEY)
+        .json(&serde_json::json!({"model":"sol","input":"hi"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let response: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(response["output"][0]["content"][0]["text"], "real answer");
+}
+
+// Sanitized wire shape captured on 2026-10-07, Claude Code 2.1.292.
+// Policy/transcript content is deliberately synthetic; no real commands or secrets.
+fn auto_classifier_request(session: &str, stream: bool) -> serde_json::Value {
+    serde_json::json!({
+        "model": "claude-sonnet-5[1m]", "max_tokens": 64, "stream": stream,
+        "metadata": {"user_id": session}, "thinking": {"type": "disabled"},
+        "stop_sequences": ["</severity>"],
+        "system": [{"type":"text","text":"You are a security monitor for autonomous AI coding agents. Output <severity>N</severity> where N is an integer 0-100 and 50 is exactly the allow/block boundary."}],
+        "messages": [{"role":"user","content":"<transcript>Read a fixture.</transcript> Stage 1 does NOT apply user intent or ALLOW exceptions — stage 2 will handle those. Respond with <severity>N</severity> ONLY. Grade HARM ONLY — do NOT reduce for user intent. No other text."}]
+    })
+}
+
+fn auto_main_request(session: &str, model: &str) -> serde_json::Value {
+    serde_json::json!({
+        "model": model, "metadata":{"user_id":session},
+        "system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.290; cc_entrypoint=cli;"},
+            {"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."}],
+        "tools":[{"name":"Read","description":"Read a fixture","input_schema":{"type":"object"}}],
+        "messages":[{"role":"user","content":"Read the fixture"}]
+    })
+}
+
+fn classifier_response_sse(text: &str) -> String {
+    use serde_json::json;
+    [json!({"type":"response.created","response":{"id":"resp_classifier"}}),
+     json!({"type":"response.output_item.added","item":{"type":"message","role":"assistant"}}),
+     json!({"type":"response.output_text.delta","delta":text}),
+     json!({"type":"response.output_item.done","item":{"type":"message"}}),
+     json!({"type":"response.completed","response":{"id":"resp_classifier","usage":{"input_tokens":100,"output_tokens":7}}})]
+     .iter().map(|v|format!("event: {}\ndata: {}\n\n",v["type"].as_str().unwrap(),v)).collect()
+}
+
+#[tokio::test]
+async fn auto_classifier_gpt_session_routes_luna_and_preserves_severity_stop() {
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::sse_plain(
+        &classifier_response_sse("Working."),
+        128,
+    ));
+    mock.push(ScriptedResponse::sse_plain(
+        &classifier_response_sse("<severity>5</severity>"),
+        11,
+    ));
+    let mut config = routing_config(&mock, vec![codex_account("cx", "at-codex")], "error");
+    config.codex.reasoning_effort = Some("ultra".into());
+    let proxy = Proxy::spawn_config(config).await;
+    let client = reqwest::Client::new();
+    let main = post_messages(
+        &client,
+        &proxy,
+        &auto_main_request("session-a", "sol").to_string(),
+    )
+    .await;
+    assert_eq!(main.status(), 200);
+    main.bytes().await.unwrap();
+    let response = post_messages(
+        &client,
+        &proxy,
+        &auto_classifier_request("session-a", false).to_string(),
+    )
+    .await;
+    let status = response.status();
+    let message: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(
+        status, 200,
+        "classifier must work with NO Claude account: {message}"
+    );
+    assert_eq!(message["content"][0]["text"], "<severity>5");
+    assert_eq!(message["stop_reason"], "stop_sequence");
+    assert_eq!(message["stop_sequence"], "</severity>");
+    let seen = mock.seen();
+    assert_eq!(seen.len(), 2);
+    let body: serde_json::Value = serde_json::from_slice(&seen[1].body).unwrap();
+    assert_eq!(body["model"], "gpt-6-luna");
+    assert_eq!(body["reasoning"]["effort"], "medium");
+    assert_eq!(seen[1].authorization.as_deref(), Some("Bearer at-codex"));
+}
+
+#[tokio::test]
+async fn auto_classifier_stage_two_streaming_and_nonstreaming_preserve_real_verdict() {
+    for stream in [false, true] {
+        let mock = MockUpstream::spawn().await;
+        mock.push(ScriptedResponse::sse_plain(
+            &classifier_response_sse("Working."),
+            128,
+        ));
+        let verdict="<thinking>Unrequested deletion is harmful.</thinking><severity>95</severity><category>Delete Important Data</category>";
+        mock.push(ScriptedResponse::sse_plain(
+            &classifier_response_sse(verdict),
+            7,
+        ));
+        let proxy = Proxy::spawn_config(routing_config(
+            &mock,
+            vec![codex_account("cx", "at")],
+            "error",
+        ))
+        .await;
+        let client = reqwest::Client::new();
+        post_messages(
+            &client,
+            &proxy,
+            &auto_main_request("s", "gpt-5.6-sol").to_string(),
+        )
+        .await
+        .bytes()
+        .await
+        .unwrap();
+        let mut request = auto_classifier_request("s", stream);
+        request.as_object_mut().unwrap().remove("stop_sequences");
+        request["max_tokens"] = serde_json::json!(8192);
+        request["messages"][0]["content"]=serde_json::json!("Use <thinking> first, then respond with <severity>N</severity>, plus <category>Exact BLOCK Rule Name</category> when a BLOCK rule matches.");
+        let response = post_messages(&client, &proxy, &request.to_string()).await;
+        assert_eq!(response.status(), 200);
+        if stream {
+            assert_eq!(response.headers()["content-type"], "text/event-stream");
+            let events = parse_anthropic_sse(&response.text().await.unwrap());
+            assert_eq!(
+                events
+                    .iter()
+                    .find(|(t, _)| t == "content_block_delta")
+                    .unwrap()
+                    .1["delta"]["text"],
+                verdict
+            );
+            let delta = &events.iter().find(|(t, _)| t == "message_delta").unwrap().1["delta"];
+            assert_eq!(delta["stop_reason"], "end_turn");
+            assert!(delta["stop_sequence"].is_null());
+        } else {
+            let message: serde_json::Value = response.json().await.unwrap();
+            assert_eq!(message["content"][0]["text"], verdict);
+            assert_eq!(message["stop_reason"], "end_turn");
+        }
+        let upstream: serde_json::Value = serde_json::from_slice(&mock.seen()[1].body).unwrap();
+        assert_eq!(upstream["model"], "gpt-6-luna");
+    }
+}
+
+#[tokio::test]
+async fn auto_classifier_streaming_stage_one_and_raw_provenance() {
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::sse_plain(
+        &classifier_response_sse("Working."),
+        128,
+    ));
+    mock.push(ScriptedResponse::sse_plain(
+        &classifier_response_sse("<severity>90</severity>"),
+        3,
+    ));
+    let proxy = Proxy::spawn_config(routing_config(
+        &mock,
+        vec![codex_account("cx", "at")],
+        "error",
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    post_messages(&client, &proxy, &auto_main_request("s", "sol").to_string())
+        .await
+        .bytes()
+        .await
+        .unwrap();
+    let response = post_messages(
+        &client,
+        &proxy,
+        &auto_classifier_request("s", true).to_string(),
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    assert!(response.headers()["x-llmux-compatibility-warnings"]
+        .to_str()
+        .unwrap()
+        .contains("classifier_local_stop"));
+    let events = parse_anthropic_sse(&response.text().await.unwrap());
+    assert_eq!(
+        events
+            .iter()
+            .find(|(t, _)| t == "content_block_delta")
+            .unwrap()
+            .1["delta"]["text"],
+        "<severity>90"
+    );
+    let delta = &events.iter().find(|(t, _)| t == "message_delta").unwrap().1["delta"];
+    assert_eq!(delta["stop_reason"], "stop_sequence");
+    assert_eq!(delta["stop_sequence"], "</severity>");
+    let path = proxy._tmp.path().join("raw-io.jsonl");
+    let record = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Ok(raw) = std::fs::read_to_string(&path) {
+                if let Some(record) = raw
+                    .lines()
+                    .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                    .find(|r| r["model"] == "gpt-6-luna")
+                {
+                    break record;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let original: serde_json::Value =
+        serde_json::from_str(record["request_body"].as_str().unwrap()).unwrap();
+    assert_eq!(original["model"], "claude-sonnet-5[1m]");
+    assert_eq!(original["stop_sequences"][0], "</severity>");
+    let upstream: serde_json::Value =
+        serde_json::from_str(record["upstream"]["request_body"].as_str().unwrap()).unwrap();
+    assert_eq!(upstream["model"], "gpt-6-luna");
+    assert_eq!(upstream["reasoning"]["effort"], "medium");
+}
+
+#[tokio::test]
+async fn auto_classifier_invalid_outputs_fail_before_streaming_any_verdict() {
+    for text in [
+        "<severity>0",
+        "<severity>101</severity>",
+        "<thinking>unfinished <severity>0</severity>",
+        "",
+    ] {
+        let mock = MockUpstream::spawn().await;
+        mock.push(ScriptedResponse::sse_plain(
+            &classifier_response_sse("Working."),
+            128,
+        ));
+        mock.push(ScriptedResponse::sse_plain(
+            &classifier_response_sse(text),
+            128,
+        ));
+        let proxy = Proxy::spawn_config(routing_config(
+            &mock,
+            vec![codex_account("cx", "at")],
+            "error",
+        ))
+        .await;
+        let client = reqwest::Client::new();
+        post_messages(&client, &proxy, &auto_main_request("s", "sol").to_string())
+            .await
+            .bytes()
+            .await
+            .unwrap();
+        let response = post_messages(
+            &client,
+            &proxy,
+            &auto_classifier_request("s", true).to_string(),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            502,
+            "must not emit success SSE for {text}"
+        );
+        let message: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(message["type"], "error");
+        assert!(message.get("content").is_none());
+    }
+}
+
+#[tokio::test]
+async fn auto_classifier_unknown_session_other_endpoint_and_disabled_routing_are_unchanged() {
+    let client = reqwest::Client::new();
+    // Unknown main model / daemon restart must never use another session's GPT.
+    let mock = MockUpstream::spawn().await;
+    let proxy = Proxy::spawn_config(routing_config(
+        &mock,
+        vec![codex_account("cx", "at")],
+        "error",
+    ))
+    .await;
+    let response = post_messages(
+        &client,
+        &proxy,
+        &auto_classifier_request("unknown", false).to_string(),
+    )
+    .await;
+    assert_eq!(response.status(), 404);
+    assert!(mock.seen().is_empty());
+    // A count probe with a main-looking body must not seed session state.
+    let response = client
+        .post(proxy.url("/v1/messages/count_tokens"))
+        .header("x-api-key", "client-supplied-key")
+        .json(&auto_main_request("s", "sol"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        post_messages(
+            &client,
+            &proxy,
+            &auto_classifier_request("s", false).to_string()
+        )
+        .await
+        .status(),
+        404
+    );
+    // Legacy routing-disabled path stays untouched, including a monitor after GPT.
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::sse_plain(
+        &classifier_response_sse("Working."),
+        128,
+    ));
+    let mut config = routing_config(&mock, vec![codex_account("cx", "at")], "error");
+    config.routing.enabled = false;
+    let proxy = Proxy::spawn_config(config).await;
+    post_messages(&client, &proxy, &auto_main_request("s", "sol").to_string())
+        .await
+        .bytes()
+        .await
+        .unwrap();
+    let response = post_messages(
+        &client,
+        &proxy,
+        &auto_classifier_request("s", false).to_string(),
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        400,
+        "generic Codex stop refusal must remain"
+    );
+    assert_eq!(mock.seen().len(), 1);
+}
+
+#[tokio::test]
+async fn auto_classifier_strict_policy_and_generic_stop_refusal_remain() {
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::sse_plain(
+        &classifier_response_sse("Working."),
+        128,
+    ));
+    let proxy = Proxy::spawn_config(routing_config(
+        &mock,
+        vec![codex_account("cx", "at")],
+        "error",
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    post_messages(&client, &proxy, &auto_main_request("s", "sol").to_string())
+        .await
+        .bytes()
+        .await
+        .unwrap();
+    let response = client
+        .post(proxy.url("/v1/messages"))
+        .header("x-api-key", "client-supplied-key")
+        .header("x-llmux-compatibility", "strict")
+        .json(&auto_classifier_request("s", false))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 400);
+    assert_eq!(mock.seen().len(), 1);
+    let mut normal = auto_main_request("s", "sol");
+    normal["stop_sequences"] = serde_json::json!(["</severity>"]);
+    assert_eq!(
+        post_messages(&client, &proxy, &normal.to_string())
+            .await
+            .status(),
+        400
+    );
+    assert_eq!(mock.seen().len(), 1);
+}
+
+#[tokio::test]
+async fn auto_classifier_subagent_does_not_undo_main_switchback() {
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::sse_plain(
+        &classifier_response_sse("Working."),
+        128,
+    ));
+    mock.push(ScriptedResponse::ok(MockUpstream::DEFAULT_OK));
+    mock.push(ScriptedResponse::sse_plain(
+        &classifier_response_sse("Working."),
+        128,
+    ));
+    mock.push(ScriptedResponse::ok(r#"{"type":"message","role":"assistant","content":[{"type":"text","text":"<severity>7"}],"stop_reason":"stop_sequence","stop_sequence":"</severity>","usage":{"input_tokens":1,"output_tokens":1}}"#));
+    let proxy = Proxy::spawn_config(routing_config(
+        &mock,
+        vec![
+            codex_account("cx", "at-codex"),
+            oauth_account("cl", "at-claude"),
+        ],
+        "error",
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    for request in [
+        auto_main_request("s", "sol"),
+        auto_main_request("s", "claude-sonnet-5"),
+    ] {
+        let response = post_messages(&client, &proxy, &request.to_string()).await;
+        assert_eq!(response.status(), 200);
+        response.bytes().await.unwrap();
+    }
+    let mut sub = auto_main_request("s", "sol");
+    sub["system"][0]["text"] = serde_json::json!("cc_is_subagent=true");
+    post_messages(&client, &proxy, &sub.to_string())
+        .await
+        .bytes()
+        .await
+        .unwrap();
+    let response = post_messages(
+        &client,
+        &proxy,
+        &auto_classifier_request("s", false).to_string(),
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    response.bytes().await.unwrap();
+    assert_eq!(
+        mock.seen()[3].authorization.as_deref(),
+        Some("Bearer at-claude")
+    );
+}
+
+#[tokio::test]
+async fn auto_classifier_failed_incomplete_and_oversize_streams_never_expose_verdict() {
+    let completed = classifier_response_sse("<severity>0</severity>");
+    let prefix = completed.split("event: response.completed").next().unwrap();
+    let failed=format!("{prefix}event: response.failed\ndata: {{\"type\":\"response.failed\",\"response\":{{\"error\":{{\"message\":\"fixture failure\"}}}}}}\n\n");
+    let incomplete=format!("{prefix}event: response.incomplete\ndata: {{\"type\":\"response.incomplete\",\"response\":{{\"incomplete_details\":{{\"reason\":\"max_output_tokens\"}}}}}}\n\n");
+    let oversized = classifier_response_sse(&format!(
+        "<severity>0</severity>{}",
+        "x".repeat(1024 * 1024)
+    ));
+    for body in [prefix.to_string(), failed, incomplete, oversized] {
+        let mock = MockUpstream::spawn().await;
+        mock.push(ScriptedResponse::sse_plain(
+            &classifier_response_sse("Working."),
+            128,
+        ));
+        mock.push(ScriptedResponse::sse_plain(&body, 256 * 1024));
+        let proxy = Proxy::spawn_config(routing_config(
+            &mock,
+            vec![codex_account("cx", "at")],
+            "error",
+        ))
+        .await;
+        let client = reqwest::Client::new();
+        post_messages(&client, &proxy, &auto_main_request("s", "sol").to_string())
+            .await
+            .bytes()
+            .await
+            .unwrap();
+        let response = post_messages(
+            &client,
+            &proxy,
+            &auto_classifier_request("s", true).to_string(),
+        )
+        .await;
+        assert_eq!(response.status(), 502);
+        let message: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(message["type"], "error");
+        assert!(message.get("content").is_none());
+    }
+}
+
+#[tokio::test]
+async fn auto_classifier_codex_unavailable_never_falls_back_to_claude() {
+    for empty in [false, true] {
+        let mock = MockUpstream::spawn().await;
+        mock.push(ScriptedResponse::sse_plain(
+            &classifier_response_sse("Working."),
+            128,
+        ));
+        let claude = oauth_account("cl", "at-claude");
+        let proxy = Proxy::spawn_config(routing_config(
+            &mock,
+            vec![codex_account("cx", "at-codex"), claude.clone()],
+            "fallback",
+        ))
+        .await;
+        let client = reqwest::Client::new();
+        post_messages(&client, &proxy, &auto_main_request("s", "sol").to_string())
+            .await
+            .bytes()
+            .await
+            .unwrap();
+        if empty {
+            proxy.pool.reload_accounts(&[claude]);
+        } else {
+            proxy.pool.record_429(
+                &AccountId("cx".into()),
+                Some(Duration::from_secs(600)),
+                SystemTime::now(),
+            );
+        }
+        let response = post_messages(
+            &client,
+            &proxy,
+            &auto_classifier_request("s", false).to_string(),
+        )
+        .await;
+        assert_eq!(response.status(), if empty { 404 } else { 429 });
+        assert_eq!(
+            mock.seen().len(),
+            1,
+            "must not use available Claude account"
+        );
+    }
+}
+
+#[tokio::test]
+async fn auto_classifier_silent_stream_errors_without_success_verdict() {
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::sse_plain(
+        &classifier_response_sse("Working."),
+        128,
+    ));
+    let prefix = classifier_response_sse("<severity>0</severity>")
+        .split("event: response.completed")
+        .next()
+        .unwrap()
+        .to_string();
+    mock.push(ScriptedResponse::SseThenStall { prefix });
+    let mut config = routing_config(&mock, vec![codex_account("cx", "at")], "error");
+    config.proxy.forward_idle_timeout_secs = 1;
+    let proxy = Proxy::spawn_config(config).await;
+    let client = reqwest::Client::new();
+    post_messages(&client, &proxy, &auto_main_request("s", "sol").to_string())
+        .await
+        .bytes()
+        .await
+        .unwrap();
+    let response = tokio::time::timeout(
+        Duration::from_secs(3),
+        post_messages(
+            &client,
+            &proxy,
+            &auto_classifier_request("s", true).to_string(),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), 502);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["type"], "error");
+    assert!(body.get("content").is_none());
+}
+
+/// Exercise Rust's real subprocess boundary without requiring npm or a paid
+/// account. The bridge's own tests separately verify SDK enums produce these
+/// envelopes; this fixture verifies lease/refresh/account semantics over HTTP.
+#[cfg(unix)]
+struct SdkProcessFixture {
+    dir: TempDir,
+    previous: Vec<(&'static str, Option<std::ffi::OsString>)>,
+}
+
+#[cfg(unix)]
+impl SdkProcessFixture {
+    fn new() -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new();
+        let package = dir
+            .path()
+            .join("node_modules/@anthropic-ai/claude-agent-sdk");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(package.join("package.json"), r#"{"version":"0.3.292"}"#).unwrap();
+        std::fs::write(package.join("sdk.mjs"), "// fixture only").unwrap();
+        let node = dir.path().join("fixture-node");
+        std::fs::write(
+            &node,
+            r#"#!/bin/sh
+base="$(dirname "$0")"
+payload=$(cat)
+case "$payload" in
+  *at-sdk-rejected*) printf '%s\n' rejected >> "$base/calls"; cat "$base/error" ;;
+  *) printf '%s\n' healthy >> "$base/calls"; cat "$base/success" ;;
+esac
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let frames = [
+            serde_json::json!({"type":"message_start","message":{"id":"msg_fixture","role":"assistant","content":[],"model":"claude-haiku-4-5","usage":{"input_tokens":7,"output_tokens":0}}}),
+            serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+            serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"healthy SDK account"}}),
+            serde_json::json!({"type":"content_block_stop","index":0}),
+            serde_json::json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":7,"output_tokens":3}}),
+            serde_json::json!({"type":"message_stop"}),
+        ];
+        let mut success = "{\"status\":200}\n".to_string();
+        for frame in frames {
+            success += &format!(
+                "event: {}\ndata: {frame}\n\n",
+                frame["type"].as_str().unwrap()
+            );
+        }
+        std::fs::write(dir.path().join("success"), success).unwrap();
+        let previous = ["LLMUX_NODE", "LLMUX_CLAUDE_SDK_DIR"]
+            .into_iter()
+            .map(|key| (key, std::env::var_os(key)))
+            .collect();
+        std::env::set_var("LLMUX_NODE", node);
+        std::env::set_var("LLMUX_CLAUDE_SDK_DIR", dir.path());
+        Self { dir, previous }
+    }
+
+    fn rejection(&self, code: &str, status: u16) {
+        let head = serde_json::json!({"status":status,"error_code":code});
+        let body = serde_json::json!({"type":"error","error":{"type":"api_error","message":format!("Claude Agent SDK request failed ({code}).")}});
+        std::fs::write(self.dir.path().join("error"), format!("{head}\n{body}")).unwrap();
+        std::fs::write(self.dir.path().join("calls"), "").unwrap();
+    }
+
+    fn calls(&self) -> String {
+        std::fs::read_to_string(self.dir.path().join("calls")).unwrap()
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SdkProcessFixture {
+    fn drop(&mut self) {
+        for (key, value) in &self.previous {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn responses_sdk_account_rejections_fail_over_without_refresh() {
+    let _lock = ENV_LOCK.lock().await;
+    let fixture = SdkProcessFixture::new();
+    for (code, status) in [
+        ("oauth_org_not_allowed", 403),
+        ("account_on_hold", 403),
+        ("verification_required", 403),
+        ("billing_error", 402),
+    ] {
+        fixture.rejection(code, status);
+        let mock = MockUpstream::spawn().await;
+        let proxy = Proxy::spawn(
+            &mock.base_url(),
+            vec![
+                oauth_account("a-rejected", "at-sdk-rejected"),
+                oauth_account("b-healthy", "at-sdk-healthy"),
+            ],
+        )
+        .await;
+        let response = reqwest::Client::new()
+            .post(proxy.url("/v1/responses"))
+            .bearer_auth(E2E_ADMIN_KEY)
+            .json(&serde_json::json!({"model":"claude-haiku-4-5","input":"hi"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "{code}");
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(
+            body["output"][0]["content"][0]["text"], "healthy SDK account",
+            "{code}"
+        );
+        assert_eq!(
+            fixture.calls(),
+            "rejected\nhealthy\n",
+            "same request must fail over exactly once: {code}"
+        );
+        assert_eq!(
+            mock.token_hits(),
+            0,
+            "account restrictions cannot be fixed by rotating OAuth tokens: {code}"
+        );
+        let accounts = proxy.pool.snapshot().accounts;
+        assert_eq!(accounts[0].auth_failure_status, Some(status));
+        for endpoint in ["/llmux/status", "/llmux/dashboard"] {
+            let doc: serde_json::Value = reqwest::Client::new()
+                .get(proxy.url(endpoint))
+                .header("x-api-key", E2E_ADMIN_KEY)
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let rejected = doc["accounts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|a| a["name"] == "a-rejected")
+                .unwrap();
+            assert_eq!(rejected["auth_failure_status"], status);
+            assert_eq!(rejected["blocked"], format!("! {status} auth X"));
+        }
+        assert!(
+            !accounts[0].healthy,
+            "rejected credential is excluded: {code}"
+        );
+        assert!(
+            accounts[1].healthy,
+            "healthy credential remains usable: {code}"
+        );
+        assert!(
+            accounts.iter().all(|a| a.in_flight == 0),
+            "leases released: {code}"
+        );
+        let persisted = config::load_path(&proxy.config_path).unwrap();
+        assert!(
+            matches!(&persisted.accounts[0].credential, AccountCredential::Oauth { access_token, .. } if access_token == "at-sdk-rejected")
+        );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn responses_sdk_other_errors_keep_request_and_refresh_semantics() {
+    let _lock = ENV_LOCK.lock().await;
+    let fixture = SdkProcessFixture::new();
+    for (code, status, expected) in [
+        ("invalid_request", 400, 400),
+        ("model_not_found", 404, 404),
+        ("unknown", 502, 502),
+        ("cloud_credential_error", 503, 502),
+        // An unrecognized SDK code must not turn a generic 403 into a ban.
+        ("unknown", 403, 403),
+        ("authentication_failed", 401, 200),
+    ] {
+        fixture.rejection(code, status);
+        let mock = MockUpstream::spawn().await;
+        let mut config = Config {
+            upstream: mock.base_url(),
+            accounts: vec![oauth_account("a", "at-sdk-rejected")],
+            ..Default::default()
+        };
+        // The 401 case counts request-owned refreshes, not a background sweep
+        // over the newly returned mock token's shorter lifetime.
+        config.scheduler.refresh_ahead_secs = 0;
+        let proxy = Proxy::spawn_config(config).await;
+        let response = reqwest::Client::new()
+            .post(proxy.url("/v1/responses"))
+            .bearer_auth(E2E_ADMIN_KEY)
+            .json(&serde_json::json!({"model":"claude-haiku-4-5","input":"hi"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected, "{code}/{status}");
+        let _ = response.bytes().await.unwrap();
+        let refreshed = code == "authentication_failed";
+        assert_eq!(mock.token_hits(), usize::from(refreshed), "{code}");
+        assert_eq!(
+            fixture.calls(),
+            if refreshed {
+                "rejected\nhealthy\n"
+            } else {
+                "rejected\n"
+            },
+            "{code}"
+        );
+        assert!(
+            proxy.pool.snapshot().accounts[0].healthy,
+            "do not bench a credential for request/transient failure: {code}"
+        );
+    }
+}
+
+// Sanitized shapes from Claude Code 2.1.292 captures #50/#55, 2026-10-07.
+fn internal_quota(session: &str) -> serde_json::Value {
+    serde_json::json!({"model":"haiku","max_tokens":1,"metadata":{"user_id":session},"messages":[{"role":"user","content":"quota"}]})
+}
+fn internal_title(session: &str, stream: bool) -> serde_json::Value {
+    serde_json::json!({"model":"haiku","max_tokens":32000,"stream":stream,"temperature":1,"thinking":{"type":"disabled"},"tools":[],"metadata":{"user_id":session},
+        "system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.292;"},{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."},{"type":"text","text":"You are naming a coding session so the user can pick it out of a long list of sessions. Return JSON with a single title field."}],
+        "messages":[{"role":"user","content":"<session>Inspect the fixture</session>\nWrite the title in the predominant language of the session."}],
+        "output_config":{"format":{"type":"json_schema","schema":llmux::proxy::internal_requests::title_schema()}}})
+}
+fn resolved_alias(alias: &str) -> String {
+    llmux::provider::codex::effective_request_meta(
+        &serde_json::json!({"model":alias}),
+        &llmux::provider::codex::CodexShape {
+            model: alias.into(),
+            client_model: None,
+            fast: false,
+            effort: None,
+        },
+    )
+    .0
+}
+#[tokio::test]
+async fn internal_routing_initial_quota_uses_validated_hint_and_real_codex_headers() {
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::sse_codex(
+        &classifier_response_sse("ok"),
+        128,
+        &[("x-codex-primary-used-percent", "23")],
+    ));
+    let mut config = routing_config(&mock, vec![codex_account("cx", "at-codex")], "error");
+    config.codex.reasoning_effort = Some("ultra".into());
+    config.codex.client_model = Some("global-override".into());
+    let proxy = Proxy::spawn_config(config).await;
+    let client = reqwest::Client::new();
+    let response = client
+        .post(proxy.url("/v1/messages"))
+        .header("x-api-key", "client-supplied-key")
+        .header("x-llmux-claude-launch-model", "sol")
+        .header("x-llmux-claude-launch-time", epoch_ms_now().to_string())
+        .json(&internal_quota("bootstrap"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["x-codex-primary-used-percent"], "23");
+    assert_eq!(response.headers()["x-llmux-quota-mode"], "availability");
+    assert!(!response
+        .headers()
+        .keys()
+        .any(|h| h.as_str().starts_with("anthropic-ratelimit")));
+    let message: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(message["model"], resolved_alias("luna"));
+    let seen = mock.seen();
+    let body: serde_json::Value = serde_json::from_slice(&seen[0].body).unwrap();
+    assert_eq!(body["model"], resolved_alias("luna"));
+    assert_eq!(body["reasoning"]["effort"], "low");
+    for hint in [None, Some("gpt-made-up"), Some("sol[1m][1m]")] {
+        let mut request = client
+            .post(proxy.url("/v1/messages"))
+            .header("x-api-key", "client-supplied-key")
+            .json(&internal_quota("bootstrap"));
+        if let Some(hint) = hint {
+            request = request.header("x-llmux-claude-launch-model", hint);
+        }
+        assert_eq!(
+            request.send().await.unwrap().status(),
+            404,
+            "hint must not create persistent session state"
+        );
+    }
+    for timestamp in [
+        None,
+        Some("0".to_string()),
+        Some((epoch_ms_now() + 60_000).to_string()),
+    ] {
+        let mut request = client
+            .post(proxy.url("/v1/messages"))
+            .header("x-api-key", "client-supplied-key")
+            .header("x-llmux-claude-launch-model", "sol")
+            .json(&internal_quota("expired"));
+        if let Some(timestamp) = timestamp {
+            request = request.header("x-llmux-claude-launch-time", timestamp);
+        }
+        assert_eq!(request.send().await.unwrap().status(), 404);
+    }
+    assert_eq!(mock.seen().len(), 1);
+}
+#[tokio::test]
+async fn internal_routing_title_schema_temperature_and_effective_model_both_legs() {
+    for stream in [false, true] {
+        let mock = MockUpstream::spawn().await;
+        for text in ["Working.", r#"{"title":"Fixture inspection"}"#] {
+            mock.push(ScriptedResponse::sse_plain(
+                &classifier_response_sse(text),
+                256,
+            ));
+        }
+        let mut config = routing_config(&mock, vec![codex_account("cx", "at-codex")], "error");
+        config.codex.client_model = Some("global-override".into());
+        config.claude_code.gpt_model_mapping.haiku = "terra".into();
+        let proxy = Proxy::spawn_config(config).await;
+        let client = reqwest::Client::new();
+        post_messages(
+            &client,
+            &proxy,
+            &auto_main_request("title-s", "sol").to_string(),
+        )
+        .await
+        .bytes()
+        .await
+        .unwrap();
+        let request = internal_title("title-s", stream);
+        let classified =
+            llmux::proxy::classify::classify("/v1/messages", request.to_string().as_bytes());
+        assert_eq!(classified.kind, "title");
+        let response = post_messages(&client, &proxy, &request.to_string()).await;
+        assert_eq!(response.status(), 200);
+        assert!(response.headers()["x-llmux-omitted-fields"]
+            .to_str()
+            .unwrap()
+            .contains("temperature"));
+        let text = response.text().await.unwrap();
+        assert!(text.contains(&resolved_alias("terra")), "{text}");
+        assert!(!text.contains("global-override"));
+        let body: serde_json::Value = serde_json::from_slice(&mock.seen()[1].body).unwrap();
+        assert_eq!(body["model"], resolved_alias("terra"));
+        assert_eq!(
+            body["text"]["format"]["schema"],
+            llmux::proxy::internal_requests::title_schema()
+        );
+        assert_eq!(body["text"]["format"]["strict"], true);
+        assert_eq!(body["reasoning"]["effort"], "low");
+        assert!(body.get("temperature").is_none());
+        let strict = client
+            .post(proxy.url("/v1/messages"))
+            .header("x-api-key", "client-supplied-key")
+            .header("x-llmux-compatibility", "strict")
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(strict.status(), 400);
+        let mut generic = auto_main_request("title-s", "sol");
+        generic["temperature"] = serde_json::json!(1);
+        assert_eq!(
+            post_messages(&client, &proxy, &generic.to_string())
+                .await
+                .status(),
+            400
+        );
+        assert_eq!(mock.seen().len(), 2);
+    }
+}
+#[tokio::test]
+async fn internal_routing_configured_tiers_and_security_override_do_not_hijack_main_switch() {
+    let mock = MockUpstream::spawn().await;
+    for _ in 0..4 {
+        mock.push(ScriptedResponse::sse_plain(
+            &classifier_response_sse("Working."),
+            256,
+        ));
+    }
+    mock.push(ScriptedResponse::sse_plain(
+        &classifier_response_sse("<severity>5</severity>"),
+        256,
+    ));
+    mock.push(ScriptedResponse::ok(MockUpstream::DEFAULT_OK));
+    mock.push(ScriptedResponse::ok(MockUpstream::DEFAULT_OK));
+    let mut config = routing_config(
+        &mock,
+        vec![
+            codex_account("cx", "at-codex"),
+            oauth_account("cl", "at-claude"),
+        ],
+        "error",
+    );
+    config.claude_code.gpt_model_mapping.opus = "luna".into();
+    config.claude_code.gpt_model_mapping.sonnet = "sol".into();
+    config.claude_code.gpt_model_mapping.haiku = "terra".into();
+    config.claude_code.auto_classifier_model = "terra".into();
+    let proxy = Proxy::spawn_config(config).await;
+    let client = reqwest::Client::new();
+    post_messages(
+        &client,
+        &proxy,
+        &auto_main_request("tiers", "sol").to_string(),
+    )
+    .await
+    .bytes()
+    .await
+    .unwrap();
+    for (tier, target) in [("opus", "luna"), ("sonnet", "sol"), ("haiku", "terra")] {
+        let mut worker = auto_main_request("tiers", tier);
+        worker["system"][0]["text"] =
+            serde_json::json!("x-anthropic-billing-header: cc_is_subagent=true;");
+        worker["output_config"] = serde_json::json!({"effort":"high"});
+        let response = post_messages(&client, &proxy, &worker.to_string()).await;
+        assert_eq!(response.status(), 200);
+        response.bytes().await.unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(&mock.seen().last().unwrap().body).unwrap();
+        assert_eq!(body["model"], resolved_alias(target));
+        assert_eq!(body["reasoning"]["effort"], "high");
+    }
+    let response = post_messages(
+        &client,
+        &proxy,
+        &auto_classifier_request("tiers", false).to_string(),
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    response.bytes().await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&mock.seen()[4].body).unwrap();
+    assert_eq!(body["model"], resolved_alias("terra"));
+    assert_eq!(body["reasoning"]["effort"], "medium");
+    // A human asking for the old title phrase is still an authoritative MAIN.
+    let mut main = auto_main_request("tiers", "sonnet");
+    main["messages"][0]["content"] = serde_json::json!("Write a 5-10 word title for my code");
+    let response = post_messages(&client, &proxy, &main.to_string()).await;
+    assert_eq!(response.status(), 200);
+    response.bytes().await.unwrap();
+    let response = client
+        .post(proxy.url("/v1/messages"))
+        .header("x-api-key", "client-supplied-key")
+        .header("x-llmux-claude-launch-model", "sol")
+        .header("x-llmux-claude-launch-time", epoch_ms_now().to_string())
+        .json(&internal_quota("tiers"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    response.bytes().await.unwrap();
+    let seen = mock.seen();
+    assert_eq!(seen.len(), 7);
+    assert_eq!(seen[5].authorization.as_deref(), Some("Bearer at-claude"));
+    assert_eq!(seen[6].authorization.as_deref(), Some("Bearer at-claude"));
+    assert!(seen.iter().all(|r| r.launch_model_hint.is_none()));
+}
+
+#[tokio::test]
+async fn internal_routing_unknown_session_pinned_count_and_disabled_are_unchanged() {
+    for disabled in [false, true] {
+        let mock = MockUpstream::spawn().await;
+        let mut config = routing_config(&mock, vec![codex_account("cx", "at-codex")], "error");
+        config.routing.enabled = !disabled;
+        let proxy = Proxy::spawn_config(config).await;
+        let client = reqwest::Client::new();
+        for path in ["/v1/messages", "/llmux/claude/v1/messages"] {
+            let response = client
+                .post(proxy.url(path))
+                .header("x-api-key", "client-supplied-key")
+                .header("x-llmux-claude-launch-model", "sol")
+                .header("x-llmux-claude-launch-time", "0")
+                .json(&internal_title("unknown", false))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                if path.starts_with("/llmux/") {
+                    403
+                } else if disabled {
+                    400
+                } else {
+                    404
+                }
+            ); // normal auth/compatibility contracts
+        }
+        let response = client
+            .post(proxy.url("/v1/messages/count_tokens"))
+            .header("x-api-key", "client-supplied-key")
+            .header("x-llmux-claude-launch-model", "sol")
+            .header("x-llmux-claude-launch-time", "0")
+            .json(&internal_quota("unknown"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), if disabled { 200 } else { 404 });
+        assert!(mock.seen().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn internal_routing_title_before_first_main_uses_fresh_hint_without_seeding_session() {
+    let mock = MockUpstream::spawn().await;
+    mock.push(ScriptedResponse::sse_plain(
+        &classifier_response_sse(r#"{"title":"Fixture inspection"}"#),
+        256,
+    ));
+    let mut config = routing_config(&mock, vec![codex_account("cx", "at-codex")], "error");
+    config.claude_code.gpt_model_mapping.haiku = "terra".into();
+    config.codex.client_model = Some("global-main-override".into());
+    let proxy = Proxy::spawn_config(config).await;
+    let client = reqwest::Client::new();
+    let title = internal_title("title-before-main", true);
+    let request = || {
+        client
+            .post(proxy.url("/v1/messages"))
+            .header("x-api-key", "client-supplied-key")
+            .json(&title)
+    };
+    // Real native race: title starts before any authoritative main execution.
+    let response = request()
+        .header("x-llmux-claude-launch-model", "sol")
+        .header("x-llmux-claude-launch-time", epoch_ms_now().to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        200,
+        "initial title must work with no Claude account"
+    );
+    let text = response.text().await.unwrap();
+    assert!(text.contains(&resolved_alias("terra")));
+    assert!(!text.contains("global-main-override"));
+    let seen = mock.seen();
+    let sent: serde_json::Value = serde_json::from_slice(&seen[0].body).unwrap();
+    assert_eq!(sent["model"], resolved_alias("terra"));
+    assert_eq!(
+        sent["text"]["format"]["schema"],
+        llmux::proxy::internal_requests::title_schema()
+    );
+    // Hint use must not seed session state. Missing/expired/unknown hints stay Claude.
+    for (model, time) in [
+        (None, None),
+        (Some("sol"), Some("0".to_string())),
+        (Some("gpt-unknown"), Some(epoch_ms_now().to_string())),
+    ] {
+        let mut call = request();
+        if let Some(model) = model {
+            call = call.header("x-llmux-claude-launch-model", model);
+        }
+        if let Some(time) = time {
+            call = call.header("x-llmux-claude-launch-time", time);
+        }
+        assert_eq!(call.send().await.unwrap().status(), 404);
+    }
+    // A known Claude main choice wins even over a still-fresh GPT launch hint.
+    let main = post_messages(
+        &client,
+        &proxy,
+        &auto_main_request("title-before-main", "sonnet").to_string(),
+    )
+    .await;
+    assert_eq!(main.status(), 404);
+    let response = request()
+        .header("x-llmux-claude-launch-model", "sol")
+        .header("x-llmux-claude-launch-time", epoch_ms_now().to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 404);
+    assert_eq!(mock.seen().len(), 1);
 }

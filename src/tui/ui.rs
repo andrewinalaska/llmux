@@ -2979,6 +2979,14 @@ fn config_rows(view: &DashboardView, chrome: &Chrome) -> Vec<CfgRow> {
         },
         CfgRow {
             section: "routing",
+            label: "Claude Code GPT mapping",
+            value: "config file".into(),
+            state: CfgState::ReadOnly,
+            note: "claude_code in config; restart required",
+            action: None,
+        },
+        CfgRow {
+            section: "routing",
             label: "model lists",
             value: "config file".into(),
             state: CfgState::ReadOnly,
@@ -3909,6 +3917,22 @@ fn account_modal_lines(
             super::view::reset_detail(None, account.credential_kind, now),
         )),
         Some(control) => {
+            if let Some(e) = &control.eligibility {
+                lines.push(modal_row(
+                    "eligible",
+                    format!(
+                        "{} · reason {} · weekly resets {}",
+                        e.eligible
+                            .map(|b| b.to_string())
+                            .unwrap_or_else(|| dash.clone()),
+                        e.ineligible_reason.clone().unwrap_or_else(|| dash.clone()),
+                        e.weekly_resets_at
+                            .as_deref()
+                            .map(|w| super::view::expiry_label(w, now))
+                            .unwrap_or_else(|| dash.clone()),
+                    ),
+                ));
+            }
             lines.push(modal_row(
                 "counts",
                 format!(
@@ -3941,7 +3965,11 @@ fn account_modal_lines(
                         field(&credit.reset_type),
                         field(&credit.status),
                         field(&credit.granted_at),
-                        field(&credit.expires_at),
+                        credit
+                            .expires_at
+                            .as_deref()
+                            .map(|e| super::view::expiry_label(e, now))
+                            .unwrap_or_else(|| dash.clone()),
                         field(&credit.title),
                         field(&credit.description),
                     ),
@@ -5250,7 +5278,7 @@ fn account_row<'a>(
 
 /// Status column: active (green) / ready (default) / the concrete blocking
 /// reason from the scheduler's own gate ("cooldown 3m12s", "7d 99.4% > 99%",
-/// "usage stale 14m", "auth failed") so the TUI never disagrees with the
+/// "usage stale 14m", "! 404 auth X") so the TUI never disagrees with the
 /// selector about WHY an account is parked.
 fn status_span(
     account: &AccountSnapshot,
@@ -5294,29 +5322,35 @@ fn status_span(
         );
     }
     let text = select::blocking_reason(account, reason, params, now);
-    // Each blocked state gets its own animated glyph so the WHY reads at a
-    // glance: blinking alert (auth), shade filling up (over quota), a rotating
-    // timer (cooldown), a faint drift (stale data), a steady held block
-    // (operator pause).
+    // Auth/pause labels already contain exactly the requested state markers.
+    // Other blocked states keep their existing animated glyphs.
     let (glyph, style) = match reason {
         IneligibleReason::AuthUnhealthy => (
-            anim::blink(frame, '!'),
+            None,
             Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
         ),
-        IneligibleReason::Paused => ('⠿', Style::new().fg(Color::Yellow)),
-        IneligibleReason::FiveHourOverThreshold | IneligibleReason::SevenDayOverThreshold => {
-            (anim::shade_breathe(frame), Style::new().fg(Color::Red))
-        }
+        IneligibleReason::Paused => (None, Style::new().fg(Color::Yellow)),
+        IneligibleReason::FiveHourOverThreshold | IneligibleReason::SevenDayOverThreshold => (
+            Some(anim::shade_breathe(frame)),
+            Style::new().fg(Color::Red),
+        ),
         IneligibleReason::CoolingDown | IneligibleReason::FableCoolingDown => (
-            anim::half_block_clock(frame),
+            Some(anim::half_block_clock(frame)),
             Style::new().fg(Color::Yellow),
         ),
-        IneligibleReason::FableWeeklyExhausted => {
-            (anim::shade_breathe(frame), Style::new().fg(Color::Red))
-        }
-        IneligibleReason::UsageStale => (anim::idle_drift(frame), dim()),
+        IneligibleReason::FableWeeklyExhausted => (
+            Some(anim::shade_breathe(frame)),
+            Style::new().fg(Color::Red),
+        ),
+        IneligibleReason::UsageStale => (Some(anim::idle_drift(frame)), dim()),
     };
-    Span::styled(format!("{glyph} {text}"), style)
+    Span::styled(
+        match glyph {
+            Some(glyph) => format!("{glyph} {text}"),
+            None => text,
+        },
+        style,
+    )
 }
 
 fn in_flight_span(in_flight: u32) -> Span<'static> {
@@ -6740,7 +6774,7 @@ fn draw_activity(
                     )));
                 }
             }
-            lines.push(Line::from(spans));
+            lines.push(endpoint_line(Line::from(spans), request.endpoint));
         }
     }
     // Completed entries, newest first, windowed by the scroll offset (req6:
@@ -6896,8 +6930,33 @@ fn draw_activity(
         format!(" activity — {} in flight ", in_flight.len())
     };
     let block = Block::new().borders(Borders::TOP).title(title);
+    // Paragraph styles graphemes, but resets wide-glyph continuation cells.
+    // Apply the row background to the final buffer so both those cells and
+    // the unused trailing width share the endpoint color.
+    let openai_rows: Vec<u16> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.style.bg == Some(OPENAI_ACTIVITY_BG))
+        .map(|(index, _)| body_top.saturating_add(index as u16))
+        .filter(|y| *y < area.bottom())
+        .collect();
     frame.render_widget(Paragraph::new(lines).block(block), area);
+    for y in openai_rows {
+        frame.buffer_mut().set_style(
+            Rect::new(area.x, y, area.width, 1),
+            Style::new().bg(OPENAI_ACTIVITY_BG),
+        );
+    }
     ActivityChrome { area, hits }
+}
+
+const OPENAI_ACTIVITY_BG: Color = Color::Rgb(40, 40, 40);
+
+fn endpoint_line(line: Line<'static>, endpoint: crate::tui::Endpoint) -> Line<'static> {
+    match endpoint {
+        crate::tui::Endpoint::OpenAi => line.style(Style::new().bg(OPENAI_ACTIVITY_BG)),
+        crate::tui::Endpoint::Anthropic => line,
+    }
 }
 
 /// The account/email column width on activity rows (Z 2026-07-15: 이메일 10자).
@@ -6952,6 +7011,7 @@ fn folded_run_line(
     );
     let newest = &run[0];
     let CompletedBody::Request {
+        endpoint,
         account,
         group,
         model,
@@ -7000,7 +7060,7 @@ fn folded_run_line(
     )));
     spans.push(Span::styled("all 2xx", Style::new().fg(Color::Green)));
     spans.push(Span::raw(")"));
-    Line::from(spans)
+    endpoint_line(Line::from(spans), *endpoint)
 }
 
 /// The «title» an activity row shows: its own operator session name when the
@@ -7032,6 +7092,7 @@ fn completed_line(
             id: _,
             method,
             path,
+            endpoint,
             account,
             status,
             duration,
@@ -7179,7 +7240,7 @@ fn completed_line(
                     )));
                 }
             }
-            Line::from(spans)
+            endpoint_line(Line::from(spans), *endpoint)
         }
         CompletedBody::Note { text, error } => {
             let stamp = Span::styled(format!("   {}  ", format::clock_hms_local(entry.at)), dim());
@@ -7207,6 +7268,7 @@ fn completed_detail_lines(
         id: _,
         method,
         path,
+        endpoint,
         account,
         status,
         duration,
@@ -7416,6 +7478,9 @@ fn completed_detail_lines(
         None => lines.push(indent("tokens", "—".to_string())),
     }
     lines
+        .into_iter()
+        .map(|line| endpoint_line(line, *endpoint))
+        .collect()
 }
 
 /// Row offset (0-based, within [`completed_detail_lines`]) of the clickable
@@ -9494,6 +9559,7 @@ mod tests {
         let account = |name: &str, kind: &'static str, group| AccountSnapshot {
             id: AccountId(name.into()),
             healthy: true,
+            auth_failure_status: None,
             credential_kind: kind,
             group,
             five_hour: None,
@@ -9526,8 +9592,8 @@ mod tests {
 
     /// The accounts overlay shows the per-account reset count at BOTH a narrow
     /// and a wide terminal, and the `*` marks "owned but upstream reports none
-    /// applicable now". The claude row, which has no resets at all, shows `—`
-    /// — never `0`.
+    /// applicable now". The claude row carries reset grants too but has not
+    /// been read yet, so it shows `?` — never `0`.
     #[test]
     fn accounts_overlay_shows_reset_counts_at_narrow_and_wide_widths() {
         let view = usage_control_view();
@@ -9551,8 +9617,8 @@ mod tests {
                 .find(|r| r.contains("me@example.com") && r.contains("CLAUDE"))
                 .unwrap_or_else(|| panic!("claude row at {w}x{h}:\n{frame}"));
             assert!(
-                claude_row.contains('—'),
-                "a provider without resets renders n/a, not 0: {claude_row:?}"
+                claude_row.contains('?'),
+                "an unread claude row renders unknown, not 0: {claude_row:?}"
             );
         }
     }
@@ -9970,6 +10036,7 @@ mod tests {
             id: 7,
             method: "POST".into(),
             path: "/v1/messages".into(),
+            endpoint: crate::tui::Endpoint::Anthropic,
             account: Some("claude:me@example.com".into()),
             group: Some("claude".into()),
             model: Some("claude-opus-4-8".into()),
@@ -11317,6 +11384,7 @@ mod tests {
             id: 1,
             method: "POST".into(),
             path: "/v1/messages".into(),
+            endpoint: crate::tui::Endpoint::Anthropic,
             account: Some("claude:me@example.com".into()),
             group: Some("claude".into()),
             model: Some("claude-opus-4-8".into()),
@@ -11350,6 +11418,7 @@ mod tests {
             id: 1,
             method: "POST".into(),
             path: "/v1/messages".into(),
+            endpoint: crate::tui::Endpoint::Anthropic,
             account: Some("codex:me@example.com".into()),
             group: Some("codex".into()),
             model: Some("gpt-5.6-sol".into()),
@@ -11385,6 +11454,7 @@ mod tests {
             id: 3,
             method: "POST".into(),
             path: "/v1/messages".into(),
+            endpoint: crate::tui::Endpoint::Anthropic,
             account: Some("claude:me@example.com".into()),
             group: Some("claude".into()),
             model: Some("claude-opus-4-8".into()),
@@ -11423,6 +11493,7 @@ mod tests {
             id: 1,
             method: "POST".into(),
             path: "/v1/messages".into(),
+            endpoint: crate::tui::Endpoint::Anthropic,
             account: Some("claude:me@example.com".into()),
             group: Some("claude".into()),
             model: Some("claude-opus-4-8".into()),
@@ -11519,6 +11590,7 @@ mod tests {
             id: 1,
             method: "POST".into(),
             path: "/v1/messages".into(),
+            endpoint: crate::tui::Endpoint::Anthropic,
             account: Some("claude:me@example.com".into()),
             group: Some("claude".into()),
             model: Some("claude-opus-4-8".into()),
@@ -11538,6 +11610,7 @@ mod tests {
                 id: 2,
                 method: "POST".into(),
                 path: "/v1/messages".into(),
+                endpoint: crate::tui::Endpoint::Anthropic,
                 account: Some("claude:me@example.com".into()),
                 status: 200,
                 duration: Duration::from_millis(1_200),
@@ -11632,6 +11705,7 @@ mod tests {
                 id: 1,
                 method: "POST".into(),
                 path: "/v1/messages".into(),
+                endpoint: crate::tui::Endpoint::Anthropic,
                 account: Some("codex:me@example.com".into()),
                 status: 200,
                 duration: Duration::from_millis(10),
@@ -12001,6 +12075,7 @@ mod tests {
                 id: 1,
                 method: "POST".into(),
                 path: "/v1/messages?beta=true".into(),
+                endpoint: crate::tui::Endpoint::Anthropic,
                 account: Some("claude:someone@example.com".into()),
                 status: 200,
                 duration: Duration::from_millis(3_100),
@@ -12251,6 +12326,7 @@ mod tests {
                 id: 1,
                 method: "POST".into(),
                 path: "/v1/messages".into(),
+                endpoint: crate::tui::Endpoint::Anthropic,
                 account: Some("a@x.com".into()),
                 status,
                 duration: Duration::from_millis(1_400),
@@ -12492,6 +12568,7 @@ mod tests {
         view.snapshot.accounts = vec![AccountSnapshot {
             id: AccountId(name.clone()),
             healthy: true,
+            auth_failure_status: None,
             credential_kind: "oauth",
             group: BackendGroup::Claude,
             five_hour: Some(QuotaWindow {
@@ -12671,6 +12748,7 @@ mod tests {
             |name: &str, kind: &'static str, group, five: Option<QuotaWindow>| AccountSnapshot {
                 id: AccountId(name.into()),
                 healthy: true,
+                auth_failure_status: None,
                 credential_kind: kind,
                 group,
                 five_hour: five,
@@ -12777,6 +12855,7 @@ mod tests {
         let acct = |name: &str, kind: &'static str, group, park: Option<u64>| AccountSnapshot {
             id: AccountId(name.into()),
             healthy: true,
+            auth_failure_status: None,
             credential_kind: kind,
             group,
             five_hour: None,
@@ -13162,6 +13241,7 @@ mod tests {
         let acct = |name: &str, paused: bool| AccountSnapshot {
             id: AccountId(name.into()),
             healthy: true,
+            auth_failure_status: None,
             credential_kind: "oauth",
             group: BackendGroup::Claude,
             five_hour: None,
@@ -13213,6 +13293,7 @@ mod tests {
         use crate::scheduler::{AccountId, AccountSnapshot};
         let acct = |name: &str, kind: &'static str, group: BackendGroup| AccountSnapshot {
             id: AccountId(name.into()),
+            auth_failure_status: None,
             healthy: true,
             credential_kind: kind,
             group,
@@ -13405,10 +13486,12 @@ mod tests {
                 openrouter,
                 scheduler,
                 routing,
+                claude_code,
                 pricing: _,
                 raw_io,
                 email_anonymous: _,
                 tui_effects: _,
+                claude_cli_version: _,
                 tui_gradient,
                 show_fable_weekly: _,
                 domain_abbrev: _,
@@ -13420,6 +13503,15 @@ mod tests {
                 client_keys: _,
                 accounts: _,
             } = &config;
+            let crate::config::schema::ClaudeCodeConfig {
+                gpt_model_mapping,
+                auto_classifier_model: _,
+            } = claude_code;
+            let crate::config::schema::GptModelMapping {
+                opus: _,
+                sonnet: _,
+                haiku: _,
+            } = gpt_model_mapping;
             let crate::config::ProxyConfig {
                 port: _,
                 api_key: _,
@@ -13532,6 +13624,10 @@ mod tests {
             "scheduler.usage_max_age_secs",
             "scheduler.usage_poll_secs",
             "scheduler.refresh_ahead_secs",
+            "claude_code.gpt_model_mapping.opus",
+            "claude_code.gpt_model_mapping.sonnet",
+            "claude_code.gpt_model_mapping.haiku",
+            "claude_code.auto_classifier_model",
             "routing.enabled",
             "routing.claude_models",
             "routing.codex_models",
@@ -13727,6 +13823,7 @@ mod tests {
         AccountSnapshot {
             id: AccountId("claude:me@example.com".into()),
             healthy: true,
+            auth_failure_status: None,
             credential_kind: "oauth",
             group: BackendGroup::Claude,
             five_hour: Some(QuotaWindow {
@@ -13977,6 +14074,7 @@ mod tests {
             |name: &str, kind: &'static str, group, five: Option<QuotaWindow>| AccountSnapshot {
                 id: AccountId(name.into()),
                 healthy: true,
+                auth_failure_status: None,
                 credential_kind: kind,
                 group,
                 five_hour: five,
@@ -14310,10 +14408,10 @@ mod tests {
                 "…clipped, not dropped (rst={resets}): {row:?}\n{frame}"
             );
             if resets {
-                // `rst` survives the squeeze; this oauth row has no resets at
-                // all, so its cell is the honest `—` (never a count).
+                // `rst` survives the squeeze; this oauth row carries a read
+                // grant doc (3 owned, 0 applicable), so its cell is `3*`.
                 assert!(
-                    header.contains("rst") && row.contains('—'),
+                    header.contains("rst") && row.contains("3*"),
                     "the reset column survives too: {row:?}\n{frame}"
                 );
             }
@@ -14364,6 +14462,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn account_state_line_is_visible_in_rendered_account_table() {
+        for (healthy, paused, code, expected) in [
+            (true, false, None, "ready"),
+            (false, false, Some(404), "! 404 auth X"),
+            (false, false, None, "! auth X"),
+            (true, true, None, "paused"),
+            (false, true, Some(503), "paused + 503 auth X"),
+            (false, true, None, "paused + auth X"),
+        ] {
+            let mut view = view_with(Vec::new());
+            let mut account = fable_account();
+            account.healthy = healthy;
+            account.paused = paused;
+            account.auth_failure_status = code;
+            view.snapshot.accounts = vec![account];
+            for width in [120, 160] {
+                let rows = render_rows(&view, &chrome_overlay(Overlay::None), width, 35);
+                let row = rows
+                    .iter()
+                    .find(|row| row.contains("me@example.com") && row.contains("CLAUDE"))
+                    .expect("rendered account table row");
+                assert!(row.contains(expected), "{width} columns: {row}");
+                println!("{width} columns: {row}");
+            }
+            if !healthy || paused {
+                let account = &view.snapshot.accounts[0];
+                let gate =
+                    select::eligibility(account, &view.select_params, SystemTime::now(), false);
+                for frame in [0, 1, 30, 60] {
+                    let span = status_span(
+                        account,
+                        gate,
+                        false,
+                        &view.select_params,
+                        SystemTime::now(),
+                        frame,
+                    );
+                    assert_eq!(span.content, expected, "no extra or blinking status glyph");
+                }
+            }
+        }
+    }
+
     /// An account with NO Fable scope renders the neutral cold state in the Fbl
     /// slot (never a crash/blank), and does not disturb the 5h/7d columns.
     #[test]
@@ -14377,6 +14519,7 @@ mod tests {
         view.snapshot.accounts = vec![AccountSnapshot {
             id: AccountId("claude:cold@example.com".into()),
             healthy: true,
+            auth_failure_status: None,
             credential_kind: "oauth",
             group: BackendGroup::Claude,
             // Both 5h and 7d populated, so the only cold cell in the row is the
@@ -14438,6 +14581,7 @@ mod tests {
         view.snapshot.accounts = vec![AccountSnapshot {
             id: AccountId("claude:icedac@example.com".into()),
             healthy: true,
+            auth_failure_status: None,
             credential_kind: "oauth",
             group: BackendGroup::Claude,
             five_hour: Some(QuotaWindow {
@@ -14510,6 +14654,7 @@ mod tests {
         view.snapshot.accounts = vec![AccountSnapshot {
             id: AccountId("claude:icedac@example.com".into()),
             healthy: true,
+            auth_failure_status: None,
             credential_kind: "oauth",
             group: BackendGroup::Claude,
             five_hour: Some(QuotaWindow {
@@ -14606,6 +14751,7 @@ mod tests {
         view.snapshot.accounts = vec![AccountSnapshot {
             id: AccountId(LEAK.into()),
             healthy: true,
+            auth_failure_status: None,
             credential_kind: "oauth",
             group: BackendGroup::Claude,
             five_hour: None,
@@ -14642,6 +14788,7 @@ mod tests {
             id: 7,
             method: "POST".into(),
             path: "/v1/messages".into(),
+            endpoint: crate::tui::Endpoint::Anthropic,
             account: Some(LEAK.into()),
             group: Some("claude".into()),
             model: Some("claude-opus-4-8".into()),
@@ -14662,6 +14809,7 @@ mod tests {
                     id: 1,
                     method: "POST".into(),
                     path: "/v1/messages".into(),
+                    endpoint: crate::tui::Endpoint::Anthropic,
                     account: Some(LEAK.into()),
                     status: 200,
                     duration: Duration::from_millis(10),
@@ -14859,5 +15007,112 @@ mod tests {
                 "narrow header must not carry `{gone}`:\n{header}"
             );
         }
+    }
+
+    #[test]
+    fn endpoint_origin_colors_rendered_activity_rows_and_expanded_errors() {
+        use crate::tui::Endpoint;
+        let mut view = view_with(Vec::new());
+        let mut openai = completed_request(2000, Some("claude"), Some("sonnet"), 10, 5, 502);
+        if let CompletedBody::Request { endpoint, .. } = &mut openai.body {
+            *endpoint = Endpoint::OpenAi;
+        }
+        let anthropic = completed_request(1000, Some("codex"), Some("gpt-5.5"), 10, 5, 200);
+        view.completed = vec![openai.clone(), anthropic];
+        view.in_flight.push(InFlight {
+            id: 3,
+            method: "POST".into(),
+            path: "/v1/responses".into(),
+            endpoint: Endpoint::OpenAi,
+            account: Some("claude-account".into()),
+            group: Some("claude".into()),
+            model: Some("sonnet".into()),
+            effort: None,
+            fast: false,
+            kind: None,
+            user_id: None,
+            tenant: None,
+            excerpt: None,
+            session_name: None,
+            client_name: None,
+            started_at: UNIX_EPOCH,
+        });
+        let mut chrome = chrome_overlay(Overlay::None);
+        chrome.expanded_activity = openai.activity_key();
+        let mut terminal = Terminal::new(TestBackend::new(160, 28)).unwrap();
+        let mut hit = None;
+        let rendered = terminal
+            .draw(|f| {
+                hit = Some(draw_activity(f, f.area(), &view, &chrome, UNIX_EPOCH));
+            })
+            .unwrap();
+        // Inspect the completed render buffer: TestBackend receives a diff
+        // that skips hidden wide-glyph continuation cells by design.
+        let buffer = rendered.buffer;
+        let hit = hit.unwrap();
+        let openai_hit = hit
+            .hits
+            .iter()
+            .find(|h| {
+                h.key == openai.activity_key().unwrap() && matches!(h.kind, ActivityHitKind::Entry)
+            })
+            .unwrap();
+        for y in 1..openai_hit.y_start + openai_hit.height {
+            for x in 0..160 {
+                assert_eq!(buffer[(x, y)].bg, OPENAI_ACTIVITY_BG, "cell ({x},{y})");
+            }
+        }
+        let anthropic_y = openai_hit.y_start + openai_hit.height;
+        assert_eq!(
+            buffer[(159, anthropic_y)].bg,
+            Color::Reset,
+            "Anthropic endpoint routed to Codex keeps original background"
+        );
+        let red_status = buffer
+            .content()
+            .iter()
+            .any(|c| c.symbol() == "5" && c.fg == Color::Red && c.bg == OPENAI_ACTIVITY_BG);
+        assert!(red_status, "error foreground remains red on dark gray");
+        for y in 0..=anthropic_y {
+            let text: String = (0..160).map(|x| buffer[(x, y)].symbol()).collect();
+            println!(
+                "activity-render row={y} bg={:?} {}",
+                buffer[(159, y)].bg,
+                text.trim_end()
+            );
+        }
+    }
+
+    #[test]
+    fn endpoint_origin_colors_folded_count_header() {
+        let mut view = view_with(Vec::new());
+        view.completed = (1..=3)
+            .map(|id| {
+                let mut row = completed_request(id, Some("claude"), Some("sonnet"), 1, 1, 200);
+                if let CompletedBody::Request { endpoint, kind, .. } = &mut row.body {
+                    *endpoint = crate::tui::Endpoint::OpenAi;
+                    *kind = Some("count".into());
+                }
+                row
+            })
+            .collect();
+        let chrome = chrome_overlay(Overlay::None);
+        let mut terminal = Terminal::new(TestBackend::new(160, 8)).unwrap();
+        terminal
+            .draw(|f| {
+                draw_activity(f, f.area(), &view, &chrome, UNIX_EPOCH);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        for x in 0..160 {
+            assert_eq!(buffer[(x, 1)].bg, OPENAI_ACTIVITY_BG);
+        }
+        let text: String = (0..160).map(|x| buffer[(x, 1)].symbol()).collect();
+        assert!(text.contains("3×"), "{text}");
+        println!(
+            "activity-render folded bg={:?} {}",
+            buffer[(159, 1)].bg,
+            text.trim_end()
+        );
     }
 }

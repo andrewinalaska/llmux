@@ -1,5 +1,8 @@
 # Claude Code `/model` picker from the llmux catalog
 
+Scope: this record describes the Claude Code picker. The later Codex client has a
+separate catalog adapter; see [Codex frontend](21-codex-frontend.md).
+
 Status: shipped
 Date: 2026-09-17
 
@@ -131,3 +134,5 @@ implemented contract, not a future target.
   in `src/catalog.rs`; a config override is a separate spec if ever wanted).
 - Serving `/v1/models` from the catalog (still proxied upstream).
 - Merging llmux rows into a user-supplied `--settings` document.
+
+**Drift note 2026-10-08.** The `/v1/models` non-goal is superseded: `GET /v1/models` now serves an OpenAI-shaped list locally for the Codex frontend, while `/llmux/models` remains the metadata catalog the picker injection reads (see `docs/models.md#endpoints`). The picker is a typing convenience only; per-agent model selection (`.claude/agents/*.md` `model:` ids, routed per request) does not depend on it and is documented in `docs/multi-model-agents.md`. The dated picker evidence above is preserved as recorded.

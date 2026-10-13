@@ -38,9 +38,9 @@ pub(crate) mod logs;
 // be at least as visible as they are.
 pub(crate) mod triage;
 mod ui;
-mod view;
+pub(crate) mod view;
 
-pub use event::{ActivityEvent, TokenCounts};
+pub use event::{ActivityEvent, Endpoint, TokenCounts};
 
 /// Bound for the proxy→dashboard activity channel (`try_send` +
 /// drop-on-full on the sender side, so a stalled dashboard never
@@ -74,9 +74,10 @@ use view::DashboardView;
 /// in [`crate::provider::codex`]'s passthrough list, so a pin set from here is
 /// forwarded upstream VERBATIM rather than rewritten to the configured pin.
 const CODEX_MODELS: &[&str] = &[
-    "gpt-6-astra",
     "gpt-6.1-sol",
+    "gpt-6-astra",
     "gpt-6-sol",
+    "gpt-6-luna",
     "gpt-5.6-sol",
     "gpt-5.6-terra",
     "gpt-5.5",
@@ -86,7 +87,7 @@ const CODEX_MODELS: &[&str] = &[
 /// Reasoning-effort levels cycled with `e` (and the group-settings bar);
 /// "" = BYPASS — the client's `output_config.effort` rides through (UI-3
 /// U12). A concrete value OVERRIDES every request. `max` is native on the
-/// gpt-5.6 family and on `gpt-6-astra`, and clamps to `xhigh` on older models.
+/// gpt-5.6 / gpt-6 / gpt-6.1 families, and clamps to `xhigh` on older models.
 const CODEX_EFFORTS: &[&str] = &["", "minimal", "low", "medium", "high", "xhigh", "max"];
 /// Grok effort rotation for the group-settings bar (UI-3 U12); "" = bypass.
 /// Values are the config superset (`none|low|medium|high|xhigh`) — per-model
@@ -3403,17 +3404,27 @@ impl App {
     }
 
     /// Open the redemption confirm on the first row whose provider actually
-    /// has resets. No codex account → a hint, never an empty gate.
+    /// has resets (codex or Claude). No such account → a hint, never an empty
+    /// gate.
     fn open_reset_confirm(&mut self, view: Option<&DashboardView>) {
         let Some(view) = view else { return };
         let now = SystemTime::now();
         let order = view.display_order(self.account_sort, now);
-        let Some(pos) = order
-            .iter()
-            .position(|&i| view.snapshot.accounts[i].credential_kind == "codex")
-        else {
+        // A held (unresolved) redemption pins the gate to ITS account, so
+        // reopening resumes that id instead of prompting for another account.
+        let held = self.pending_redemption.as_ref().and_then(|p| {
+            order
+                .iter()
+                .position(|&i| view.snapshot.accounts[i].id.0 == p.account)
+        });
+        let Some(pos) = held.or_else(|| {
+            order
+                .iter()
+                .position(|&i| view::has_usage_controls(view.snapshot.accounts[i].credential_kind))
+        }) else {
             self.set_status(
-                "reset: no codex account (rate-limit resets are a ChatGPT/Codex entitlement)"
+                "reset: no codex or claude account (rate-limit resets are a ChatGPT/Codex \
+                 or Claude subscription entitlement)"
                     .into(),
             );
             return;
@@ -3507,9 +3518,10 @@ impl App {
         let Some(target) = order.get(idx).and_then(|&i| view.snapshot.accounts.get(i)) else {
             return;
         };
-        if target.credential_kind != "codex" {
+        if !view::has_usage_controls(target.credential_kind) {
             self.set_status(format!(
-                "reset: {} is a {} account — rate-limit resets are a Codex entitlement",
+                "reset: {} is a {} account — rate-limit resets are a Codex or Claude \
+                 subscription entitlement",
                 target.id, target.credential_kind
             ));
             return;
@@ -4549,7 +4561,7 @@ fn accounts_entry_refresh_due(view: &DashboardView, now: SystemTime) -> bool {
     view.snapshot
         .accounts
         .iter()
-        .filter(|a| a.credential_kind == "codex")
+        .filter(|a| view::has_usage_controls(a.credential_kind))
         .any(|a| match view.usage_control(&a.id.0) {
             None => true,
             Some(control) => match control.last_refresh_ms {
@@ -4629,6 +4641,9 @@ fn consume_message(
         }
         ResetOutcome::NoCredit => {
             format!("{account}: no reset credit available upstream — nothing was spent")
+        }
+        ResetOutcome::Cooldown => {
+            format!("{account}: upstream is in a post-reset cooldown — nothing was spent")
         }
     };
     let mut text = format!("{head} · request id {}", response.request_id);
@@ -6266,10 +6281,11 @@ mod tests {
     /// a model llmux can route but cannot be cycled to is not switchable.
     #[test]
     fn codex_model_cycle_reaches_gpt_6_astra_from_the_sol_pin() {
-        // Newest generation first, and every entry is distinct (a duplicate
-        // would make the modulo cycle skip a model forever).
-        assert_eq!(CODEX_MODELS[0], "gpt-6-astra");
-        assert_eq!(CODEX_MODELS.len(), 8);
+        // Newest generation first (gpt-6.1-sol, the openai/codex catalog's
+        // priority-1 default since 2026-09-29), and every entry is distinct (a
+        // duplicate would make the modulo cycle skip a model forever).
+        assert_eq!(CODEX_MODELS[0], "gpt-6.1-sol");
+        assert_eq!(CODEX_MODELS.len(), 9);
         let mut sorted = CODEX_MODELS.to_vec();
         sorted.sort_unstable();
         sorted.dedup();
@@ -6306,7 +6322,7 @@ mod tests {
         app.cycle_codex_model(Some(&view));
         assert_eq!(
             app.take_pending_codex().map(|c| c.model),
-            Some("gpt-6-astra".to_string())
+            Some("gpt-6.1-sol".to_string())
         );
     }
 
@@ -6385,6 +6401,7 @@ mod tests {
         let acct = |name: &str| AccountSnapshot {
             id: AccountId(name.into()),
             healthy: true,
+            auth_failure_status: None,
             credential_kind: "oauth",
             group: BackendGroup::Claude,
             five_hour: None,
@@ -6458,6 +6475,7 @@ mod tests {
         let acct = |name: &str| AccountSnapshot {
             id: AccountId(name.into()),
             healthy: true,
+            auth_failure_status: None,
             credential_kind: "oauth",
             group: BackendGroup::Claude,
             five_hour: None,
@@ -8004,6 +8022,7 @@ mod tests {
                 client_name: None,
                 method: "POST".into(),
                 path: "/v1/messages".into(),
+                endpoint: crate::tui::Endpoint::Anthropic,
                 account: Some("claude:a@x".into()),
                 status: 200,
                 duration: Duration::from_millis(10),
@@ -8226,6 +8245,7 @@ mod tests {
                 id: 1,
                 method: "POST".into(),
                 path: "/v1/messages/count_tokens".into(),
+                endpoint: crate::tui::Endpoint::Anthropic,
                 account: Some("claude:a@x".into()),
                 status: 200,
                 duration: Duration::from_millis(10),
@@ -8338,6 +8358,7 @@ mod tests {
                 id: 1,
                 method: "POST".into(),
                 path: "/v1/messages".into(),
+                endpoint: crate::tui::Endpoint::Anthropic,
                 account: Some("claude:a@x".into()),
                 status: 200,
                 duration: Duration::from_millis(10),
@@ -8443,6 +8464,7 @@ mod tests {
                 id: 1,
                 method: "POST".into(),
                 path: "/v1/messages".into(),
+                endpoint: crate::tui::Endpoint::Anthropic,
                 account: Some("claude:a@x".into()),
                 status: 200,
                 duration: Duration::from_millis(10),
@@ -8534,6 +8556,7 @@ mod tests {
         v.snapshot.accounts = vec![AccountSnapshot {
             id: AccountId("claude:me@example.com".into()),
             healthy: true,
+            auth_failure_status: None,
             credential_kind: "oauth",
             group: BackendGroup::Claude,
             five_hour: None,
@@ -8619,6 +8642,7 @@ mod tests {
         let account = |name: &str, kind: &'static str, group| AccountSnapshot {
             id: AccountId(name.into()),
             healthy: true,
+            auth_failure_status: None,
             credential_kind: kind,
             group,
             five_hour: None,
@@ -8714,19 +8738,32 @@ mod tests {
         let now = UNIX_EPOCH + Duration::from_secs(1_000_000);
         let ms = |secs: u64| secs * 1_000;
 
-        // No codex account → nothing to count → never refreshes on entry.
+        // No account with reset entitlements (codex OR claude oauth) →
+        // nothing to count → never refreshes on entry.
+        let mut none_with_resets = control_view();
+        none_with_resets
+            .snapshot
+            .accounts
+            .retain(|a| !view::has_usage_controls(a.credential_kind));
+        assert!(!accounts_entry_refresh_due(&none_with_resets, now));
+        // A claude-only roster DOES count now: its grants are read on entry.
         let mut claude_only = control_view();
         claude_only
             .snapshot
             .accounts
             .retain(|a| a.credential_kind != "codex");
-        assert!(!accounts_entry_refresh_due(&claude_only, now));
+        assert!(accounts_entry_refresh_due(&claude_only, now));
 
         // Codex account with no observation at all → due.
         let mut view = control_view();
         assert!(accounts_entry_refresh_due(&view, now));
 
-        // Observed 10s ago → NOT due (entry must not hammer upstream).
+        // Observed 10s ago (both reset-bearing accounts) → NOT due (entry
+        // must not hammer upstream).
+        view.usage_controls.insert(
+            "claude:a@x.com".into(),
+            control_doc(Some(1), Some(ms(999_990))),
+        );
         view.usage_controls.insert(
             "codex:c@x.com".into(),
             control_doc(Some(3), Some(ms(999_990))),
@@ -8831,7 +8868,8 @@ mod tests {
         );
     }
 
-    /// `R` opens the gate on a CODEX row (never a claude one), the prompt
+    /// `R` opens the gate on the first row whose provider HAS resets (never
+    /// an api-key / grok one), arrows move it onto the codex row, the prompt
     /// names that account and one reset, and cancelling queues nothing.
     #[test]
     fn reset_gate_targets_a_codex_account_and_cancel_queues_nothing() {
@@ -8845,10 +8883,28 @@ mod tests {
             panic!("expected the reset gate, got {:?}", app.mode);
         };
         let order = view.display_order(Default::default(), SystemTime::now());
-        assert_eq!(
-            view.snapshot.accounts[order[idx]].credential_kind, "codex",
+        assert!(
+            view::has_usage_controls(view.snapshot.accounts[order[idx]].credential_kind),
             "the gate opens on an account that HAS resets"
         );
+        // Walk the cursor onto the codex row.
+        let codex_pos = order
+            .iter()
+            .position(|&i| view.snapshot.accounts[i].credential_kind == "codex")
+            .expect("codex row");
+        let mut idx = idx;
+        while idx != codex_pos {
+            let key = if idx < codex_pos {
+                KeyCode::Down
+            } else {
+                KeyCode::Up
+            };
+            app.on_key_confirm_reset(key, idx, Some(&view));
+            let Mode::ConfirmReset { idx: moved } = app.mode else {
+                panic!("gate closed while moving: {:?}", app.mode);
+            };
+            idx = moved;
+        }
         let status = app.status_line().expect("prompt").to_string();
         assert!(status.contains("codex:c@x.com"), "{status}");
         assert!(status.contains("ONE"), "{status}");
@@ -8861,13 +8917,14 @@ mod tests {
         assert!(app.pending_redemption.is_none());
     }
 
-    /// A roster with no codex account cannot open the gate at all.
+    /// A roster with no codex OR claude account cannot open the gate at all;
+    /// a claude-only roster can (its grants are a reset entitlement too).
     #[test]
     fn reset_gate_refuses_without_a_codex_account() {
         let mut view = control_view();
         view.snapshot
             .accounts
-            .retain(|a| a.credential_kind != "codex");
+            .retain(|a| !view::has_usage_controls(a.credential_kind));
         let mut app = remote_app();
         app.overlay = Overlay::Accounts;
         app.on_key_accounts(KeyCode::Char('R'), Some(&view));
@@ -8875,7 +8932,20 @@ mod tests {
         assert_eq!(app.pending_control, None);
         assert!(app
             .status_line()
-            .is_some_and(|s| s.contains("no codex account")));
+            .is_some_and(|s| s.contains("no codex or claude account")));
+
+        let mut claude_only = control_view();
+        claude_only
+            .snapshot
+            .accounts
+            .retain(|a| a.credential_kind == "oauth");
+        let mut app = remote_app();
+        app.overlay = Overlay::Accounts;
+        app.on_key_accounts(KeyCode::Char('R'), Some(&claude_only));
+        assert!(matches!(app.mode, Mode::ConfirmReset { .. }));
+        assert!(app
+            .status_line()
+            .is_some_and(|s| s.contains("claude:a@x.com") && s.contains("ONE")));
     }
 
     /// The confirm resolves the cursor to an account at CONFIRM time through
@@ -8916,7 +8986,9 @@ mod tests {
             ControlOp::Reset { account, .. } => assert_eq!(account, "codex:c@x.com"),
             other => panic!("expected a redemption, got {other:?}"),
         }
-        // Confirming on the CLAUDE row instead redeems nothing.
+        // Confirming on the CLAUDE row redeems THAT account's grant (Claude
+        // oauth accounts carry reset grants since 2026-10-06) — and nothing
+        // else: the queued redemption names the claude account.
         let mut app = remote_app();
         app.account_sort = triage::AccountSort::Next;
         let claude_pos = order
@@ -8924,10 +8996,14 @@ mod tests {
             .position(|&i| view.snapshot.accounts[i].credential_kind == "oauth")
             .expect("claude row");
         app.on_key_confirm_reset(KeyCode::Char('y'), claude_pos, Some(&view));
-        assert_eq!(app.pending_control, None);
-        assert!(app
-            .status_line()
-            .is_some_and(|s| s.contains("Codex entitlement")));
+        match app
+            .pending_control
+            .as_ref()
+            .expect("queued claude redemption")
+        {
+            ControlOp::Reset { account, .. } => assert_eq!(account, "claude:a@x.com"),
+            other => panic!("expected a redemption, got {other:?}"),
+        }
     }
 
     /// The redemption id is minted ONCE by the client and held before the

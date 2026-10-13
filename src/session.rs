@@ -534,6 +534,7 @@ pub(crate) mod test_support {
         /// `PersistedRequest::from_event`, then a JSON round-trip as on disk.
         pub(crate) fn persisted(&self) -> PersistedRequest {
             let event = ActivityEvent::RequestFinished {
+                endpoint: crate::tui::Endpoint::Anthropic,
                 id: self.id,
                 method: "POST".into(),
                 path: "/v1/messages".into(),

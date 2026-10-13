@@ -80,6 +80,10 @@ layout and color tokens.
 
 ### ActivityReceipt
 
+Endpoint origin is independent of provider/model. `open_ai` receipts use a dark gray
+background in native surfaces (the TUI uses RGB(40,40,40)); `anthropic` keeps the normal
+background. See [endpoint flow](../../../docs/codex-frontend/activity.md).
+
     receipt_id
     kind               in_flight | request | note
     occurred_at_ms
@@ -88,6 +92,7 @@ layout and color tokens.
     path?
     account_display?
     provider?
+    endpoint           anthropic | open_ai (legacy missing field defaults to anthropic)
     model?
     effort?
     fast
@@ -371,3 +376,12 @@ a receipt-detail crop.
 
 The root llmux package remains the daemon and wire DTO authority. The core may
 depend on the root library by path; the root must not depend on the GUI crates.
+
+## macOS local-control amendment (2026-10-08)
+
+The [get-started contract](../../22-islands-get-started.md) explicitly adds a
+CLI-owned, endpoint-bound local-control handoff. Native Swift does not read provider
+configuration or credentials. Its executor receives only the local control key
+through private bounded pipes, and never puts it in UiState or persistence.
+Remote keys remain native connection settings, restricted to their chosen endpoint.
+No Rust shared state or Linux ABI field changes are required.

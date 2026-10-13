@@ -1,4 +1,4 @@
-//! API-equivalent USD pricing for token usage (Feature D).
+//! API-equivalent USD reference pricing for token usage (Feature D).
 //!
 //! The dashboard tracks tokens per model and per request; this module turns
 //! those token counts into the **API-equivalent USD cost** so the dashboard
@@ -362,9 +362,13 @@ const OPUS_TIER: ModelPrice = ModelPrice::new(5.0, 25.0, 0.5, 6.25).with_cache_c
 const OPUS_5_5: ModelPrice = ModelPrice::new(4.0, 20.0, 0.20, 5.0).with_cache_creation_1h(8.0);
 /// Claude Opus 4.1 and Opus 4 (both retired): 15 / 18.75 / 30 / 1.50 / 75.
 const OPUS_4_1: ModelPrice = ModelPrice::new(15.0, 75.0, 1.5, 18.75).with_cache_creation_1h(30.0);
-/// Claude Sonnet 5.5 and Sonnet 5: 2 / 2.50 / 4 / 0.20 / 10 (Sonnet 5's
-/// $2/$10 is now its standard price, not a launch promotion).
+/// Claude Sonnet 5: 2 / 2.50 / 4 / 0.20 / 10 (its $2/$10 is now its standard
+/// price, not a launch promotion).
 const SONNET_5: ModelPrice = ModelPrice::new(2.0, 10.0, 0.2, 2.5).with_cache_creation_1h(4.0);
+/// Claude Sonnet 5.5: 2 / 2.50 / 4 / 0.10 / 10 — same as Sonnet 5 except the
+/// cache read, which fell to $0.10 on 2026-10-07 (pricing page, re-read
+/// 2026-10-08).
+const SONNET_5_5: ModelPrice = ModelPrice::new(2.0, 10.0, 0.1, 2.5).with_cache_creation_1h(4.0);
 /// Claude Sonnet 4.6, 4.5, 4: 3 / 3.75 / 6 / 0.30 / 15. Also the default for a
 /// Sonnet version this table does not list.
 const SONNET_TIER: ModelPrice = ModelPrice::new(3.0, 15.0, 0.3, 3.75).with_cache_creation_1h(6.0);
@@ -595,6 +599,10 @@ fn builtin_price(model_norm_lower: &str) -> Option<ModelPrice> {
         // future dated `gpt-5.6-sol-*` snapshot resolve here. Same generation
         // boundary: `gpt-5.60-*` must NOT take 5.6 rates.
         Some(GPT_5_6_SOL)
+    } else if model_norm_lower.starts_with("gpt-6.1-") {
+        // Generation 6.1 has one tier (sol); `gpt-6.10-*` must miss this
+        // branch, hence the required `-`.
+        Some(GPT_6_1_SOL)
     } else if model_norm_lower.starts_with("gpt-6-astra-") {
         Some(GPT_6_ASTRA)
     } else if model_norm_lower.starts_with("gpt-6-sol-") {
@@ -604,8 +612,9 @@ fn builtin_price(model_norm_lower: &str) -> Option<ModelPrice> {
     } else if model_norm_lower.starts_with("gpt-6-luna-") {
         Some(GPT_6_LUNA)
     } else if model_norm_lower.starts_with("gpt-6-") {
-        // Astra is generation 6's flagship (and its only tier), so it is the
-        // `gpt-6-` default exactly as sol is for `gpt-5.6-`. The required `-`
+        // Astra is generation 6's flagship, so it is the `gpt-6-` default
+        // exactly as sol is for `gpt-5.6-` (sol/luna have their own exact and
+        // prefix rows above). The required `-`
         // is the generation boundary: `gpt-60-*` and `gpt-6.5-*` are DIFFERENT
         // generations and must miss this branch (mirrors codex.rs
         // `supports_extended_efforts`).
@@ -702,7 +711,8 @@ fn claude_price(slug: &str) -> Option<ModelPrice> {
         // `claude-opus-4` / `-4-0` / `-4-<date>` is Opus 4; `-4-1` is Opus 4.1.
         ("opus", Some((4, None | Some(0 | 1)))) => OPUS_4_1,
         ("opus", _) => OPUS_TIER,
-        ("sonnet", Some((5, None | Some(5)))) => SONNET_5,
+        ("sonnet", Some((5, Some(5)))) => SONNET_5_5,
+        ("sonnet", Some((5, None))) => SONNET_5,
         ("sonnet", _) => SONNET_TIER,
         ("haiku", Some((5, Some(5)))) => HAIKU_5_5,
         ("haiku", _) => HAIKU_4_5,
@@ -1330,6 +1340,7 @@ mod tests {
         let opus = (5.0, 25.0, 0.5, 6.25);
         let opus_legacy = (15.0, 75.0, 1.5, 18.75);
         let sonnet_5 = (2.0, 10.0, 0.2, 2.5);
+        let sonnet_5_5 = (2.0, 10.0, 0.1, 2.5);
         let sonnet_4 = (3.0, 15.0, 0.3, 3.75);
         for (model, want) in [
             ("claude-fable-5-1", (10.0, 50.0, 0.25, 12.5)),
@@ -1343,7 +1354,7 @@ mod tests {
             ("claude-opus-4-1", opus_legacy),
             ("claude-opus-4", opus_legacy),
             ("claude-opus-4-0", opus_legacy),
-            ("claude-sonnet-5-5", sonnet_5),
+            ("claude-sonnet-5-5", sonnet_5_5),
             ("claude-sonnet-5", sonnet_5),
             ("claude-sonnet-4-6", sonnet_4),
             ("claude-sonnet-4-5", sonnet_4),
@@ -1358,10 +1369,10 @@ mod tests {
         }
         // The curated aliases resolve through `normalize_model` first.
         // `sonnet` resolves to `claude-sonnet-5-5[1m]` (the alias rolled off
-        // sonnet-5 on 2026-09-29) — same rate tier, so this stays sonnet_5.
+        // sonnet-5 on 2026-09-29) — so it takes the sonnet_5_5 rates.
         assert_eq!(
             claude_rates("sonnet"),
-            sonnet_5,
+            sonnet_5_5,
             "sonnet → claude-sonnet-5-5"
         );
         assert_eq!(claude_rates("fable").2, 0.25, "fable → claude-fable-5-1");

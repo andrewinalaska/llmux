@@ -1,7 +1,7 @@
 # llmux CD reference (shared procedures)
 
 Not an invokable skill — shared mechanics for the `build` / `deploy` / `release` runbooks.
-All facts verified 2026-06-14.
+Release topology checked against llmux workflows and the tap’s current `bump.yml` on 2026-10-08; Codex frontend procedures verified 2026-10-07.
 
 ## Topology
 
@@ -13,8 +13,13 @@ All facts verified 2026-06-14.
   version, then a stable release `v<x.y.z>`.
 - Tap: `2lab-ai/homebrew-tap` (tapped as `2lab-ai/tap`), two formulae: `llmux` (stable,
   from latest `v*`) and `llmux-preview` (from latest `preview-*`). The tap's `bump.yml`
-  renders formulae from release assets and runs on **`workflow_dispatch` or a 6h schedule —
-  NOT instantly on release**. Trigger it explicitly for a prompt brew update.
+  renders llmux formulae/casks on its schedule. As checked 2026-10-08, manual
+  `workflow_dispatch` requires Dbotter inputs and skips llmux jobs; do not dispatch
+  it expecting an immediate llmux update.
+  **Preview publication directly bumps the preview formula and Islands cask in its
+  own required `publish` step** (`.github/scripts/bump-tap-preview.sh`); a missing
+  token or failed push fails publication. Stable releases need the scheduled tap
+  update or the narrow reviewed template-rendering fallback in procedure B.
 - Local daemon: `/opt/homebrew/bin/llmux server --no-tui`, control port 3456. The PATH
   binary is a brew symlink into the Cellar.
 
@@ -36,15 +41,29 @@ Restart is safe when `llmux status` shows `in_flight: 0` across accounts.
 
 ## Procedure B — publish brew formula + verify it landed
 
-The tap bump is not automatic. Dispatch it, wait, then upgrade. Use `llmux-preview`
-for a deploy, `llmux` for a release.
+For a preview, first verify the successful preview `publish` job and that the tap
+points to its exact tag; it already performed the bump. For stable, inspect the
+current tap workflow before choosing a trigger. Its llmux jobs are schedule-only
+as of 2026-10-08, so immediate stable publication uses this scoped fallback:
+
+1. Pin the exact released `v<version>` and download all four CLI assets, the
+   matching `LlmuxIslands-<version>.zip` and `SHA256SUMS`. Verify every asset’s actual
+   digest against that manifest; do not infer hashes from a different release.
+2. In an isolated checkout of the current tap, render **only** `Formula/llmux.rb`
+   and `Casks/llmux-islands.rb` from their existing `.tmpl` files using the pinned
+   version and measured hashes. Run `ruby -c` on both and review the two-file diff,
+   asset URLs, architectures and app dependency/version. Preserve unrelated tap files.
+3. Publish the reviewed tap change through the authorized release workflow, then
+   verify the remote formula and cask point to the same exact tag before upgrading.
+   Do not alter the shared tap workflow or supply unrelated Dbotter inputs.
+
+For a failed preview bump, diagnose and rerun its idempotent publish job rather
+than dispatching the tap’s unrelated manual workflow. Then upgrade.
+Primary source: [tap `bump.yml`](https://github.com/2lab-ai/homebrew-tap/blob/master/.github/workflows/bump.yml), checked 2026-10-08.
 
 ```bash
 formula=llmux-preview   # or: llmux
-gh workflow run bump.yml --repo 2lab-ai/homebrew-tap
-sleep 5
-rid=$(gh run list --repo 2lab-ai/homebrew-tap --workflow bump.yml -L1 --json databaseId -q '.[0].databaseId')
-gh run watch --repo 2lab-ai/homebrew-tap "$rid" --exit-status
+# First verify the exact formula/cask publication using procedure B above.
 brew update
 brew upgrade "$formula" || brew install "2lab-ai/tap/$formula"
 brew info --json=v2 "$formula" | python3 -c 'import json,sys;print(json.load(sys.stdin)["formulae"][0]["installed"][0]["version"])'
@@ -54,6 +73,29 @@ brew info --json=v2 "$formula" | python3 -c 'import json,sys;print(json.load(sys
 After `brew upgrade` the new binary is already in the Cellar, so "hot-deploy" reduces to
 `/opt/homebrew/bin/llmux restart` (no rm/cp needed — that path is only for a local
 `target/release` build).
+
+## Frontend packaging and installed verification
+
+Rust `include_str!` embeds `bridge/claude-agent.mjs`, `bridge/package.json` and
+`bridge/package-lock.json`; filtered source archives, Docker contexts and fixture
+git clones must include all three. Do not bundle `node_modules`. For bridge/runtime
+changes run `npm ci --ignore-scripts --no-audit --no-fund` in `bridge/`, then
+`just check-bridge` as well as the required `just check`. CI runs the SDK tests.
+
+Claude-through-Codex needs Node.js 18+ and npm on the daemon host; first use installs
+the pinned SDK from embedded assets. A normal packaged smoke must not depend on a
+source checkout or `LLMUX_CLAUDE_SDK_DIR`. Codex CLI belongs on the client host.
+For a frontend/runtime release, use the **installed** `llmux run --codex` to prove
+text plus an actual client-tool roundtrip against both a Codex and a Claude model.
+Record command exit, returned tool marker, client/server build equality and
+OpenAI-origin Activity. Account-policy fixes additionally need same-request bad-to-
+healthy failover evidence; a healthy first selection does not prove failover.
+
+Docs-only followups to an already verified release retain the deployed artifact.
+`preview.yml` has no path filter: put `[skip ci]` in both the documentation commit
+and squash-merge message to avoid a duplicate unchanged runtime preview. Still run
+`just check` before commit and obtain document review; do not rebuild/restart solely
+to publish documentation.
 
 ## Push auth fallback
 

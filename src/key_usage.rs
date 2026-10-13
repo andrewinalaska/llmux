@@ -1766,6 +1766,7 @@ mod tests {
         // Live path: the first three via `from_event`.
         for (i, (model, tokens)) in requests[..3].iter().enumerate() {
             let event = ActivityEvent::RequestFinished {
+                endpoint: crate::tui::Endpoint::Anthropic,
                 id: i as u64,
                 method: "POST".into(),
                 path: "/v1/messages".into(),

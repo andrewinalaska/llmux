@@ -1,6 +1,7 @@
 //! Account authentication: PKCE OAuth login, token refresh (coalesced),
 //! profile lookup, and `~/.claude/.credentials.json` import.
 
+pub mod claude_resets;
 pub mod codex;
 pub mod codex_usage;
 pub mod credentials;
@@ -54,4 +55,17 @@ pub enum AuthError {
     /// the grok flow cannot work without.
     #[error("grok auth data invalid: {0}")]
     GrokAuth(&'static str),
+}
+
+impl AuthError {
+    /// HTTP evidence only; transport/parse failures must not invent a status.
+    pub fn http_status(&self) -> Option<http::StatusCode> {
+        match self {
+            Self::Http(err) => err.status(),
+            Self::TokenEndpoint { status, .. }
+            | Self::RefreshPermanent { status, .. }
+            | Self::ProfileEndpoint { status, .. } => Some(*status),
+            _ => None,
+        }
+    }
 }

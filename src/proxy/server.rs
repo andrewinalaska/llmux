@@ -284,6 +284,8 @@ pub struct AppState {
     /// for routing (forward passes `group = None`); it is still held so the
     /// status/eval paths can ask whether routing is on.
     pub classifier: Arc<crate::routing::Classifier>,
+    /// Ephemeral, tenant-isolated main-model context for auto-mode monitors.
+    pub auto_classifier_sessions: Arc<Mutex<super::auto_classifier::Sessions>>,
     /// Coalesces concurrent OAuth refreshes per account.
     pub refresher: Arc<RefreshCoalescer>,
     /// Per-account relayed-traffic totals for `/llmux/status`.
@@ -398,6 +400,7 @@ impl AppState {
         logger: Option<Arc<RequestLogger>>,
         logs_rx: Option<tokio::sync::mpsc::Receiver<LogLine>>,
     ) -> Result<Self, ProxyError> {
+        config.claude_code.validate().map_err(ProxyError::Config)?;
         let (events_tx, events_rx) = tokio::sync::mpsc::channel(ACTIVITY_CHANNEL_CAP);
         // Operator pause set from the loaded config — applied before the pool
         // serves its first selection so a paused account never gets picked at
@@ -471,6 +474,9 @@ impl AppState {
             openrouter,
             idle_prober,
             classifier,
+            auto_classifier_sessions: Arc::new(Mutex::new(
+                super::auto_classifier::Sessions::default(),
+            )),
             refresher: Arc::new(refresher),
             totals: Arc::new(UsageTotals::default()),
             config_path: crate::config::config_path().ok(),
@@ -1555,11 +1561,14 @@ pub async fn background_refresh_pass(state: &AppState) {
                 );
             }
         }
-        forward::RefreshOutcome::Permanent { detail } => {
+        forward::RefreshOutcome::Permanent { detail, status } => {
             // Only bench if the dead refresh token is STILL this account's
             // credential: a re-login that landed during the refresh has
             // already healed it (relogin-trace B1/B5).
-            if state.pool.record_auth_failure_if(&account_id, &fingerprint) {
+            if state
+                .pool
+                .record_auth_failure_if(&account_id, &fingerprint, Some(status))
+            {
                 state.emit(ActivityEvent::Error {
                     context: Some("refresh".into()),
                     message: format!(
@@ -1571,7 +1580,7 @@ pub async fn background_refresh_pass(state: &AppState) {
         // The account was re-credentialed mid-refresh; nothing was written and
         // nothing is wrong — the next tick sees the new token's expiry.
         forward::RefreshOutcome::Superseded => {}
-        forward::RefreshOutcome::Failed => {} // transient — next tick retries
+        forward::RefreshOutcome::Failed { .. } => {} // transient — next tick retries
     }
 }
 
@@ -1609,6 +1618,7 @@ pub fn router(state: AppState) -> Router {
         .route("/llmux/login/cancel", post(login_cancel_endpoint))
         .route("/llmux/shutdown", post(shutdown))
         .route("/models", get(models_endpoint))
+        .route("/v1/models", get(openai_models_endpoint))
         .route("/llmux/models", get(models_endpoint))
         .route("/v1/oauth/token", post(oauth_token_relay))
         // Root reachability ping, answered LOCALLY (Z 2026-07-15, startup-set
@@ -1687,8 +1697,20 @@ async fn client_auth(
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ConnectInfo(addr)| addr.ip());
     let loopback = peer.is_some_and(|ip| ip.is_loopback());
-    let presented = req.headers().get("x-api-key").and_then(|v| v.to_str().ok());
-    match state.keys.resolve(presented, loopback) {
+    let openai =
+        super::responses::is_responses_path(req.uri().path()) || req.uri().path() == "/v1/models";
+    let presented = if openai {
+        match openai_client_key(req.headers()) {
+            Ok(key) => key,
+            Err(detail) => return super::responses::error(StatusCode::UNAUTHORIZED, detail),
+        }
+    } else {
+        req.headers().get("x-api-key").and_then(|v| v.to_str().ok())
+    };
+    match state
+        .keys
+        .resolve(presented, loopback && (!openai || presented.is_none()))
+    {
         Resolution::Allowed(tenant) => {
             if is_control_plane(req.uri().path()) && !tenant.admin {
                 return auth_error(
@@ -1703,6 +1725,43 @@ async fn client_auth(
         Resolution::Revoked => auth_error(StatusCode::UNAUTHORIZED, "client key revoked"),
         Resolution::Denied => auth_error(StatusCode::UNAUTHORIZED, "Invalid proxy API key"),
     }
+}
+
+/// Explicit malformed or conflicting credentials never become a keyless request.
+fn openai_client_key(headers: &http::HeaderMap) -> Result<Option<&str>, &'static str> {
+    let api = headers
+        .get("x-api-key")
+        .map(|v| v.to_str().map_err(|_| "Invalid proxy API key"))
+        .transpose()?;
+    let bearer = headers
+        .get(http::header::AUTHORIZATION)
+        .map(|v| {
+            let value = v.to_str().map_err(|_| "Invalid authorization header")?;
+            let (scheme, key) = value
+                .split_once(' ')
+                .ok_or("Expected Bearer authorization")?;
+            if !scheme.eq_ignore_ascii_case("bearer")
+                || key.is_empty()
+                || key.chars().any(char::is_whitespace)
+            {
+                return Err("Expected Bearer authorization");
+            }
+            Ok(key)
+        })
+        .transpose()?;
+    if api.is_some() && bearer.is_some() && api != bearer {
+        return Err("Conflicting proxy credentials");
+    }
+    Ok(bearer.or(api))
+}
+
+async fn openai_models_endpoint(State(state): State<AppState>) -> Response {
+    let rows = crate::catalog::catalog(
+        &state.grok.model(),
+        &state.codex.model(),
+        state.openrouter.model(),
+    );
+    axum::Json(serde_json::json!({"object":"list","data": rows.iter().map(|row| serde_json::json!({"id":row.id,"object":"model","created":0,"owned_by":row.group})).collect::<Vec<_>>()})).into_response()
 }
 
 /// Domain errors of the client-key admin surface (multi-tenant #22), mapped
@@ -2114,6 +2173,7 @@ pub fn status_json(
                     "status": status,
                     "order": order + 1,
                     "blocked": blocked,
+                    "auth_failure_status": account.auth_failure_status,
                     "five_hour": window(&account.five_hour),
                     "seven_day": window(&account.seven_day),
                     // Model-scoped weekly windows (additive; null / empty when
@@ -2530,7 +2590,7 @@ async fn grok_config_endpoint(
 ///
 /// Registering root `/models` reserves a path that previously fell through to
 /// the upstream proxy fallback; Anthropic exposes no root `/models`, and
-/// `/v1/models` is untouched (still proxied), so nothing regresses.
+/// `/v1/models` is the OpenAI-shaped catalog for the Responses frontend.
 async fn models_endpoint(State(state): State<AppState>) -> Response {
     let models = crate::catalog::catalog(
         &state.grok.model(),
@@ -4286,7 +4346,7 @@ mod tests {
     fn status_json_marks_auth_failed_accounts() {
         let now = SystemTime::now();
         let pool = AccountPool::new(&[oauth_account("a")]);
-        pool.record_auth_failure(&AccountId("a".into()));
+        pool.record_auth_failure(&AccountId("a".into()), None);
         let meta = ServerMeta {
             pid: 1,
             uptime_secs: 0,
@@ -4302,7 +4362,7 @@ mod tests {
             &meta,
         );
         assert_eq!(doc["accounts"][0]["status"], "auth_failed");
-        assert_eq!(doc["accounts"][0]["blocked"], "auth failed");
+        assert_eq!(doc["accounts"][0]["blocked"], "! auth X");
         assert_eq!(doc["current"], serde_json::Value::Null);
     }
 
@@ -4547,9 +4607,9 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_json(response).await;
         let models = body["models"].as_array().expect("models array");
-        // 42 curated (15 claude + 13 codex + 4 grok + 10 openrouter) + 1
+        // 43 curated (15 claude + 14 codex + 4 grok + 10 openrouter) + 1
         // synthesized (grok-4.3 is out-of-catalog now).
-        assert_eq!(models.len(), 43);
+        assert_eq!(models.len(), 44);
 
         let by_id = |id: &str| {
             models
@@ -4578,10 +4638,23 @@ mod tests {
             by_id("gpt-5.6-sol")["aliases"],
             serde_json::json!(["gpt-5.6"])
         );
-        assert_eq!(by_id("gpt-6.1-sol")["aliases"], serde_json::json!(["sol"]));
-        assert_eq!(by_id("gpt-5.6-sol")["max_context"], 372_000);
+        assert_eq!(
+            by_id("gpt-6.1-sol")["aliases"],
+            serde_json::json!(["sol", "gpt-6.1"])
+        );
+        assert_eq!(by_id("gpt-6.1-sol")["max_context"], 272_000);
+        assert_eq!(by_id("gpt-6.1-sol[1m]")["max_context"], 1_000_000);
+        for id in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+            assert_eq!(by_id(id)["max_context"], 272_000);
+        }
+        assert_eq!(
+            by_id("claude-haiku-5-5[1m]")["aliases"],
+            serde_json::json!(["haiku", "haiku-5-5"])
+        );
+        assert_eq!(by_id("claude-haiku-5-5[1m]")["max_context"], 1_000_000);
+        assert_eq!(by_id("claude-haiku-4-5")["aliases"], serde_json::json!([]));
         // The codex `[1m]` opt-in rows ride the same serialization: 1M window,
-        // no aliases (those stay on the base rows), base sol unchanged.
+        // no aliases (the version alias stays on the base row).
         for id in ["gpt-5.6-sol[1m]", "gpt-5.6-terra[1m]"] {
             assert_eq!(by_id(id)["max_context"], 1_000_000, "{id}");
             assert_eq!(by_id(id)["aliases"], serde_json::json!([]), "{id}");
@@ -4589,11 +4662,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn models_routes_registered_and_v1_models_still_proxies() {
-        // Drive the REAL router on an ephemeral loopback port. Zero accounts,
-        // so the proxy fallback answers `/v1/models` with an error
-        // synchronously (no upstream network call) — proving that path is NOT
-        // intercepted by the catalog handler.
+    async fn models_routes_registered_and_v1_models_has_openai_shape() {
+        // Both client protocols discover the catalog locally, without accounts
+        // or upstream requests; the OpenAI path has its native list envelope.
         let dir = TempDir::new();
         let path = dir.path().join("llmux.json");
         let state = endpoint_state(&path, Vec::new());
@@ -4629,18 +4700,20 @@ mod tests {
         assert!(b1.contains("\"models\""), "catalog shape present");
         assert!(b1.contains("gpt-5.6-sol"), "curated ids present");
 
-        // `/v1/models` is not intercepted: it reaches the proxy fallback, which
-        // with no accounts returns an error — never the catalog shape.
+        // The Responses feature intentionally reserves /v1/models as OpenAI's list.
         let rv = client
             .get(format!("{base}/v1/models"))
             .send()
             .await
             .expect("GET /v1/models");
-        let bv = rv.text().await.expect("body");
-        assert!(
-            !bv.contains("gpt-5.6-sol"),
-            "/v1/models must reach the fallback, not return the catalog"
-        );
+        assert_eq!(rv.status(), reqwest::StatusCode::OK);
+        let bv: serde_json::Value = rv.json().await.expect("OpenAI list");
+        assert_eq!(bv["object"], "list");
+        assert!(bv["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["id"] == "gpt-5.6-sol" && m["object"] == "model"));
     }
 
     // ---- multi-tenant client keys (#22) ----

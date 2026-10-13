@@ -195,6 +195,7 @@ impl DashboardView {
             .map(|a| AccountSnapshot {
                 id: AccountId(a.name.clone()),
                 healthy: a.healthy,
+                auth_failure_status: a.auth_failure_status,
                 credential_kind: kind_static(&a.kind),
                 group: crate::routing::BackendGroup::from_kind(kind_static(&a.kind)),
                 five_hour: window_from_doc(&a.five_hour),
@@ -307,6 +308,7 @@ impl DashboardView {
                 id: r.id,
                 method: r.method.clone(),
                 path: r.path.clone(),
+                endpoint: r.endpoint,
                 account: r.account.clone(),
                 // group/model/effort/fast are filled at routing time and
                 // carried over the wire so the in-flight row shows the same
@@ -341,6 +343,7 @@ impl DashboardView {
                     at_ms,
                     method,
                     path,
+                    endpoint,
                     account,
                     status,
                     duration_ms,
@@ -369,6 +372,7 @@ impl DashboardView {
                         id: *id,
                         method: method.clone(),
                         path: path.clone(),
+                        endpoint: *endpoint,
                         account: account.clone(),
                         status: *status,
                         duration: Duration::from_millis(*duration_ms),
@@ -536,8 +540,52 @@ impl DashboardView {
 /// no controls at all, which is a DIFFERENT display state from "we have not
 /// looked yet" — an apikey account must never read as an account with unknown
 /// resets.
-fn has_usage_controls(credential_kind: &str) -> bool {
-    matches!(credential_kind, "codex")
+/// Providers whose accounts carry rate-limit reset entitlements: codex (WHAM
+/// reset credits) and Claude oauth (usage-limit reset grants, read through
+/// the same usage endpoint with `cedar_ember=1`).
+pub(crate) fn has_usage_controls(credential_kind: &str) -> bool {
+    matches!(credential_kind, "codex" | "oauth")
+}
+
+/// Compact "expires" rendering for an RFC3339 grant/credit expiry: absolute
+/// local time (`MM-DD HH:MM`, or `HH:MM` inside a day) plus the remaining
+/// countdown — the "만료일" the claude.ai card shows, in the TUI's own idiom.
+/// Falls back to the raw string when it does not parse, so an odd upstream
+/// value is still visible rather than blanked.
+pub(crate) fn expiry_label(expires_at: &str, now: SystemTime) -> String {
+    let Some(at) = crate::scheduler::headers::parse_rfc3339(expires_at) else {
+        return expires_at.to_string();
+    };
+    let offset = super::format::local_offset_secs(at);
+    let absolute = super::format::absolute_label(at, now, offset);
+    match at.duration_since(now) {
+        Ok(remaining) => format!(
+            "{absolute} (in {})",
+            crate::scheduler::select::compact_duration(remaining)
+        ),
+        Err(_) => format!("{absolute} (expired)"),
+    }
+}
+
+/// The soonest expiry among the listed live credits, when any carries one —
+/// compared as PARSED instants, not as strings (RFC3339 with mixed UTC
+/// offsets does not sort lexically). Unparseable rows cannot win, so a
+/// malformed value never displaces a real soonest expiry; they stay visible
+/// in the per-row listing.
+pub(crate) fn earliest_expiry(
+    control: &crate::proxy::usage_controls::UsageControlDoc,
+) -> Option<&str> {
+    control
+        .credits
+        .iter()
+        .filter(|c| c.status.as_deref() != Some("spent"))
+        .filter_map(|c| {
+            let raw = c.expires_at.as_deref()?;
+            let at = crate::scheduler::headers::parse_rfc3339(raw)?;
+            Some((at, raw))
+        })
+        .min_by_key(|(at, _)| *at)
+        .map(|(_, raw)| raw)
 }
 
 /// The compact accounts-table cell for an account's reset count:
@@ -554,6 +602,14 @@ pub(crate) fn reset_cell(
 ) -> String {
     if !has_usage_controls(credential_kind) {
         return "—".to_string();
+    }
+    // A Claude account the server declared ineligible on this surface is not
+    // "unknown" — the verdict is known; the detail pane carries the reason.
+    if control
+        .and_then(|c| c.eligibility.as_ref())
+        .is_some_and(|e| e.eligible == Some(false))
+    {
+        return "n/e".to_string();
     }
     match control.and_then(|c| c.available_resets) {
         None => "?".to_string(),
@@ -585,9 +641,17 @@ pub(crate) fn reset_detail(
     let Some(control) = control else {
         return "unknown — press f to refresh".to_string();
     };
-    let mut text = match control.available_resets {
-        None => "unknown — press f to refresh".to_string(),
-        Some(owned) => {
+    let ineligible = control
+        .eligibility
+        .as_ref()
+        .filter(|e| e.eligible == Some(false));
+    let mut text = match (ineligible, control.available_resets) {
+        (Some(e), _) => format!(
+            "not eligible on this surface ({})",
+            e.ineligible_reason.as_deref().unwrap_or("no reason given")
+        ),
+        (None, None) => "unknown — press f to refresh".to_string(),
+        (None, Some(owned)) => {
             let applicable = match control.applicable_resets {
                 Some(applicable) => format!(" · {applicable} applicable now"),
                 None => " · applicable unknown".to_string(),
@@ -595,6 +659,16 @@ pub(crate) fn reset_detail(
             format!("{owned} owned{applicable}")
         }
     };
+    if let Some(expires) = earliest_expiry(control) {
+        text.push_str(&format!(" · expires {}", expiry_label(expires, now)));
+    }
+    if let Some(weekly) = control
+        .eligibility
+        .as_ref()
+        .and_then(|e| e.weekly_resets_at.as_deref())
+    {
+        text.push_str(&format!(" · weekly resets {}", expiry_label(weekly, now)));
+    }
     if let Some(ms) = control.last_refresh_ms {
         let age = now.duration_since(ms_time(ms)).unwrap_or_default();
         text.push_str(&format!(
@@ -706,6 +780,37 @@ mod tests {
 
     fn now() -> SystemTime {
         UNIX_EPOCH + Duration::from_secs(1_000_000)
+    }
+
+    #[test]
+    fn account_state_line_survives_attached_dashboard_projection() {
+        for (healthy, paused, code, expected) in [
+            (false, false, None, "! auth X"),
+            (false, false, Some(404), "! 404 auth X"),
+            (true, true, None, "paused"),
+            (false, true, None, "paused + auth X"),
+            (false, true, Some(503), "paused + 503 auth X"),
+        ] {
+            let mut json = doc_json();
+            json["accounts"][0]["healthy"] = serde_json::json!(healthy);
+            json["accounts"][0]["paused"] = serde_json::json!(paused);
+            if let Some(code) = code {
+                json["accounts"][0]["auth_failure_status"] = serde_json::json!(code);
+            }
+            let doc: DashboardDoc = serde_json::from_value(json).expect("decode old or new daemon");
+            let view = DashboardView::from_doc(&doc);
+            let account = &view.snapshot.accounts[0];
+            assert_eq!(account.auth_failure_status, code);
+            assert_eq!(account.paused, paused);
+            let params = SelectParams::from(&crate::config::SchedulerConfig::default());
+            let now = SystemTime::now();
+            let reason = crate::scheduler::select::eligibility(account, &params, now, true)
+                .expect("auth or pause gate");
+            assert_eq!(
+                crate::scheduler::select::blocking_reason(account, reason, &params, now),
+                expected
+            );
+        }
     }
 
     #[test]
@@ -1172,10 +1277,86 @@ mod tests {
         use crate::proxy::usage_controls::UsageControlDoc;
         assert_eq!(reset_cell(None, "codex"), "?", "no metadata = unknown");
         assert_eq!(
+            reset_cell(None, "oauth"),
+            "?",
+            "claude accounts have controls too"
+        );
+        assert_eq!(
             reset_cell(None, "apikey"),
             "—",
             "a provider with no controls is not 'unknown'"
         );
+        assert_eq!(reset_cell(None, "grok"), "—");
+        let ineligible = UsageControlDoc {
+            eligibility: Some(crate::auth::codex_usage::ResetEligibility {
+                eligible: Some(false),
+                ineligible_reason: Some("surface".into()),
+                weekly_resets_at: None,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(reset_cell(Some(&ineligible), "oauth"), "n/e");
+        let detail = reset_detail(Some(&ineligible), "oauth", SystemTime::UNIX_EPOCH);
+        assert!(
+            detail.starts_with("not eligible on this surface (surface)"),
+            "{detail}"
+        );
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_791_300_000);
+        let eligible = UsageControlDoc {
+            available_resets: Some(1),
+            applicable_resets: Some(1),
+            eligibility: Some(crate::auth::codex_usage::ResetEligibility {
+                eligible: Some(true),
+                ineligible_reason: None,
+                weekly_resets_at: Some("2026-10-12T22:00:00+00:00".into()),
+            }),
+            credits: vec![crate::auth::codex_usage::ResetCredit {
+                id: Some("g".into()),
+                status: Some("available".into()),
+                expires_at: Some("2026-10-22T16:00:00+00:00".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let detail = reset_detail(Some(&eligible), "oauth", now);
+        assert!(
+            detail.starts_with("1 owned · 1 applicable now · expires "),
+            "{detail}"
+        );
+        assert!(detail.contains("weekly resets"), "{detail}");
+        assert!(
+            detail.contains("(in "),
+            "a future expiry carries a countdown: {detail}"
+        );
+        assert_eq!(
+            expiry_label("not-a-date", now),
+            "not-a-date",
+            "unparseable stays visible"
+        );
+        // Soonest expiry is chosen by INSTANT: the +09:00 row expires before
+        // the Z row even though it sorts after it as a string, and a
+        // malformed row never wins.
+        let credit = |id: &str, expires: &str| crate::auth::codex_usage::ResetCredit {
+            id: Some(id.into()),
+            status: Some("available".into()),
+            expires_at: Some(expires.into()),
+            ..Default::default()
+        };
+        let mixed = UsageControlDoc {
+            credits: vec![
+                credit("z", "2026-10-22T23:00:00Z"),
+                credit("kst", "2026-10-23T00:30:00+09:00"),
+                credit("bad", "garbage"),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(earliest_expiry(&mixed), Some("2026-10-23T00:30:00+09:00"));
+        let only_bad = UsageControlDoc {
+            credits: vec![credit("bad", "garbage")],
+            ..Default::default()
+        };
+        assert_eq!(earliest_expiry(&only_bad), None);
+        assert!(expiry_label("2026-01-01T00:00:00Z", now).ends_with("(expired)"));
         let doc = |available, applicable| UsageControlDoc {
             available_resets: available,
             applicable_resets: applicable,
@@ -1264,5 +1445,37 @@ mod tests {
             view.snapshot.accounts[0].group,
             crate::routing::BackendGroup::Grok
         );
+    }
+
+    #[test]
+    fn endpoint_origin_survives_dashboard_wire_and_attached_view() {
+        use crate::tui::Endpoint;
+        let mut json = doc_json();
+        for (wire, expected) in [
+            (Some("open_ai"), Endpoint::OpenAi),
+            (None, Endpoint::Anthropic),
+        ] {
+            {
+                let row = &mut json["activity"]["in_flight"][0];
+                if let Some(wire) = wire {
+                    row["endpoint"] = wire.into();
+                } else {
+                    row.as_object_mut().unwrap().remove("endpoint");
+                }
+            }
+            let row = &mut json["activity"]["completed"][0];
+            if let Some(wire) = wire {
+                row["endpoint"] = wire.into();
+            } else {
+                row.as_object_mut().unwrap().remove("endpoint");
+            }
+            let doc: DashboardDoc = serde_json::from_value(json.clone()).expect("decode");
+            let doc: DashboardDoc =
+                serde_json::from_slice(&serde_json::to_vec(&doc).unwrap()).unwrap();
+            let view = DashboardView::from_doc(&doc);
+            assert_eq!(view.in_flight[0].endpoint, expected);
+            assert!(matches!(&view.completed[0].body,
+                CompletedBody::Request { endpoint, .. } if *endpoint == expected));
+        }
     }
 }
