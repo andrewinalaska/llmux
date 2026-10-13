@@ -260,7 +260,10 @@ pub(crate) fn past_label(at: SystemTime, now: SystemTime, offset_secs: i64) -> S
         return clock_hm(at, offset_secs);
     }
     let (year, month, day) = civil_from_days(day_of(at));
-    format!("{month:02}/{day:02}/{year:04} {}", clock_hm(at, offset_secs))
+    format!(
+        "{month:02}/{day:02}/{year:04} {}",
+        clock_hm(at, offset_secs)
+    )
 }
 
 /// Local "M/D HH:MM" for an event-banner deadline — unpadded month/day,

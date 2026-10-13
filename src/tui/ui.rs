@@ -5414,7 +5414,13 @@ fn quota_bar_text(
         .filter(|rem| !rem.is_zero());
     let (text, bold_chars) = match (absolute, live) {
         // Absolute stamp (`t` toggle): `MM/DD HH:MM` local, date part bold.
-        (true, Some(_)) => (format::absolute_stamp(window.resets_at, format::local_offset_secs(window.resets_at)), 5),
+        (true, Some(_)) => (
+            format::absolute_stamp(
+                window.resets_at,
+                format::local_offset_secs(window.resets_at),
+            ),
+            5,
+        ),
         (false, Some(rem)) => {
             let (head, tail) = format::countdown_units(rem);
             let bold = head.chars().count();
