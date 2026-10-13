@@ -18,7 +18,36 @@ The older [spec](../.prd/11-llmux-islands-spec.md) and
 macOS inputs.
 User guide: [`../docs/llmux-islands.md`](../docs/llmux-islands.md).
 
+## Get started
+
+The setup screens and Start coding launcher described here ship on stable since
+v0.2.25 (2026-10-08; first on preview 2026-10-07). Install
+`brew install --cask 2lab-ai/tap/llmux-islands`, which also installs the matching
+CLI; a 0.2.24 install upgrades with `llmux update`. The 0.2.24 app predates these
+screens and cannot authenticate local control against the daemon — see
+[release availability](../docs/operational-reference.md#release-availability).
+
+Installed users do not need Xcode: open Islands, connect an account, then choose
+Claude Code/Codex and a project folder. **Open in Terminal** launches the existing
+llmux frontend only after a click. See the [user guide](../docs/llmux-islands.md#first-launch)
+for prerequisites, old-CLI recovery and remote limitations.
+
+The new macOS setup and launcher are native executor UI; shared dashboard state,
+provider selection, scheduler and Linux semantics are unchanged. See the active
+[get-started contract](../.prd/22-islands-get-started.md).
+
+### Notes for operators
+
+- Activity receipts distinguish incoming OpenAI requests with dark gray
+  backgrounds, including Claude models served through the SDK; see
+  [endpoint activity](../docs/codex-frontend/activity.md).
+- Node.js/npm are required only on a daemon serving Claude-through-Codex, not by
+  the native Islands UI itself.
+
 ## Build & run
+
+**Build from source (developers).** Ordinary users do not need Xcode; install
+the preview cask described in [Get started](#get-started) instead.
 
 Requires Xcode 15+, XcodeGen (`brew install xcodegen`), and the stable Rust
 toolchain installed through rustup. The Xcode build phase compiles and links the
@@ -49,9 +78,7 @@ hide it.
 | Pause/resume an account | `POST /llmux/pause-account` |
 | Email anonymity and operator events | `POST /llmux/settings`, `POST /llmux/events` |
 
-Remote daemons require HTTPS and an `x-api-key`; redirects are denied. Loopback
-may use HTTP, is exempt from the control key, and never receives a configured
-remote key header.
+Remote daemons require HTTPS and an `x-api-key`; redirects are denied. llmux itself does not terminate TLS; put an HTTPS reverse proxy in front of a remote daemon. Loopback may use HTTP and authenticates through the private `llmux islands-connection --port N` handoff. The CLI reads only its owned config; the native executor receives only a matching local endpoint/control key through bounded Process pipes. It never receives provider credentials, persists the key, or sends a configured remote key to loopback. HTTP 401/403 prevents daemon spawning. Remote-key reuse is restricted to the same endpoint.
 
 ## Layout
 

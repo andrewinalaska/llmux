@@ -421,6 +421,7 @@ fn trace_event(event: &ActivityEvent) {
             id,
             method,
             path,
+            endpoint,
             account,
             status,
             duration,
@@ -450,7 +451,7 @@ fn trace_event(event: &ActivityEvent) {
                 _ => 0.0,
             };
             tracing::info!(
-                id, %method, %path,
+                id, %method, %path, ?endpoint,
                 account = account.as_deref().unwrap_or("-"),
                 status,
                 duration_ms = duration.as_millis() as u64,
@@ -971,6 +972,9 @@ pub struct AccountDoc {
     pub order: u64,
     pub blocked: Option<String>,
     pub healthy: bool,
+    /// Optional for documents from older daemons.
+    #[serde(default)]
+    pub auth_failure_status: Option<u16>,
     pub five_hour: Option<WindowDoc>,
     pub seven_day: Option<WindowDoc>,
     /// The "Fable" model-scoped weekly window surfaced for convenient reads;
@@ -1370,6 +1374,8 @@ pub struct InFlightDoc {
     pub id: u64,
     pub method: String,
     pub path: String,
+    #[serde(default)]
+    pub endpoint: crate::tui::Endpoint,
     pub account: Option<String>,
     pub started_at_ms: u64,
     /// Backend group / served model / per-request effort / fast, filled at
@@ -1424,6 +1430,8 @@ pub enum CompletedDoc {
         at_ms: u64,
         method: String,
         path: String,
+        #[serde(default)]
+        endpoint: crate::tui::Endpoint,
         account: Option<String>,
         status: u16,
         duration_ms: u64,
@@ -1916,6 +1924,7 @@ pub(crate) fn dashboard_doc(
                 order: pos as u64 + 1,
                 blocked,
                 healthy: account.healthy,
+                auth_failure_status: account.auth_failure_status,
                 five_hour: window_doc(&account.five_hour, now),
                 seven_day: window_doc(&account.seven_day, now),
                 fable_weekly: account
@@ -1996,6 +2005,7 @@ pub(crate) fn dashboard_doc(
                 id: r.id,
                 method: r.method.clone(),
                 path: r.path.clone(),
+                endpoint: r.endpoint,
                 account: r.account.clone(),
                 started_at_ms: epoch_ms(r.started_at),
                 group: r.group.clone(),
@@ -2024,6 +2034,7 @@ pub(crate) fn dashboard_doc(
                     id,
                     method,
                     path,
+                    endpoint,
                     account,
                     status,
                     duration,
@@ -2049,6 +2060,7 @@ pub(crate) fn dashboard_doc(
                     at_ms: epoch_ms(entry.at),
                     method: method.clone(),
                     path: path.clone(),
+                    endpoint: *endpoint,
                     account: account.clone(),
                     status: *status,
                     duration_ms: u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
@@ -2571,6 +2583,7 @@ mod tests {
                 id: 1,
                 method: "POST".into(),
                 path: "/v1/messages".into(),
+                endpoint: crate::tui::Endpoint::Anthropic,
                 kind: None,
                 user_id: None,
                 tenant: None,
@@ -2584,6 +2597,7 @@ mod tests {
                 id: 1,
                 method: "POST".into(),
                 path: "/v1/messages".into(),
+                endpoint: crate::tui::Endpoint::Anthropic,
                 account: Some("a".into()),
                 status: 200,
                 duration: Duration::from_millis(1_400),
@@ -2615,6 +2629,7 @@ mod tests {
                 id: 2,
                 method: "POST".into(),
                 path: "/v1/messages".into(),
+                endpoint: crate::tui::Endpoint::Anthropic,
                 kind: None,
                 user_id: None,
                 tenant: None,
@@ -2688,6 +2703,76 @@ mod tests {
         )
     }
 
+    #[test]
+    fn account_state_line_reaches_dashboard_and_status_without_details() {
+        for (healthy, paused, code, expected) in [
+            (false, false, None, "! auth X"),
+            (
+                false,
+                false,
+                Some(http::StatusCode::NOT_FOUND),
+                "! 404 auth X",
+            ),
+            (true, true, None, "paused"),
+            (false, true, None, "paused + auth X"),
+            (
+                false,
+                true,
+                Some(http::StatusCode::SERVICE_UNAVAILABLE),
+                "paused + 503 auth X",
+            ),
+        ] {
+            let pool = AccountPool::new(&[oauth_account("a")]);
+            if !healthy {
+                pool.record_auth_failure(&AccountId("a".into()), code);
+            }
+            if paused {
+                pool.apply_paused(&std::collections::BTreeSet::from(["a".to_string()]));
+            }
+            let doc = dashboard_doc(
+                &pool.snapshot(),
+                &seeded_hub().view(now()),
+                &UsageTotals::default(),
+                &params(),
+                now(),
+                &meta(),
+            );
+            let json = serde_json::to_value(&doc).expect("serialize");
+            assert_eq!(
+                json["accounts"][0]["auth_failure_status"],
+                serde_json::json!(code.map(|c| c.as_u16()))
+            );
+            assert_eq!(json["accounts"][0]["blocked"], expected);
+            assert_eq!(json["accounts"][0]["paused"], paused);
+            let decoded: DashboardDoc = serde_json::from_value(json).expect("decode");
+            assert_eq!(
+                decoded.accounts[0].auth_failure_status,
+                code.map(|c| c.as_u16())
+            );
+            let status = crate::proxy::server::status_json(
+                &pool.snapshot(),
+                &UsageTotals::default(),
+                &params(),
+                now(),
+                &crate::proxy::server::ServerMeta {
+                    pid: 1,
+                    uptime_secs: 0,
+                    port: 3456,
+                    email_anonymous: false,
+                    usage_controls: Default::default(),
+                },
+            );
+            assert_eq!(status["accounts"][0]["blocked"], expected);
+            if !healthy {
+                assert_eq!(status["accounts"][0]["status"], "auth_failed");
+            }
+            assert_eq!(
+                status["accounts"][0]["auth_failure_status"],
+                serde_json::json!(code.map(|c| c.as_u16()))
+            );
+        }
+    }
+
     /// Multi-tenant #22: the doc's tenant rows join hub aggregates with key
     /// metadata (name/email), price the per-model cells, and carry the
     /// first/last-seen span. Unknown ids (pre-tenant history) name themselves.
@@ -2700,6 +2785,7 @@ mod tests {
                     id,
                     method: "POST".into(),
                     path: "/v1/messages".into(),
+                    endpoint: crate::tui::Endpoint::Anthropic,
                     account: Some("a".into()),
                     status: 200,
                     duration: Duration::from_millis(900),
@@ -2843,6 +2929,7 @@ mod tests {
         for (i, (tenant, group, model, tokens)) in requests.iter().enumerate() {
             live.apply_event(
                 ActivityEvent::RequestFinished {
+                    endpoint: crate::tui::Endpoint::Anthropic,
                     id: i as u64 + 1,
                     method: "POST".into(),
                     path: "/v1/messages".into(),
@@ -3047,6 +3134,7 @@ mod tests {
                     id,
                     method: "POST".into(),
                     path: "/v1/messages".into(),
+                    endpoint: crate::tui::Endpoint::Anthropic,
                     account: Some("a".into()),
                     status: 200,
                     duration: Duration::from_millis(900),
@@ -3134,6 +3222,7 @@ mod tests {
             id,
             method: "POST".into(),
             path: "/v1/messages".into(),
+            endpoint: crate::tui::Endpoint::Anthropic,
             kind: Some("user".into()),
             user_id: Some("u1".into()),
             tenant: tenant.map(str::to_string),
@@ -3940,6 +4029,7 @@ mod tests {
                     id: i,
                     method: "POST".into(),
                     path: format!("/v1/messages/{i}"),
+                    endpoint: crate::tui::Endpoint::Anthropic,
                     account: Some("a".into()),
                     status: 200,
                     duration: Duration::from_millis(10),
@@ -3987,6 +4077,7 @@ mod tests {
             id,
             method: "POST".into(),
             path: "/v1/messages".into(),
+            endpoint: crate::tui::Endpoint::Anthropic,
             account: Some(account.into()),
             status: 200,
             duration: Duration::from_millis(10),
@@ -4131,6 +4222,7 @@ mod tests {
         tokens: Option<TokenCounts>,
     ) -> ActivityEvent {
         ActivityEvent::RequestFinished {
+            endpoint: crate::tui::Endpoint::Anthropic,
             id,
             method: "POST".into(),
             path: "/v1/messages".into(),
@@ -4318,6 +4410,7 @@ mod tests {
         let hub = DashboardHub::default();
         hub.apply_event(
             ActivityEvent::RequestStarted {
+                endpoint: crate::tui::Endpoint::Anthropic,
                 id: 9,
                 method: "POST".into(),
                 path: "/v1/messages".into(),
@@ -4400,5 +4493,47 @@ mod tests {
             doc.session_labels.get("u1").map(String::as_str),
             Some("hello")
         );
+    }
+
+    #[test]
+    fn endpoint_origin_reaches_dashboard_document_from_live_events() {
+        use crate::tui::Endpoint;
+        let pool = AccountPool::new(&[oauth_account("a")]);
+        let hub = DashboardHub::default();
+        hub.apply_event(
+            ActivityEvent::RequestStarted {
+                id: 21,
+                method: "POST".into(),
+                path: "/v1/responses".into(),
+                endpoint: Endpoint::OpenAi,
+                kind: None,
+                user_id: None,
+                tenant: None,
+                excerpt: None,
+                session_name: None,
+            },
+            now(),
+        );
+        let mut finish = finished_for(22, "a");
+        if let ActivityEvent::RequestFinished { endpoint, .. } = &mut finish {
+            *endpoint = Endpoint::OpenAi;
+        }
+        hub.apply_event(finish, now());
+        let doc = dashboard_doc(
+            &pool.snapshot(),
+            &hub.view(now()),
+            &UsageTotals::default(),
+            &params(),
+            now(),
+            &meta(),
+        );
+        assert_eq!(doc.activity.in_flight[0].endpoint, Endpoint::OpenAi);
+        assert!(matches!(
+            doc.activity.completed[0],
+            CompletedDoc::Request {
+                endpoint: Endpoint::OpenAi,
+                ..
+            }
+        ));
     }
 }

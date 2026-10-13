@@ -247,6 +247,145 @@ fn env_prints_api_key_export_when_proxy_key_set() {
     );
 }
 
+#[test]
+fn env_codex_exports_selected_remote_key_and_responses_url() {
+    let h = Harness::new();
+    h.seed_config(r#"{"version":1,"proxy":{"port":39103,"api_key":"lm-local-admin"},"remote":{"host":"gateway.example","port":4567,"api_key":"lmk-remote-client"},"accounts":[]}"#);
+    let out = Output::run({
+        let mut c = h.cmd();
+        c.args(["--remote", "override.example:5678", "env", "--codex"]);
+        c
+    });
+    assert_eq!(out.code, Some(0), "{}", out.stderr);
+    assert!(out
+        .stdout
+        .contains("export OPENAI_BASE_URL=http://override.example:5678/v1\n"));
+    assert!(out
+        .stdout
+        .contains("export OPENAI_API_KEY=lmk-remote-client\n"));
+    assert!(out
+        .stdout
+        .contains("model_providers.llmux_env.requires_openai_auth=false"));
+    assert!(out
+        .stdout
+        .contains("model_providers.llmux_env.env_key=\"OPENAI_API_KEY\""));
+    assert!(!out.stdout.contains("lm-local-admin"));
+    assert!(!out.stdout.contains("ANTHROPIC_"));
+}
+
+#[test]
+fn env_codex_initializes_local_key_and_refuses_missing_remote_key_without_exports() {
+    let h = Harness::new();
+    h.seed_config(&config_json(39104, "[]"));
+    let local = Output::run({
+        let mut c = h.cmd();
+        c.args(["env", "--codex"]);
+        c
+    });
+    assert_eq!(local.code, Some(0), "{}", local.stderr);
+    assert!(local
+        .stdout
+        .contains("export OPENAI_BASE_URL=http://localhost:39104/v1\n"));
+    assert!(local.stdout.contains("export OPENAI_API_KEY=lm-"));
+    for key in [
+        serde_json::Value::Null,
+        serde_json::json!(""),
+        serde_json::json!("  "),
+    ] {
+        h.seed_config(
+            &serde_json::json!({
+                "version": 1,
+                "proxy": {"api_key": "lm-local-admin"},
+                "remote": {"host": "gateway.example", "api_key": key},
+                "accounts": []
+            })
+            .to_string(),
+        );
+        let out = Output::run({
+            let mut c = h.cmd();
+            c.args(["env", "--codex"])
+                .env("OPENAI_API_KEY", "unrelated-inherited-key");
+            c
+        });
+        assert_ne!(out.code, Some(0));
+        assert_eq!(out.stdout, "");
+        assert!(out.stderr.contains("remote.api_key"));
+        assert!(!out.stderr.contains("lm-local-admin"));
+        assert!(!out.stderr.contains("unrelated-inherited-key"));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn env_exports_round_trip_shell_metacharacters_without_executing_them() {
+    let h = Harness::new();
+    let host = "gateway'$(touch should-not-exist)`touch also-not`;\\\"\n.example";
+    let key = "lmk-quote'$(touch should-not-exist)`touch also-not`;\\\"\nsecret";
+    h.seed_config(
+        &serde_json::json!({
+            "version": 1,
+            "proxy": {"api_key": "lm-local-admin"},
+            "remote": {"host": host, "port": 4567, "api_key": key},
+            "accounts": []
+        })
+        .to_string(),
+    );
+    for codex in [false, true] {
+        let out = Output::run({
+            let mut c = h.cmd();
+            c.arg("env");
+            if codex {
+                c.arg("--codex");
+            }
+            c
+        });
+        assert_eq!(out.code, Some(0), "{}", out.stderr);
+        let prefix = if codex { "OPENAI" } else { "ANTHROPIC" };
+        let script = format!(
+            "{}\nprintf '%s\\0%s' \"${prefix}_BASE_URL\" \"${prefix}_API_KEY\"",
+            out.stdout
+        );
+        let shell = Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .current_dir(h.dir.path())
+            .output()
+            .expect("shell");
+        assert!(shell.status.success(), "{:?}", shell.stderr);
+        let suffix = if codex { "/v1" } else { "" };
+        assert_eq!(
+            shell.stdout,
+            format!("http://{host}:4567{suffix}\0{key}").into_bytes()
+        );
+        assert!(!h.dir.path().join("should-not-exist").exists());
+        assert!(!h.dir.path().join("also-not").exists());
+        if codex {
+            // Un-comment the suggested command and capture its argv instead of
+            // launching a client. TOML then shell quoting must survive together.
+            let command = out
+                .stdout
+                .lines()
+                .find_map(|l| l.strip_prefix("# codex "))
+                .expect("Codex hint");
+            let capture = format!("set -- {command}; printf '%s\\0' \"$@\"");
+            let argv = Command::new("sh")
+                .args(["-c", &capture])
+                .current_dir(h.dir.path())
+                .output()
+                .expect("argv capture");
+            assert!(argv.status.success());
+            let expected = format!(
+                "model_providers.llmux_env.base_url={}\0",
+                serde_json::json!(format!("http://{host}:4567/v1"))
+            );
+            assert!(String::from_utf8(argv.stdout)
+                .expect("utf8")
+                .contains(&expected));
+            assert!(!h.dir.path().join("should-not-exist").exists());
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // CLI-14 / CLI-15 — `status` with no server.
 // ---------------------------------------------------------------------------
@@ -885,8 +1024,11 @@ fn server_exits_at_the_drain_deadline_with_a_connection_still_open() {
         let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe port");
         probe.local_addr().expect("probe addr").port()
     };
+    // This test measures local connection drain only. The default immediate
+    // idle sweep would send this fake key to the real upstream and can leave
+    // blocking DNS work running during Tokio runtime teardown.
     h.seed_config(&format!(
-        r#"{{"version":1,"proxy":{{"port":{port},"api_key":"testkey"}},"accounts":[{{"name":"fake","type":"apikey","api_key":"sk-ant-test"}}]}}"#
+        r#"{{"version":1,"proxy":{{"port":{port},"api_key":"testkey","idle_probe":{{"enabled":false}}}},"accounts":[{{"name":"fake","type":"apikey","api_key":"sk-ant-test"}}]}}"#
     ));
 
     let mut cmd = h.cmd();
@@ -951,7 +1093,9 @@ fn server_exits_at_the_drain_deadline_with_a_connection_still_open() {
         }
         if Instant::now() >= exit_deadline {
             let _ = child.kill();
-            panic!("server still alive 15s after shutdown with a hung connection open");
+            let _ = child.wait();
+            let joined = stderr_lines.join().expect("stderr thread").join("\n");
+            panic!("server still alive 15s after shutdown with a hung connection open\n{joined}");
         }
         std::thread::sleep(Duration::from_millis(50));
     };
@@ -980,4 +1124,145 @@ fn now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Codex subcommand configuration replaces clap's parent config list. All
+/// provider settings must be inside exec, before user overrides.
+#[test]
+fn run_codex_scopes_provider_to_exec_and_propagates_exit() {
+    let h = Harness::new();
+    h.seed_config(
+        r#"{"version":1,"remote":{"host":"127.0.0.1","port":45678,"api_key":"remote-key"},"accounts":[]}"#,
+    );
+    let bindir = h.dir.path().join("bin");
+    std::fs::create_dir_all(&bindir).unwrap();
+    let stub = bindir.join("codex");
+    std::fs::write(
+        &stub,
+        "#!/bin/sh\nprintf '%s\\n' \"$@\"\nprintf 'KEY=%s\\n' \"$LLMUX_CODEX_API_KEY\"\nexit 7\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let output = h
+        .cmd()
+        .args([
+            "run",
+            "--codex",
+            "--no-model-picker",
+            "--",
+            "exec",
+            "--ignore-user-config",
+            "-c",
+            "model_reasoning_effort=low",
+            "hello",
+        ])
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                bindir.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env("OPENAI_API_KEY", "unrelated-key")
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(7),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let out = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        out.starts_with("exec\n-c\nmodel_provider=\"llmux\""),
+        "{out}"
+    );
+    assert!(
+        out.contains("base_url=\"http://127.0.0.1:45678/v1\""),
+        "{out}"
+    );
+    assert!(out.contains("KEY=remote-key"));
+    assert!(!out.contains("unrelated-key"));
+    assert!(out.contains("--ignore-user-config\n-c\nmodel_reasoning_effort=low\nhello"));
+}
+
+// Native first-run ordering: read-only handoff cannot create a config/key;
+// starting the daemon initializes its admin key before the next handoff.
+#[test]
+fn islands_connection_cold_start_reads_only_then_authenticates_dashboard() {
+    use std::io::Read as _;
+    use std::net::TcpStream;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+    let h = Harness::new();
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let handoff = || {
+        h.cmd()
+            .args(["islands-connection", "--port", &port.to_string()])
+            .output()
+            .unwrap()
+    };
+    assert!(!handoff().status.success());
+    assert!(
+        !h.config_path.exists(),
+        "handoff must not initialize configuration"
+    );
+    h.seed_config(&format!(r#"{{"version":1,"proxy":{{"port":{port},"idle_probe":{{"enabled":false}}}},"accounts":[]}}"#));
+    assert!(!handoff().status.success(), "missing key must fail closed");
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let _server = ChildGuard(
+        h.cmd()
+            .args(["server", "--no-tui"])
+            .env("HOME", h.dir.path())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "isolated cold-start daemon did not bind"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let before = std::fs::read(&h.config_path).unwrap();
+    let output = handoff();
+    assert!(output.status.success(), "handoff failed after bootstrap");
+    let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(receipt.as_object().unwrap().len(), 2);
+    assert_eq!(receipt["endpoint"], format!("http://127.0.0.1:{port}"));
+    let key = receipt["api_key"].as_str().expect("control key");
+    assert!(!key.is_empty());
+    assert_eq!(std::fs::read(&h.config_path).unwrap(), before);
+    let mut socket = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    write!(socket, "GET /llmux/dashboard HTTP/1.1\r\nHost: localhost\r\nx-api-key: {key}\r\nConnection: close\r\n\r\n").unwrap();
+    let mut reply = String::new();
+    socket.read_to_string(&mut reply).unwrap();
+    assert!(
+        reply.starts_with("HTTP/1.1 200"),
+        "authenticated empty dashboard must succeed"
+    );
 }

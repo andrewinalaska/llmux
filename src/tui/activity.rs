@@ -63,6 +63,7 @@ pub(crate) struct InFlight {
     pub id: u64,
     pub method: String,
     pub path: String,
+    pub endpoint: crate::tui::Endpoint,
     pub account: Option<String>,
     pub group: Option<String>,
     pub model: Option<String>,
@@ -109,6 +110,7 @@ pub(crate) enum CompletedBody {
         id: u64,
         method: String,
         path: String,
+        endpoint: crate::tui::Endpoint,
         account: Option<String>,
         status: u16,
         duration: Duration,
@@ -928,6 +930,8 @@ pub(crate) struct PersistedRequest {
     pub id: u64,
     pub method: String,
     pub path: String,
+    #[serde(default)]
+    pub endpoint: crate::tui::Endpoint,
     pub account: Option<String>,
     pub status: u16,
     pub duration_ms: u64,
@@ -993,6 +997,7 @@ impl PersistedRequest {
             id,
             method,
             path,
+            endpoint,
             account,
             status,
             duration,
@@ -1024,6 +1029,7 @@ impl PersistedRequest {
             id: *id,
             method: method.clone(),
             path: path.clone(),
+            endpoint: *endpoint,
             account: account.clone(),
             status: *status,
             duration_ms: u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
@@ -1052,6 +1058,7 @@ impl PersistedRequest {
             id: self.id,
             method: self.method,
             path: self.path,
+            endpoint: self.endpoint,
             account: self.account,
             status: self.status,
             duration: Duration::from_millis(self.duration_ms),
@@ -2231,6 +2238,7 @@ impl ActivityLog {
                 id,
                 method,
                 path,
+                endpoint,
                 kind,
                 user_id,
                 tenant,
@@ -2258,6 +2266,7 @@ impl ActivityLog {
                     id,
                     method,
                     path,
+                    endpoint,
                     account: None,
                     group: None,
                     model: None,
@@ -2295,6 +2304,7 @@ impl ActivityLog {
                 id,
                 method,
                 path,
+                endpoint,
                 account,
                 status,
                 duration,
@@ -2438,6 +2448,7 @@ impl ActivityLog {
                         id,
                         method,
                         path,
+                        endpoint,
                         account,
                         status,
                         duration,
@@ -2565,6 +2576,7 @@ mod tests {
                 id: 1,
                 method: "POST".into(),
                 path: "/v1/messages".into(),
+                endpoint: crate::tui::Endpoint::Anthropic,
                 account: Some("a".into()),
                 status: 200,
                 duration: Duration::from_millis(100),
@@ -2630,6 +2642,7 @@ mod tests {
             id,
             method: "POST".into(),
             path: "/v1/messages".into(),
+            endpoint: crate::tui::Endpoint::Anthropic,
             kind: None,
             user_id: None,
             tenant: None,
@@ -2644,6 +2657,7 @@ mod tests {
             id,
             method: "POST".into(),
             path: "/v1/messages".into(),
+            endpoint: crate::tui::Endpoint::Anthropic,
             kind: Some("user".into()),
             user_id: Some(user_id.into()),
             tenant: None,
@@ -2683,6 +2697,7 @@ mod tests {
             id,
             method: "POST".into(),
             path: "/v1/messages".into(),
+            endpoint: crate::tui::Endpoint::Anthropic,
             account: account.map(str::to_string),
             status,
             duration: Duration::from_millis(1_400),
@@ -2724,6 +2739,7 @@ mod tests {
             id,
             method: "POST".into(),
             path: path.into(),
+            endpoint: crate::tui::Endpoint::Anthropic,
             account: account.map(str::to_string),
             status,
             duration: Duration::from_millis(1_400),
@@ -2756,6 +2772,7 @@ mod tests {
             id,
             method: "POST".into(),
             path: "/v1/messages".into(),
+            endpoint: crate::tui::Endpoint::Anthropic,
             account: None,
             status,
             duration: Duration::from_millis(1_400),
@@ -2889,6 +2906,7 @@ mod tests {
                 id: 1,
                 method: "POST".into(),
                 path: "/v1/messages".into(),
+                endpoint: crate::tui::Endpoint::Anthropic,
                 kind: Some("user".into()),
                 user_id: Some("u1".into()),
                 tenant: Some("k-t1".into()),
@@ -3468,6 +3486,7 @@ mod tests {
                 id,
                 method,
                 path,
+                endpoint,
                 account,
                 status,
                 duration,
@@ -3489,6 +3508,7 @@ mod tests {
                 id,
                 method,
                 path,
+                endpoint,
                 account,
                 status,
                 duration,
@@ -3917,6 +3937,7 @@ mod tests {
             id,
             method: "POST".into(),
             path: path.into(),
+            endpoint: crate::tui::Endpoint::Anthropic,
             account: Some(account.to_string()),
             status,
             duration: Duration::from_millis(1_234),
@@ -4026,6 +4047,7 @@ mod tests {
             id,
             method: "POST".into(),
             path: "/v1/messages".into(),
+            endpoint: crate::tui::Endpoint::Anthropic,
             account: Some("acct".into()),
             status: 500,
             duration: Duration::from_millis(10),
@@ -4349,6 +4371,7 @@ mod tests {
             "absent split is unknown"
         );
         let event = |id: u64, h1: Option<u64>| ActivityEvent::RequestFinished {
+            endpoint: crate::tui::Endpoint::Anthropic,
             id,
             method: "POST".into(),
             path: "/v1/messages".into(),
@@ -4417,6 +4440,7 @@ mod tests {
                 id,
                 method: "POST".into(),
                 path: "/v1/messages".into(),
+                endpoint: crate::tui::Endpoint::Anthropic,
                 account: Some("a".into()),
                 status,
                 duration: Duration::from_millis(duration_ms),
@@ -4513,6 +4537,7 @@ mod tests {
             id,
             method: "POST".into(),
             path: "/v1/messages".into(),
+            endpoint: crate::tui::Endpoint::Anthropic,
             account: Some("a".into()),
             status: 200,
             duration: Duration::from_millis(1_000),
@@ -5099,6 +5124,7 @@ mod tests {
         excerpt: &str,
     ) -> ActivityEvent {
         ActivityEvent::RequestFinished {
+            endpoint: crate::tui::Endpoint::Anthropic,
             id,
             method: "POST".into(),
             path: "/v1/messages".into(),
@@ -5163,6 +5189,7 @@ mod tests {
         // The start fold applies the same rule (running rows label identically).
         log.apply(
             ActivityEvent::RequestStarted {
+                endpoint: crate::tui::Endpoint::Anthropic,
                 id: 4,
                 method: "POST".into(),
                 path: "/v1/messages".into(),
@@ -5424,8 +5451,11 @@ mod tests {
         let record = PersistedRequest::from_event(&event, at(1)).expect("record");
         let line = serde_json::to_string(&record).expect("json");
         assert!(!line.contains("session_name"), "{line}");
-        let expected = r#"{"v":1,"ts_ms":1000,"id":7,"method":"POST","path":"/v1/messages","account":"a","status":200,"duration_ms":900,"tokens":{"input":10,"output":20,"cache_read":null,"cache_creation":null},"group":"claude","model":"claude-opus-5-5","effort":null,"fast":false,"ttfb_ms":null,"ttft_ms":null,"gen_ms":null,"aborted":false,"user_id":"u1","kind":"user","excerpt":"Hi","tenant":"local"}"#;
-        assert_eq!(line, expected, "unnamed line is the pre-field format");
+        let expected = r#"{"v":1,"ts_ms":1000,"id":7,"method":"POST","path":"/v1/messages","endpoint":"anthropic","account":"a","status":200,"duration_ms":900,"tokens":{"input":10,"output":20,"cache_read":null,"cache_creation":null},"group":"claude","model":"claude-opus-5-5","effort":null,"fast":false,"ttfb_ms":null,"ttft_ms":null,"gen_ms":null,"aborted":false,"user_id":"u1","kind":"user","excerpt":"Hi","tenant":"local"}"#;
+        assert_eq!(
+            line, expected,
+            "unnamed line is the pre-session-name-field format (modulo endpoint)"
+        );
         let mut log = ActivityLog::new(8);
         log.apply(event, at(1));
         assert!(log.session_stats().is_empty());
@@ -5453,5 +5483,63 @@ mod tests {
             }
             other => panic!("expected finish, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn endpoint_origin_survives_routing_finish_and_persisted_replay() {
+        use crate::tui::Endpoint;
+        let mut log = ActivityLog::new(LOG_CAPACITY);
+        let mut start = started(42);
+        if let ActivityEvent::RequestStarted { endpoint, .. } = &mut start {
+            *endpoint = Endpoint::OpenAi;
+        }
+        log.apply(start, at(10));
+        log.apply(
+            ActivityEvent::RequestRouted {
+                id: 42,
+                account: "claude-account".into(),
+                group: Some("claude".into()),
+                model: Some("sonnet".into()),
+                effort: None,
+                fast: false,
+            },
+            at(10),
+        );
+        assert_eq!(log.in_flight()[0].endpoint, Endpoint::OpenAi);
+        // Both an upstream error and a client-disconnect finish keep origin;
+        // the latter has no corresponding start (lossy event channel).
+        for (id, status, aborted) in [(42, 502, true), (43, 200, false)] {
+            let mut event = finished(id, Some("claude-account"), None);
+            if let ActivityEvent::RequestFinished {
+                endpoint,
+                status: event_status,
+                aborted: event_aborted,
+                ..
+            } = &mut event
+            {
+                *endpoint = Endpoint::OpenAi;
+                *event_status = status;
+                *event_aborted = aborted;
+            }
+            let record = PersistedRequest::from_event(&event, at(11)).expect("record");
+            let json = serde_json::to_value(&record).expect("serialize");
+            assert_eq!(json["endpoint"], "open_ai");
+            let replay: PersistedRequest = serde_json::from_value(json.clone()).expect("parse");
+            let (replayed, ts) = replay.into_event();
+            assert_eq!(replayed, event);
+            log.apply(replayed, ts);
+            assert!(matches!(
+                &log.completed().next().expect("row").body,
+                CompletedBody::Request {
+                    endpoint: Endpoint::OpenAi,
+                    ..
+                }
+            ));
+            let mut legacy = json;
+            legacy.as_object_mut().expect("object").remove("endpoint");
+            let legacy: PersistedRequest = serde_json::from_value(legacy).expect("old record");
+            assert_eq!(legacy.endpoint, Endpoint::Anthropic);
+        }
+        assert!(log.in_flight().is_empty());
     }
 }

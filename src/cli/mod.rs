@@ -6,9 +6,11 @@ pub mod accounts;
 pub mod api;
 pub mod brew;
 pub mod channel;
+pub mod claude_context;
 pub mod daemon;
 pub mod env;
 pub mod import;
+pub mod islands;
 pub mod keys;
 pub mod login;
 pub mod run;
@@ -95,8 +97,11 @@ pub enum Command {
     /// Import accounts from teamclaude config, ~/.claude/.credentials.json,
     /// or inline JSON.
     Import(ImportArgs),
-    /// Print the env exports for pointing Claude Code at the proxy.
+    /// Print shell exports for Claude Code (or Codex with --codex).
     Env(EnvArgs),
+    /// Private local-control handoff for the native Islands executor.
+    #[command(hide = true)]
+    IslandsConnection(islands::ConnectionArgs),
     /// Attach to a running daemon and render its dashboard (read-only except
     /// manual switch). Polls `GET /llmux/dashboard` over HTTP.
     Dashboard(DashboardArgs),
@@ -150,6 +155,9 @@ pub struct ServerArgs {
 
 #[derive(Debug, Args)]
 pub struct RunArgs {
+    /// Launch Codex against llmux Responses instead of Claude Code.
+    #[arg(long)]
+    pub codex: bool,
     /// Restart the daemon even when it already runs this binary's version
     /// (by default a same-version daemon is reused; a different version is
     /// always restarted).
@@ -163,7 +171,7 @@ pub struct RunArgs {
     /// aliases (a var you already set is left alone).
     #[arg(long)]
     pub no_model_picker: bool,
-    /// Arguments passed through to `claude` after `--`.
+    /// Arguments passed through to the selected client after `--`.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub args: Vec<String>,
 }
@@ -212,7 +220,12 @@ pub struct ImportArgs {
 }
 
 #[derive(Debug, Args)]
-pub struct EnvArgs {}
+pub struct EnvArgs {
+    /// Export OpenAI-compatible variables and print a Codex provider command.
+    /// Use `llmux run --codex` to launch directly instead.
+    #[arg(long)]
+    pub codex: bool,
+}
 
 #[derive(Debug, Args)]
 pub struct DashboardArgs {}
@@ -410,6 +423,7 @@ pub async fn dispatch(cli: Cli) -> Result<(), CliError> {
         Command::Login(args) => login::run(args).await,
         Command::Import(args) => import::run(args).await,
         Command::Env(args) => env::run(args, remote).await,
+        Command::IslandsConnection(args) => islands::connection(args, remote),
         Command::Dashboard(args) => dashboard(args, remote).await,
         Command::Status(args) => status::run(args, remote).await,
         Command::Accounts(args) => accounts::run(args, remote).await,
@@ -933,7 +947,10 @@ mod tests {
             })),
             None
         );
-        assert_eq!(remote_refused_command(&Command::Env(EnvArgs {})), None);
+        assert_eq!(
+            remote_refused_command(&Command::Env(EnvArgs { codex: false })),
+            None
+        );
         assert_eq!(
             remote_refused_command(&Command::ResetUsage(ResetUsageArgs {})),
             None,

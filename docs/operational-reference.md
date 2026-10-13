@@ -7,13 +7,13 @@ This is the detailed, operational half of the docs: every command, the daemon/da
 | Command | Description |
 |---|---|
 | `server [--port N] [--no-tui] [--log-to DIR]` | Start the proxy. `--log-to` writes one file per request with credentials masked. If a llmux daemon already owns the port, attach to it instead. |
-| `run [--force] [-- args]` | Ensure the daemon is running, then spawn `claude` pointed at the proxy. `--force` restarts the daemon even if a same-version one is already up. |
+| `run [--codex] [--force] [--no-model-picker] [-- args]` | Ensure the local daemon is running, then spawn `claude` or, with `--codex`, `codex` pointed at the proxy. `--force` restarts the daemon even if a same-version one is already up. |
 | `stop` | Stop a running server gracefully via `POST /llmux/shutdown`. |
 | `restart` | Cooperatively drain a running daemon, then respawn it from this binary after an upgrade. |
 | `login [--api \| --codex \| --grok \| --openrouter [--paste]]` | Add a Claude account via browser OAuth; `--api` pastes an Anthropic API key; `--codex` runs the ChatGPT OAuth flow, falling back to importing `~/.codex/auth.json`, to add a Codex account; `--grok` runs the xAI device-code flow; `--openrouter` runs the OpenRouter OAuth PKCE flow in the browser and mints a long-lived `sk-or-v1-…` key. `--paste` (only with `--openrouter`) prompts for an existing key instead of opening a browser — and is also the automatic fallback when the browser flow cannot complete locally. |
 | `import [--from PATH \| --json JSON]` | Import credentials from a teamclaude config, `~/.claude/.credentials.json`, a Codex `~/.codex/auth.json`, or inline JSON. |
 | `dashboard` | Attach to a running daemon and render its dashboard over HTTP. Read-only except manual account switch. |
-| `env` | Print shell exports for pointing Claude Code at the proxy. |
+| `env [--codex]` | Print shell exports for Claude Code, or OpenAI-compatible exports plus a Codex provider command. |
 | `status [--json]` | Show client/server/update sections plus per-account quota; exits 1 when no server is running. |
 | `accounts [-v]` | List configured accounts; `-v` adds quota/cooldown detail. |
 | `accounts refresh [ACCOUNT]` | Re-read usage from the provider NOW, on the target daemon, for one account or every supported subscription account. Per-account failures stay visible and the command exits nonzero if any requested account failed. |
@@ -29,12 +29,15 @@ In the TUI: `s` switches account, `a` adds, `n` starts a new browser login, `r` 
 
 ### Usage controls (refresh · resets)
 
-An external Codex reset does not invalidate llmux's observed quota window, so a freshly reset account can keep reading as exhausted. The accounts surface owns the two explicit controls that fix that, and both act on the DAEMON — identically in local and attach mode.
+An external reset does not invalidate llmux's observed quota window, so a freshly reset account can keep reading as exhausted. The accounts surface owns the two explicit controls that fix that, and both act on the DAEMON — identically in local and attach mode. Two providers carry reset entitlements: **Codex** (ChatGPT rate-limit reset credits, read from WHAM) and **Claude** (usage-limit reset grants — the "Limit resets" card under claude.ai Settings → Usage — read from the same `/api/oauth/usage` document the poller uses, with `cedar_ember=1`). Grok, API-key and OpenRouter accounts have none and answer 422.
+
+Claude grants are gated upstream on the client **surface and version**: the endpoint answers `ineligible_reason: surface` to an unidentified client and `cli_version` to a Claude Code identity below its floor, so llmux reads and redeems them as `claude-cli/<version> (external, cli)`. The version defaults to the one probed at ship time and is overridable with the `claude_cli_version` config key (see [configuration.md](configuration.md)) — if every Claude account starts reading `n/e (cli_version)`, raise it; no rebuild needed. No Claude redemption has been executed live as of 2026-10-06; the read path and the consume request/response shapes come from the claude.ai web bundle and a live read.
+
 
 - **Refresh.** `f` in the accounts overlay refreshes every supported account; `f` inside the `s` switcher refreshes the highlighted one; `llmux accounts refresh [ACCOUNT]` does the same from a shell. A refresh performs a real upstream usage read (no inference request is sent), bypasses scheduler eligibility and the idle-probe cooldown, and changes no pause/health/operator state. A failed read keeps the previous observation and reports the error — it never blanks the gauges. Entering the accounts surface requests ONE refresh when the reset inventory is missing or older than 60 s; `f` has no such floor.
-- **Reset inventory.** The accounts table gains an `rst` column and the detail pane a `reset` line: `3` resets owned, `3*` owned but upstream currently reports none applicable, `?` not observed yet, `—` a provider with no resets at all. Unknown is never rendered as `0`. `llmux accounts resets ACCOUNT` prints the same inventory with per-credit detail.
-- **Redeem one reset.** `R` in the accounts overlay opens a confirmation that names the account and the single reset it spends (`r` still removes an account — the redemption is deliberately the shifted key). `y` redeems; any other key closes the dialog. `llmux accounts reset ACCOUNT` is the shell equivalent and refuses on a non-TTY without `--yes`. A new redemption requires a fresh entitlement read showing a redeemable credit; unknown or zero inventory refuses before any redemption is attempted.
-- **Idempotency.** The client mints the redemption's request id, prints it before sending, and holds it until a terminal outcome (`reset`, `already_redeemed`, `nothing_to_reset`, `no_credit`). Closing the TUI dialog does not abandon a pending redemption, and a retry reuses the SAME id — a fresh key could spend a second reset. On an uncertain outcome the CLI prints the exact `--request-id` invocation to repeat. `already_redeemed` means the replay spent nothing extra. If the follow-up usage read fails after a successful redemption, that is a success with a stale-read warning, not a retryable failure.
+- **Reset inventory.** The accounts table gains an `rst` column and the detail pane a `reset` line: `3` resets owned, `3*` owned but upstream currently reports none applicable, `?` not observed yet, `n/e` a Claude account the server declared ineligible on this surface (the detail pane names the reason), `—` a provider with no resets at all. Unknown is never rendered as `0`. The detail line also carries the **expiry** of the soonest live credit/grant — absolute local time plus countdown — and, for Claude, when the weekly window resets. `llmux accounts resets ACCOUNT` prints the same inventory with per-credit detail: every credit's `expires` line shows the local time, the countdown and the raw upstream timestamp (Codex credits and Claude grants alike; a Claude grant also says which windows it clears and how many uses remain).
+- **Redeem one reset.** `R` in the accounts overlay opens a confirmation on the first row whose provider has resets — in a roster that lists Claude accounts before Codex that is a Claude row, so read the account name in the prompt and move with `↑↓`/`j k` before pressing `y`; a held (unresolved) redemption pins the gate to its own account. The prompt names the account and the single reset it spends (`r` still removes an account — the redemption is deliberately the shifted key). `y` redeems; any other key closes the dialog. `llmux accounts reset ACCOUNT` is the shell equivalent and refuses on a non-TTY without `--yes`. A new redemption requires a fresh entitlement read showing a redeemable credit; unknown or zero inventory refuses before any redemption is attempted. Codex redeems through WHAM's `consume`; Claude posts `{program, grant_id, request_id}` to the account organization's `reset_rate_limits` route (the organization id is read from the profile endpoint first — a failure there spends nothing). A Claude grant is redeemable only while the server reports it `usable_now` (the projected credit status `available`); `blocked` means a grant that only applies once a limit is hit.
+- **Idempotency.** The client mints the redemption's request id, prints it before sending, and holds it until a terminal outcome (`reset`, `already_redeemed`, `nothing_to_reset`, `no_credit`, and for Claude `cooldown` — a post-reset cooling period, nothing spent). Claude's `unavailable` answer is treated as uncertain, exactly as the web client does: retry with the same id. Closing the TUI dialog does not abandon a pending redemption, and a retry reuses the SAME id — a fresh key could spend a second reset. On an uncertain outcome the CLI prints the exact `--request-id` invocation to repeat. `already_redeemed` means the replay spent nothing extra. If the follow-up usage read fails after a successful redemption, that is a success with a stale-read warning, not a retryable failure.
 - **Forced switch.** Selecting an account with `s` (or `POST /llmux/switch`) refreshes that account's usage BEFORE committing, including when it is already the active account — re-selecting is how you force a fresh read. The client no longer pre-judges eligibility from cached windows (a stale 100% could otherwise block the very switch that refreshes it); the pool remains the authority on pause, auth and cooldown, and a failed pre-switch refresh is shown as a separate warning rather than as a failed switch.
 
 `n` (from the accounts overlay or the account switcher) opens a provider picker — Claude (Anthropic OAuth), Codex (ChatGPT OAuth), Grok (xAI device code — it prints the verification URL and user code, best-effort opens the browser, then polls), OpenRouter (PKCE minting an `sk-or-v1-…` key). `↑↓` picks, `Enter` runs the flow, `Esc` cancels. The OAuth flow runs in the client that owns the keyboard, and the minted credential is injected into the daemon — in-process locally, over `POST /llmux/inject-account` when attached — so the account serves traffic without a restart and `n` is live in attach mode too. On a client with no browser (a headless SSH session), `n` refuses with the `llmux login` fallback hint instead of starting a flow that would hang.
@@ -89,11 +92,12 @@ The `misc` tab (`?`) carries the keybinding reference plus daemon facts: config 
 
 ```bash
 brew install 2lab-ai/tap/llmux
-brew install 2lab-ai/tap/llmux-islands
+brew install --cask 2lab-ai/tap/llmux-islands    # app + CLI, stable
 brew install 2lab-ai/tap/llmux-preview
+brew install --cask 2lab-ai/tap/llmux-islands-preview
 ```
 
-Use `llmux-preview` for the rolling preview channel. Use the stable `llmux` formula for normal daily work.
+Use `llmux-preview` (and the `llmux-islands-preview` cask) for the rolling preview channel; use the stable `llmux` formula and `llmux-islands` cask for normal daily work. Which features landed in which release: [release availability](#release-availability).
 
 ### Channels and updating
 
@@ -115,6 +119,25 @@ llmux channel stable
 
 `llmux update` also restarts a running daemon whose version differs from the binary brew has installed, so a daemon left behind by an out-of-band `brew upgrade` — or by a restart skipped on an earlier run — converges instead of reporting "already up to date" while serving the old build. The comparison is server-vs-installed-artifact (`<installed llmux> --version`), not against the `llmux` process you invoked, which may itself be a stale keg or the other channel's binary.
 
+### Release availability
+
+Stable is v0.2.25 (2026-10-08). Preview is rolling and carries whatever landed on `main` after the last tag. This table says which release each user-visible feature needs.
+
+| Feature | Stable 0.2.24 (2026-10-07) | Stable 0.2.25 (2026-10-08) | Preview |
+|---|---|---|---|
+| `llmux run` / `llmux run --codex`, the four backend groups, schedulers, raw request viewer, remote mode, issued client keys, `/model` picker lineup | yes | yes | yes |
+| Islands first-run setup screens (connecting / needs attention / no accounts / ready) and the Start coding launcher (Claude Code or Codex, project folder, Open in Terminal) | no | yes (source `7fe64d1`) | yes |
+| Authenticated local control between the Islands app and the daemon (`llmux islands-connection --port N` handoff; `LocalControlAuth`) | no (see note below) | yes | yes |
+| `llmux env --codex` | no — `env` prints Claude Code exports only | yes | yes |
+| Haiku 5.5 catalog row (`haiku` → `claude-haiku-5-5[1m]`) | no | yes | yes |
+| Numeric combined auth states in `status` / Islands | no | yes | yes |
+
+Note on 0.2.24 local control: the 0.2.24 Islands app sends loopback requests without a key, while the daemon requires an admin credential on `/llmux/*`, so that app cannot read a daemon locally. This is confirmed from source (`LlmuxClient.swift`, `server.rs`), not reproduced in a running GUI. `llmux update` moves a 0.2.24 install to 0.2.25.
+
+Install per channel: `brew install --cask 2lab-ai/tap/llmux-islands` installs the app plus the stable CLI; `brew install 2lab-ai/tap/llmux` installs the stable CLI only; `brew install --cask 2lab-ai/tap/llmux-islands-preview` / `brew install 2lab-ai/tap/llmux-preview` are the preview equivalents; `llmux channel preview|stable` switches both.
+
+The Islands cask and formula must be on the same channel; a new app with an old CLI shows an update instruction.
+
 ### How a preview reaches brew
 
 A preview is published when the tap points at it, not when the prerelease exists. The `Preview` workflow's `publish` job creates `preview-<YYYY-MM-DD-HHMM>-<sha12>` and then, in the same job, renders `Formula/llmux-preview.rb` + `Casks/llmux-islands-preview.rb` from the exact assets it just uploaded and pushes them to [`2lab-ai/homebrew-tap`](https://github.com/2lab-ai/homebrew-tap) ([`.github/scripts/bump-tap-preview.sh`](../.github/scripts/bump-tap-preview.sh)). `brew upgrade llmux-preview` therefore sees a merge to `main` within one workflow run — no waiting.
@@ -135,7 +158,7 @@ just build
 
 ### Running Claude Code through llmux
 
-`llmux run` spawns `claude` with only `ANTHROPIC_BASE_URL` set and passes arguments through after `--`. If nothing is listening on the configured port, `run` auto-starts a detached daemon and waits until it is ready.
+`llmux run` spawns `claude` with `ANTHROPIC_BASE_URL` set (plus remote client authentication in remote mode) and passes arguments through after `--`. If nothing is listening on the configured port, `run` auto-starts a detached daemon and waits until it is ready.
 
 It also makes Claude Code's `/model` picker list the llmux catalog: `run` fetches `GET /llmux/models` from the proxy it is pointing `claude` at and prepends the lineup as `claude --settings '<modelPicker json>'` (no settings file is written, and the built-in Anthropic rows stay). `--no-model-picker` suppresses the injection, a `--settings` of your own in the pass-through args wins with one warning line, and a failed catalog fetch is a warning that never blocks the launch — see [`models.md`](models.md#claude-code-model-picker).
 
@@ -175,6 +198,53 @@ What the name drives:
 - **Per-name stats**: requests, ok/err, fresh input/output, cache read/write (with the 1-hour subset), first/last seen, and a per-model breakdown. Stats are keyed by the **name**, not by Claude Code's `metadata.user_id` session UUID, so a resumed session (new UUID, same name) keeps adding to the same row. Cost is the API-equivalent estimate, priced by the daemon with its `pricing` overrides. Long-context tiering and the 5m/1h cache-write split are applied per request, so a row's cost equals the sum of its requests' costs. The rows are served on `GET /llmux/dashboard` as `session_usage` (omitted until a named request lands) and appear as a **named sessions** panel at the top of the TUI Sessions tab (`s`). Unnamed traffic never creates a row, and the per-client (`metadata.user_id`) panel is unchanged.
 - **Cardinality**: up to 1,024 distinct names are tracked (the same bound as the per-client rows). A name first seen after that limit is added to a visible `(overflow)` row. Existing rows are never evicted and keep accumulating. `(overflow)` cannot collide with a real name, because parentheses are outside the sanitized alphabet.
 - **Persistence**: the name is stored in `activity.jsonl` as `session_name`. The key is left out for unnamed requests, so their lines are byte-identical to the older format. At startup the per-name rows are rebuilt from that history, the same way the per-client rows are. Lines written before the field existed have no name and add nothing to named rows. There is no durable SQLite per-session history: the per-name rows are rebuilt by replaying `activity.jsonl`, not stored in the keys-usage database.
+Per-agent models: a `.claude/agents/<name>.md` file with `model: gpt-6-astra[1m]` or `model: grok-4.7` runs as a native Claude Code subagent and is routed by llmux like any request; see [multi-model agents](multi-model-agents.md).
+
+### Running Codex through llmux
+
+`llmux run --codex` launches the installed Codex CLI with a session-only Responses
+provider and temporary llmux model catalog. For example:
+
+```sh
+llmux run --codex -- exec -m haiku 'Run the tests'
+```
+
+Local readiness/version handling and `--force` match the Claude launcher; remote
+mode targets the configured daemon without starting or restarting a local one.
+Arguments after `--`, working directory and exit/signal status pass through.
+Claude-through-Codex needs Node.js 18+ and npm on the daemon host; the pinned SDK
+installs lazily from embedded assets. Caller tools execute in Codex. See the
+[frontend guide](codex-frontend/README.md), [model picker](models.md#codex-model-picker)
+and [SDK account-error lifecycle](provider-compatibility.md#claude-agent-sdk-account-errors).
+For manual environment wiring:
+
+`env --codex` is on stable since v0.2.25 (see [release availability](#release-availability)).
+
+```sh
+llmux env --codex          # inspect exports and the commented Codex command
+# Apply the exports to this shell:
+eval "$(llmux env --codex)"
+# Run the `codex -c ...` command printed above, adding --model as needed.
+```
+
+This prints `OPENAI_BASE_URL` (the selected endpoint plus `/v1`) and
+`OPENAI_API_KEY` (that endpoint's llmux key). Values are shell-quoted for POSIX
+shells such as bash and zsh. The commented command selects the `llmux_env`
+Responses provider with `env_key="OPENAI_API_KEY"` and
+`requires_openai_auth=false`; **exports alone do not override an existing
+Codex ChatGPT login or selected provider/profile**. For `codex exec`, place
+`exec` immediately after `codex`, before the printed `-c` overrides.
+The printed provider URL is fixed to the selected endpoint at generation time;
+regenerate the command when changing endpoints.
+
+`--remote` and `remote.host` select the remote URL and `remote.api_key`; local
+mode uses `proxy.port` and `proxy.api_key`. A missing or empty selected key
+fails before emitting exports, so an inherited OpenAI key cannot be reused by
+accident. As with plain `env`, local config initialization can create its admin
+key. The command does not launch a client or daemon, fetch the model catalog,
+or write Codex configuration/login files; `llmux run --codex` handles startup
+and the model picker. Output contains the selected key: treat it as a secret.
+Plain `llmux env` continues to emit Claude Code exports.
 
 ## Multi-tenant client keys
 
@@ -282,7 +352,7 @@ Only one process can own port 3456 — normally the background daemon created by
 - `llmux server`, when a llmux daemon already owns the port, prints `daemon already running (pid N) — attaching…` and enters attach mode instead of failing with `Address already in use`.
 - A foreign process on the port remains a clean error and is never overwritten.
 
-Both attach paths are read-only except manual switching through the gated loopback control endpoint.
+Both attach paths read `GET /llmux/dashboard`, a control-plane route that needs an admin credential: the local CLI presents `proxy.api_key` automatically, and a remote client needs an admin-scope issued key or the daemon's `proxy.api_key`. Attach mode's mutations (manual account switch, usage refresh, scheduler mode, config-tab edits) go through the same `/llmux/*` control plane with that credential; attach mode never binds the port or starts a daemon.
 
 ## Demo, recording, and privacy modes
 
@@ -292,10 +362,10 @@ The Islands app has the same masking via `--demo` or `LLMUX_ISLANDS_DEMO=1`; it 
 
 For persistent masking, `email_anonymous` in the config masks every email surface — TUI render and Islands mosaic — and can be flipped live from the Islands ☰ menu or `POST /llmux/settings`.
 
-Two demo GIFs are regenerated at deploy time and attached to each release:
+Demo GIFs are attached to a release only when the recorders in `demo/` are run for that release; v0.2.24 and v0.2.25 have none. In-repo captures live in [`screenshots/`](../screenshots/) — `llmux-islands-workspace.png` (2026-10-08, preview UI, demo data) and the 2026-07 recordings.
 
-- **CLI / TUI** — [`demo/llmux.tape`](../demo/llmux.tape) (vhs) → [`llmux-demo.gif`](https://github.com/2lab-ai/llmux/releases/latest/download/llmux-demo.gif)
-- **Islands app** — `--demo` capture → [`llmux-islands-demo.gif`](https://github.com/2lab-ai/llmux/releases/latest/download/llmux-islands-demo.gif)
+- **CLI / TUI** — [`demo/llmux.tape`](../demo/llmux.tape) (vhs) → release asset `llmux-demo.gif`
+- **Islands app** — `--demo` capture → release asset `llmux-islands-demo.gif`
 
 Recorders live in [`demo/`](../demo/): `record-cli.sh`, `record-islands.sh`, and `record-all.sh` (records both + `gh release upload`). The app capture needs a one-time macOS **Screen Recording** grant for the terminal you run it from.
 
@@ -351,13 +421,15 @@ Scheduler knobs:
 | `usage_max_age_secs` | `600` | Usage older than this is stale; stale accounts are skipped unless all are stale. |
 | `refresh_ahead_secs` | `25200` | Background refresh threshold; default 7 hours before token expiry. |
 
-Codex request-shaping is also settable live from the dashboard's Codex group: `default_model` (the model slug sent upstream, default `gpt-5.6-sol`), `fast` (sends `service_tier: "priority"` when `true`), and `reasoning_effort` (`none`|`minimal`|`low`|`medium`|`high`|`xhigh`|`max`, plus `ultra` on `gpt-5.6-sol`/`-terra`; `max`/`ultra` clamp to `xhigh` below the gpt-5.6 family; omitted by default). Grok request-shaping is the same minus `fast` (xAI has no service tier): `default_model` (default `grok-4.7`) and `reasoning_effort` (`none`|`low`|`medium`|`high`|`xhigh`, clamped per model at request time; omitted by default).
+Codex request-shaping is also settable live from the dashboard's Codex group: `default_model` (the model slug sent upstream, default `gpt-5.6-sol`), `fast` (sends `service_tier: "priority"` when `true`), and `reasoning_effort` (`none`|`minimal`|`low`|`medium`|`high`|`xhigh`|`max`, plus `ultra` on `gpt-6.1-sol`, `gpt-6-astra`, `gpt-6-sol` and `gpt-5.6-sol`/`-terra`; `max`/`ultra` clamp to `xhigh` below the gpt-5.6 family; omitted by default). Grok request-shaping is the same minus `fast` (xAI has no service tier): `default_model` (default `grok-4.7`) and `reasoning_effort` (`none`|`low`|`medium`|`high`|`xhigh`, clamped per model at request time; omitted by default).
 
-Accounts are `oauth` (Claude subscription), `apikey` (Anthropic API key), `codex` (ChatGPT/Codex subscription token), `grok` (xAI subscription token), or `openrouter` (an `sk-or-v1-…` API key). Claude accounts dedupe by `account_uuid`; Codex accounts dedupe by `account_id`; API keys and OpenRouter accounts dedupe by name. An `lm-...` proxy API key is generated on first run; localhost clients are exempt.
+Accounts are `oauth` (Claude subscription), `apikey` (Anthropic API key), `codex` (ChatGPT/Codex subscription token), `grok` (xAI subscription token), or `openrouter` (an `sk-or-v1-…` API key). Claude accounts dedupe by `account_uuid`; Codex accounts dedupe by `account_id`; API keys and OpenRouter accounts dedupe by name. An `lm-...` proxy API key is generated on first run; keyless loopback data-plane access remains available. Explicit malformed, conflicting or invalid OpenAI credentials are rejected even on localhost; control endpoints still require admin authentication.
 
 `email_anonymous` (default `false`) masks account emails on every display surface. The TUI render layer uses the same stable fake-email mapping as demo mode, and llmux Islands pixelizes emails in its Usage panel. The value is served in `GET /llmux/status` and can be flipped live via `POST /llmux/settings {"email_anonymous": true}` or the Islands ☰ toggle.
 
 ## Activity feed
+
+Requests received on the OpenAI Responses endpoint have a dark gray activity-row background. Anthropic endpoint requests keep the normal background, including when a Codex model serves them. This follows the incoming endpoint, not the model or account; running, failed, expanded, attached-dashboard, and replayed historical rows keep the same distinction. Older records without endpoint metadata retain the normal background.
 
 The dashboard's activity panel shows one row per request — running requests
 pinned on top, then completed ones newest first
@@ -419,12 +491,17 @@ over the dashboard with the request's captured payloads (from
 `raw-io.jsonl`; see `raw_io` in [configuration.md](configuration.md)).
 
 - **Tabs follow the wire.** A translated (codex/grok) exchange shows all
-  four legs — `Request` (client → llmux) → `Upstream Req` (the rewritten
+  four HTTP legs — `Request` (client → llmux) → `Upstream Req` (the rewritten
   Responses-API request llmux sent) → `Upstream Resp` (the provider's
   verbatim reply before conversion) → `Response` (what the client
   received). A byte-identity Anthropic passthrough shows the classic 2 tabs
   (client and upstream exchange are the same bytes). Click a tab or walk
   with `←`/`→`/`Tab`/`h`/`l`.
+For Claude-through-Codex, the `claude-agent-sdk` upstream legs record the Messages
+bridge transport, not the SDK’s private HTTP bytes; only the original client
+request is a replayable HTTP request. Raw capture is enabled by default and follows
+the configured size/redaction limits.
+
 - **Scrolling.** `↑`/`↓`/`j`/`k`, `PgUp`/`PgDn`, `Home`/`End`, and the
   wheel scroll vertically; `H`/`L` (or a horizontal wheel) pan sideways.
   Proportional scrollbars render on the right and bottom edges when the
@@ -507,7 +584,7 @@ or set the model in Claude Code's own model setting:
 /model gpt-5.5[1m]
 ```
 
-For account *selection*, the model string's only job is to choose the group. Any `gpt-*` / `codex` / `o1`–`o4` string that classifies to the Codex group is routed there. The model actually sent upstream is the one you asked for whenever llmux recognizes it: the known codex ids (`gpt-5.6-sol` / `-terra` / `-luna`, `gpt-5.5`, …) pass through verbatim, the bare aliases resolve (`sol` → `gpt-5.6-sol`, bare `gpt-5.6` → the sol flagship), and a trailing `[1m]` is stripped before the request leaves llmux, so `gpt-5.6-terra[1m]` reaches the backend as `gpt-5.6-terra`. Only an unrecognized id or a model-less request falls back to `codex.default_model` (default `gpt-5.6-sol`), set in config or live from the dashboard. `/llmux/status` reports the per-group current accounts under `current_by_group` and keeps a representative scalar `current` for back-compat.
+For account *selection*, the model string's only job is to choose the group. Any `gpt-*` / `codex` / `o1`–`o4` string that classifies to the Codex group is routed there. The model actually sent upstream is the one you asked for whenever llmux recognizes it: the known codex ids (`gpt-6.1-sol`, `gpt-6-astra` / `-sol` / `-luna`, `gpt-5.6-sol` / `-terra` / `-luna`, `gpt-5.5`, …) pass through verbatim, the bare aliases resolve to the newest generation of that variant (`sol` → `gpt-6.1-sol`, `luna` → `gpt-6-luna`, `terra` → `gpt-5.6-terra`, `astra` → `gpt-6-astra`; bare `gpt-5.6` / `gpt-6` / `gpt-6.1` → that generation's flagship — see [models.md](models.md#alias-semantics)), and a trailing `[1m]` is stripped before the request leaves llmux, so `gpt-5.6-terra[1m]` reaches the backend as `gpt-5.6-terra`. Only an unrecognized id or a model-less request falls back to `codex.default_model` (default `gpt-5.6-sol`), set in config or live from the dashboard. `/llmux/status` reports the per-group current accounts under `current_by_group` and keeps a representative scalar `current` for back-compat.
 
 ### Context-window display for Codex models
 
@@ -538,7 +615,7 @@ A ChatGPT/Codex subscription credential can be added with `llmux login --codex` 
 llmux import --from ~/.codex/auth.json
 ```
 
-The Codex provider translates Claude Code Messages requests into the Codex Responses backend and converts the stream back into Anthropic Messages SSE (or an aggregated Messages JSON response for `stream: false`). The upstream model, a fast (`priority`) service tier, and reasoning effort are configurable (`codex.default_model` / `codex.fast` / `codex.reasoning_effort`) and adjustable live from the dashboard (`m` / `f` / `e`). Text, reasoning summaries, ordinary client-defined tools, and the bounded image subset below are supported. `/v1/messages/count_tokens` is answered locally; other non-`/v1/messages` endpoints return a clear 501.
+The Codex provider translates Claude Code Messages requests into the Codex Responses backend and converts the stream back into Anthropic Messages SSE (or an aggregated Messages JSON response for `stream: false`). The upstream model, a fast (`priority`) service tier, and reasoning effort are configurable (`codex.default_model` / `codex.fast` / `codex.reasoning_effort`) and adjustable live from the dashboard (`m` / `f` / `e`). Text, reasoning summaries, ordinary client-defined tools, and the bounded image subset below are supported. `/v1/messages/count_tokens` is answered locally; unsupported legacy translated endpoints return 501. The separate `/v1/responses` (alias `/responses`) and `/v1/models` routes are supported; see [Codex frontend](codex-frontend/README.md).
 
 ### Codex / Grok compatibility contract
 
@@ -556,7 +633,7 @@ These are **subscription gateways**, not the public OpenAI or xAI API: Codex use
 | Positive-integer `max_tokens` | Omitted upstream; omission/warning `max_tokens`; strict mode returns 400 | Forwarded unchanged as `max_output_tokens`; warning `max_tokens_semantics`; strict mode returns 400 |
 | Prior assistant `thinking` / `redacted_thinking` | Omitted with matching omission/warning names; strict mode returns 400 | Same |
 | Top-level `thinking` configuration | Validate shape, then omit with `thinking_config` omission/warning; strict mode returns 400 | Same |
-| Other generation controls | Non-null `temperature`/`top_p`/`top_k` or nonempty `stop_sequences`: local 400; subscription support is unverified | Same |
+| Other generation controls | Non-null `temperature`/`top_p`/`top_k` or nonempty `stop_sequences`: local 400; scoped monitor/title exceptions below | Same, without the scoped exceptions |
 | Text/tool-only `count_tokens` | Local heuristic, including serialized tool schemas/property names; `X-Llmux-Token-Count: estimate` | Same |
 | Image `count_tokens` (top-level or nested) | Local HTTP 400: no reliable image-token estimate | Same |
 | Process-wide `prompt_cache_key` | Retained | Omitted; routing scope of a shared key is unproven |
@@ -571,7 +648,35 @@ Image validation requires `source.type: "base64"`, nonempty valid base64, a deco
 
 Send `X-Llmux-Compatibility: strict` to reject any such issue with HTTP 400 **before upstream traffic or credential refresh**. Other header values and invalid/nonpositive/noninteger limits also return 400. Since normal Messages clients send `max_tokens`, strict mode will reject those Codex/Grok requests rather than pretend to enforce an equivalent budget.
 
-**Other generation controls.** Non-null `temperature`, `top_p`, and `top_k`, and nonempty `stop_sequences`, are rejected locally with 400 because their subscription-gateway mapping is unverified; public API support does not establish that mapping. Empty `stop_sequences` is vacuous; malformed stop sequences return 400. Top-level `thinking` configuration is separate from prior assistant thinking blocks: its shape is validated, then the configuration is omitted with `thinking_config` in both diagnostic lists (strict mode: 400). Do not assume `budget_tokens` or disabled reasoning is enforced. Counting sends no generation controls upstream and produces no inference-only omission warnings. This is a bounded list of known controls, not a claim that every present or future Anthropic field is faithfully handled.
+**Claude Code auto-mode monitors.** With routing enabled, llmux remembers the main
+CLI model for each tenant/device/session (at most 4096 entries, six hours, cleared
+on daemon restart). After a GPT main turn, its auto-mode security monitor uses
+`claude_code.auto_classifier_model` (default alias `luna`) with **medium** effort, independent of the main
+model's effort/fast settings. Main model changes update this context; subagents,
+quota/count probes, compact/summary and other control calls do not. Unknown
+sessions, other endpoints, routing-disabled traffic and Claude main sessions keep
+normal routing. The monitor does not fall back to Claude when Codex is unavailable.
+
+The adapter recognizes the monitor system contract, supports Stage 1 severity and
+Stage 2 thinking/severity/category, and retains historical block verdict support.
+Only its single closing-tag `</severity>` or `</block>` stop is handled locally:
+llmux validates the actual completed model output, removes that closing delimiter
+and reports `stop_reason: stop_sequence`. No-stop Stage 2 retains the full output,
+including optional category. Both JSON and SSE clients receive a validated answer;
+SSE is buffered for these short control calls. No approval is manufactured on
+timeout, malformed output, truncated completion, or provider failure. The total
+deadline is 60 seconds; a successful upstream stream over 1 MiB is refused.
+
+Original requested Sonnet model/stop remain in raw-io; the upstream half and
+activity model show the effective configured model/medium. The route trace includes
+`reason=gpt_main_session_internal_request`. `classifier_local_stop` appears in
+compatibility warnings when the local adapter is used. **Strict mode still rejects
+unsupported original controls**, and ordinary stop requests still return 400.
+This local output boundary is not a generation or billing cap; Codex still omits
+`max_tokens` and top-level thinking configuration with existing diagnostics.
+See [provider contract and dated tests](provider-compatibility.md#claude-code-auto-mode-monitors).
+
+**Other generation controls.** Outside the scoped monitor and [title](#claude-code-internal-model-routing) exceptions, non-null `temperature`, `top_p`, and `top_k`, and nonempty `stop_sequences`, are rejected locally with 400 because their subscription-gateway mapping is unverified; public API support does not establish that mapping. Empty `stop_sequences` is vacuous; malformed stop sequences return 400. Top-level `thinking` configuration is separate from prior assistant thinking blocks: its shape is validated, then the configuration is omitted with `thinking_config` in both diagnostic lists (strict mode: 400). Do not assume `budget_tokens` or disabled reasoning is enforced. Counting sends no generation controls upstream and produces no inference-only omission warnings. This is a bounded list of known controls, not a claim that every present or future Anthropic field is faithfully handled.
 
 **Limits are not billing caps.** Codex's subscription endpoint rejected `max_output_tokens: 16` in the dated probe below; llmux does not send it, clamp it, or fake truncation. Grok accepted that field and stopped at an observed 16 non-reasoning output tokens, but reported **302 output tokens including 286 reasoning tokens**. That is evidence of a visible-output cap for that fixture, not an Anthropic-equivalent total-generation budget or a billing guarantee. Reasoning usage can be additional to the requested visible output. A `response.incomplete` (or a `response.completed` envelope with `status: "incomplete"`) whose reason is `max_output_tokens` maps to Messages `stop_reason: "max_tokens"`, retaining partial text and usage. Other incomplete reasons become an Anthropic error event for SSE or HTTP 502 for aggregate JSON. Truncated tool arguments must never be repaired to an executable `{}` call; clients must not execute incomplete tool calls.
 
@@ -617,7 +722,78 @@ Cost: the ten curated models are free (`$0` in and out). An uncurated openrouter
 
 ```bash
 just check    # cargo fmt --check + cargo clippy --all-targets -- -D warnings + cargo test
+# after npm ci --ignore-scripts in bridge/:
+just check-bridge  # actual pinned SDK + bridge regression tests
 just build    # cargo build --release --locked
 ```
 
 Contributor conventions are in [`../AGENTS.md`](../AGENTS.md).
+
+## Claude Code internal model routing
+
+In a GPT main session, llmux maps implicit Opus/Sonnet/Haiku requests to
+`sol`/`terra`/`luna`. Configure `claude_code.gpt_model_mapping` and the separate
+`claude_code.auto_classifier_model` in [configuration](configuration.md#claude-code-internal-models-claude_code).
+Titles are labeled `title`; activity records the actual effective model.
+Explicit main Claude choices remain authoritative, including a switch after launch.
+
+Startup quota and session-title calls can occur before the first main request.
+`llmux run` supplies
+`x-llmux-claude-launch-model` only when it can resolve the launch choice: explicit
+`--model`, `ANTHROPIC_MODEL`, or ordinary user/project/local/flag settings model,
+with native alias environment overrides considered. Both `--model=value` and
+`--model value` work; `CLAUDE_CONFIG_DIR` is respected. Unrelated
+`ANTHROPIC_CUSTOM_HEADERS` are preserved, and the reserved hint is stripped before
+upstream forwarding. Hints only affect an exact quota probe or captured no-tools session-title request,
+not arbitrary helpers, and never override an
+observed session choice or populate session state.
+
+This is a conservative resolver, not a clone of Claude Code settings: agent/routine
+selection, resumed sessions, nonstandard settings-source/safe/restricted modes and
+known managed policy/available-model restrictions suppress implicit inference.
+Model-changing `settings.env` or global `.claude.json`/legacy `.config.json` environment overrides also suppress inference, because native
+trust/merge rules can apply them after the launcher reads its own environment.
+Normal `CLAUDE_CODE_OAUTH_TOKEN` authentication preserves launch-model inference;
+a nonempty `CLAUDE_CODE_CUSTOM_OAUTH_URL` suppresses it because native Claude Code
+selects a different global settings profile (2.1.292 profile selector, 2026-10-07).
+Explicit `--model` still works with safe mode and settings-source flags unless a
+known policy restriction makes it uncertain. Remote-only policy, worktree-specific
+settings or native selection overrides not visible at launch cannot be inferred;
+the first genuine main request supplies authoritative context. Direct `claude`
+launches without `llmux run` also rely on that observed context.
+
+For GPT sessions the quota call checks Codex availability. Actual Codex quota
+headers remain available, but native Claude UI does not interpret them as Claude
+usage percentages. llmux does not manufacture Claude limits/reset times. The
+Codex gateway's existing output-cap omission also applies to this probe. See the
+[provider contract](provider-compatibility.md#claude-code-internal-tasks).
+
+Startup context requires `x-llmux-claude-launch-time` (Unix milliseconds) within
+120 seconds and not in the future; both reserved headers are stripped upstream.
+Expired, missing or invalid timestamps leave unknown sessions unchanged. Remote
+clock skew can suppress bootstrap. Session state remains ephemeral: a daemon
+restart inside that short window can reuse launch context until a main turn is observed.
+
+### Account authentication failure status
+
+Accounts blocked by authentication or a persistent account error show the HTTP
+status actually observed, for example `! 401 auth X`, `! 404 auth X`, or
+`! 503 auth X`. A paused account shows `paused`; when authentication also fails,
+the same line shows `paused + 404 auth X` (using its observed code). The same
+reason appears in `llmux status`, the local/attached
+dashboard, and Islands account details. `/llmux/status` and `/llmux/dashboard`
+retain `status: "auth_failed"` and add nullable `auth_failure_status`; `blocked`
+contains the readable reason. Failures without an HTTP response
+show `! auth X`, or `paused + auth X` when also paused, without an invented status.
+Pause and authentication health remain independent; this combined label changes
+only the display, not scheduling priority or retry policy.
+
+A permanent refresh rejection uses the refresh endpoint's status. When an upstream
+401 triggers refresh and that refresh fails, the last HTTP failure status is
+shown; a refresh failure without an HTTP status retains the observed 401. This
+display does not change retry policy: ordinary 404 responses still relay and
+ordinary 503 responses remain transient.
+A successful credential refresh or changed credentials on re-login clear the
+stored failure code; late failures from replaced credentials cannot restore it.
+Only the numeric status is added to account documents, never response bodies or
+credentials.

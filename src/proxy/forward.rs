@@ -162,6 +162,8 @@ pub fn classify_send_error(_err: &reqwest::Error) -> UpstreamSignal {
 /// mismatch) and `content-length` (recomputed by reqwest from the buffered
 /// body) from an outgoing request.
 pub fn strip_hop_by_hop(headers: &mut HeaderMap) {
+    headers.remove(super::internal_requests::LAUNCH_MODEL_HEADER);
+    headers.remove(super::internal_requests::LAUNCH_TIME_HEADER);
     for name in HOP_BY_HOP_HEADERS {
         headers.remove(name);
     }
@@ -263,6 +265,11 @@ pub fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
 /// original request (headers/body are reused on every retry) plus the
 /// request-log accumulator and the activity-event correlation handle.
 struct ForwardContext {
+    endpoint_origin: crate::tui::Endpoint,
+    responses_input: Option<serde_json::Value>,
+    ingress_body: Bytes,
+    responses_account: Option<String>,
+    responses_upstream: Option<crate::proxy::raw_io::UpstreamRaw>,
     method: Method,
     path_query: String,
     headers: HeaderMap,
@@ -285,7 +292,8 @@ struct ForwardContext {
     model: Option<String>,
     /// The keyless per-client metering identity (`metadata.user_id`) parsed
     /// from the request body once at entry (issue #32). `None` → the request is
-    /// attributed to the `unknown` bucket. Counting only; never gates routing.
+    /// attributed to the `unknown` bucket. The classifier adapter separately
+    /// normalizes the identity to scope its main-model context.
     user_id: Option<String>,
     /// KEYED tenant attribution id resolved by the auth gate (multi-tenant
     /// #22): client-key id / `legacy` / `local`. Counting only; the gate
@@ -297,7 +305,7 @@ struct ForwardContext {
     session_name: Option<String>,
     /// Message-kind classification + input excerpt (TUI UI-3 U1), decided once
     /// at entry from the buffered body by [`crate::proxy::classify`]. Display
-    /// only; never gates routing.
+    /// classification; auto-mode routing uses a stricter monitor signature.
     kind: Option<String>,
     excerpt: Option<String>,
     /// The backend group this request routes to, OR `None` when routing is
@@ -316,9 +324,24 @@ struct ForwardContext {
     /// same losses. `None` on every non-Responses path: anthropic/openrouter
     /// requests go upstream verbatim and have nothing to report.
     compatibility: Option<responses_request::CompatibilityReport>,
+    auto_classifier: Option<super::auto_classifier::Route>,
 }
 
 impl ForwardContext {
+    fn codex_meta(&self, state: &AppState) -> (String, Option<String>, bool) {
+        self.auto_classifier
+            .as_ref()
+            .map(|r| r.meta())
+            .unwrap_or_else(|| state.codex.request_meta(&self.body))
+    }
+
+    fn translated_body(&self) -> &[u8] {
+        self.auto_classifier
+            .as_ref()
+            .map(|r| r.body.as_ref())
+            .unwrap_or(&self.body)
+    }
+
     fn log(&mut self, section: String) {
         if self.log_enabled {
             self.sections.push(section);
@@ -339,13 +362,23 @@ impl ForwardContext {
     /// the thinking budget, never fast. All `None`/`false` before the provider
     /// path is chosen (early failures).
     fn finished_meta(&self, state: &AppState) -> FinishedMeta {
+        // The override is known even on a pre-lease failure (Codex exhausted).
+        if let Some(route) = &self.auto_classifier {
+            let (model, effort, fast) = route.meta();
+            return FinishedMeta {
+                group: Some("codex".into()),
+                model: Some(model),
+                effort,
+                fast,
+            };
+        }
         match self.served_by {
             Some(BackendGroup::Codex) => {
                 // Per-request effective model + effort + fast (matches the
                 // wire), not the static shape defaults: a request for gpt-5.5
                 // under a gpt-5.6-sol pin records gpt-5.5, and a FAILED
                 // request still names the model that failed.
-                let (model, effort, fast) = state.codex.request_meta(&self.body);
+                let (model, effort, fast) = self.codex_meta(state);
                 FinishedMeta {
                     group: Some("codex".to_string()),
                     model: Some(model),
@@ -402,6 +435,10 @@ impl ForwardContext {
     /// (`state.raw_io_path == None`). When `None`, [`capture_raw_io`] is a no-op
     /// and no record is built — so capture is genuinely off the hot path.
     fn raw_io_path<'a>(&self, state: &'a AppState) -> Option<&'a std::path::Path> {
+        // Responses boundary captures both sides after the return transform.
+        if self.responses_input.is_some() {
+            return None;
+        }
         if state
             .settings_live
             .raw_io_enabled
@@ -442,7 +479,7 @@ impl ForwardContext {
             account.map(|a| a.0.clone()),
             Some(status.as_u16()),
             Some(u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)),
-            &self.body,
+            &self.ingress_body,
             response,
             state.config.raw_io.max_body_bytes,
             Some(redacted_header_pairs(&self.headers)),
@@ -483,6 +520,7 @@ impl ForwardContext {
         } = self.finished_meta(state);
         state.emit(ActivityEvent::RequestFinished {
             id: self.activity_id,
+            endpoint: self.endpoint_origin,
             method: self.method.to_string(),
             path: self.path_query.clone(),
             account: account.map(|a| a.0.clone()),
@@ -834,7 +872,14 @@ fn compatibility_gate(
     // A body that will not parse has no honest answer on either path: the
     // relay would 502 on it later, and the count path used to answer "1
     // token" — a fabricated number dressed as a count.
-    let Ok(body) = serde_json::from_slice::<serde_json::Value>(&ctx.body) else {
+    // Strict clients validate the ORIGINAL controls, including stops. Compat
+    // alone permits the narrowly recognized local classifier-stop adapter.
+    let checked_body = if mode == CompatibilityMode::Strict {
+        &ctx.body[..]
+    } else {
+        ctx.translated_body()
+    };
+    let Ok(body) = serde_json::from_slice::<serde_json::Value>(checked_body) else {
         return Err(Box::new(invalid_request_response(
             state,
             ctx,
@@ -842,7 +887,7 @@ fn compatibility_gate(
             "request body is not valid JSON",
         )));
     };
-    let report = match responses_request::validate_request(&body, flavor, count_tokens) {
+    let mut report = match responses_request::validate_request(&body, flavor, count_tokens) {
         Ok(report) => report,
         Err(ProviderError::InvalidRequest(message)) => {
             return Err(Box::new(invalid_request_response(
@@ -863,6 +908,23 @@ fn compatibility_gate(
             )));
         }
     };
+    if ctx
+        .auto_classifier
+        .as_ref()
+        .is_some_and(|r| r.omitted_temperature)
+    {
+        report.omitted_fields.push("temperature");
+        report.warnings.push("temperature");
+        report.omitted_fields.sort_unstable();
+        report.omitted_fields.dedup();
+        report.warnings.sort_unstable();
+        report.warnings.dedup();
+    }
+    if ctx.auto_classifier.as_ref().is_some_and(|r| r.local_stop()) {
+        report.warnings.push("classifier_local_stop");
+        report.warnings.sort_unstable();
+        report.warnings.dedup();
+    }
     if mode == CompatibilityMode::Strict && !report.warnings.is_empty() {
         let message = format!(
             "{group} cannot serve this request without loss: {}",
@@ -963,6 +1025,11 @@ fn transient_response(detail: &str) -> Response {
 /// streaming back, the account is pinned and errors propagate to the client
 /// (never switch mid-stream).
 pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response {
+    let endpoint_origin = if super::responses::is_responses_path(req.uri().path()) {
+        crate::tui::Endpoint::OpenAi
+    } else {
+        crate::tui::Endpoint::Anthropic
+    };
     let started = std::time::Instant::now();
     let activity_id = state.next_request_id();
     // Tenant attribution id resolved by the auth gate (multi-tenant #22),
@@ -1016,6 +1083,7 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
             };
             state.emit(ActivityEvent::RequestFinished {
                 id: activity_id,
+                endpoint: endpoint_origin,
                 method: parts.method.to_string(),
                 path: path_query,
                 account: None,
@@ -1040,18 +1108,61 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
             return error_response(status, error_type, &message);
         }
     };
+    let early_error = |status: StatusCode, detail: &str| {
+        state.emit(ActivityEvent::RequestFinished {
+            id: activity_id,
+            endpoint: endpoint_origin,
+            method: parts.method.to_string(),
+            path: path_query.clone(),
+            account: None,
+            status: status.as_u16(),
+            duration: started.elapsed(),
+            tokens: None,
+            group: None,
+            model: crate::routing::model_from_body(&body),
+            effort: None,
+            fast: Some(false),
+            ttfb_ms: None,
+            ttft_ms: None,
+            gen_ms: None,
+            aborted: false,
+            user_id: None,
+            kind: None,
+            excerpt: None,
+            tenant: tenant.clone(),
+            session_name: session_name.clone(),
+        });
+        super::responses::error(status, detail)
+    };
+    let ingress_body = body.clone();
+    let responses_input = if endpoint_origin == crate::tui::Endpoint::OpenAi {
+        if parts.method != Method::POST {
+            return early_error(StatusCode::METHOD_NOT_ALLOWED, "Responses requires POST");
+        }
+        match super::responses::validate(&body) {
+            Ok(value) => Some(value),
+            Err(detail) => return early_error(StatusCode::BAD_REQUEST, &detail),
+        }
+    } else {
+        None
+    };
+    let body = responses_input
+        .as_ref()
+        .map(super::responses::metadata_request)
+        .unwrap_or(body);
     let log_enabled = state.logger.is_some();
     // Parse the model once (body is buffered) and classify to a backend group.
     // Routing disabled ⇒ group = None (legacy single-slot path); the
     // classifier is not consulted on the forward path in that case.
     let model = crate::routing::model_from_body(&body);
     // Keyless per-client metering identity (issue #32): parsed once from the
-    // buffered body, same pattern as `model`. Counting only — never routes.
+    // buffered body, same pattern as `model`. The auto-mode adapter also uses
+    // its normalized session component to isolate the main-model context.
     let user_id = crate::routing::user_id_from_body(&body);
     // Message-kind + input excerpt (TUI UI-3 U1): same parse-once-at-entry
     // pattern; rides the RequestFinished event for the activity feed.
     let classified = crate::proxy::classify::classify(&path_query, &body);
-    let group = if state
+    let mut group = if state
         .settings_live
         .routing_enabled
         .load(std::sync::atomic::Ordering::Relaxed)
@@ -1060,10 +1171,89 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
     } else {
         None
     };
+    let mut auto_classifier = None;
+    if let Some(request_group) =
+        group.filter(|_| parts.method == Method::POST && parts.uri.path() == "/v1/messages")
+    {
+        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&body) {
+            let task = super::internal_requests::task(&value, classified.kind);
+            let hint = if matches!(
+                task,
+                Some(super::internal_requests::Task::Quota | super::internal_requests::Task::Title)
+            ) && super::internal_requests::fresh_launch(
+                parts
+                    .headers
+                    .get(super::internal_requests::LAUNCH_TIME_HEADER)
+                    .and_then(|h| h.to_str().ok()),
+                super::raw_io::now_ms(),
+            ) {
+                parts
+                    .headers
+                    .get(super::internal_requests::LAUNCH_MODEL_HEADER)
+                    .and_then(|v| v.to_str().ok())
+            } else {
+                None
+            };
+            let (monitor, gpt) = state
+                .auto_classifier_sessions
+                .lock()
+                .map(|mut sessions| {
+                    let monitor = sessions.observe(
+                        tenant.as_deref(),
+                        &value,
+                        classified.kind,
+                        request_group,
+                        started,
+                    );
+                    (
+                        monitor,
+                        sessions.gpt_context(tenant.as_deref(), &value, hint),
+                    )
+                })
+                .unwrap_or((false, false));
+            let candidate = if monitor {
+                Some(super::auto_classifier::Route::monitor(
+                    &value,
+                    &state.config.claude_code.auto_classifier_model,
+                ))
+            } else if gpt {
+                task.and_then(|task| {
+                    super::internal_requests::target(&value, &state.config.claude_code)
+                        .map(|model| super::internal_requests::route(&value, task, model))
+                })
+            } else {
+                None
+            };
+            if let Some(candidate) = candidate {
+                match candidate {
+                    Ok(route) => {
+                        tracing::info!(requested_model = model.as_deref().unwrap_or("<none>"),
+                            target_alias = %route.shape.model, effective_model = %route.meta().0,
+                            kind = classified.kind, reason = "gpt_main_session_internal_request",
+                            "routing Claude Code internal request through configured GPT alias");
+                        auto_classifier = Some(route);
+                        group = Some(BackendGroup::Codex);
+                    }
+                    Err(message) => {
+                        state.emit(ActivityEvent::Error {
+                            context: Some("claude_code".into()),
+                            message: message.into(),
+                        });
+                        return error_response(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_request_error",
+                            message,
+                        );
+                    }
+                }
+            }
+        }
+    }
     // Now that the body is classified, announce the in-flight row WITH its kind
     // so its `kind` column aligns with the completed rows (TUI UI-6 item 1).
     state.emit(ActivityEvent::RequestStarted {
         id: activity_id,
+        endpoint: endpoint_origin,
         method: parts.method.to_string(),
         path: path_query.clone(),
         kind: Some(classified.kind.to_string()),
@@ -1078,6 +1268,11 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
         session_name: session_name.clone(),
     });
     let mut ctx = ForwardContext {
+        endpoint_origin,
+        responses_input: responses_input.clone(),
+        ingress_body,
+        responses_account: None,
+        responses_upstream: None,
         method: parts.method,
         path_query,
         headers: parts.headers,
@@ -1101,15 +1296,67 @@ pub async fn forward(state: &AppState, req: axum::extract::Request) -> Response 
         group,
         served_by: None,
         compatibility: None,
+        auto_classifier,
     };
     if log_enabled && !ctx.body.is_empty() {
         ctx.log(format!(
             "=== REQUEST BODY ({} bytes) ===\n{}",
             ctx.body.len(),
-            body_excerpt(&ctx.body)
+            body_excerpt(&ctx.ingress_body)
         ));
     }
-    run_taxonomy_loop(state, &mut ctx).await
+    let mut response = if ctx.auto_classifier.as_ref().is_some_and(|r| r.is_monitor()) {
+        // One wall-clock deadline covers queueing, retries, headers and body.
+        // Cancellation drops the lease; no partial verdict has been exposed.
+        match tokio::time::timeout(
+            super::auto_classifier::DEADLINE,
+            run_taxonomy_loop(state, &mut ctx),
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(_) => {
+                ctx.emit_finished(state, None, StatusCode::GATEWAY_TIMEOUT, None);
+                error_response(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "api_error",
+                    "auto classifier timed out without a verdict",
+                )
+            }
+        }
+    } else {
+        run_taxonomy_loop(state, &mut ctx).await
+    };
+    apply_compatibility_headers(response.headers_mut(), ctx.compatibility.as_ref());
+    if let Some(input) = responses_input {
+        let meta = ctx.finished_meta(state);
+        let capture = if state
+            .settings_live
+            .raw_io_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            state
+                .raw_io_path
+                .clone()
+                .map(|path| super::responses::Capture {
+                    path,
+                    id: ctx.activity_id,
+                    group: meta.group,
+                    model: meta.model,
+                    account: ctx.responses_account.clone(),
+                    started: ctx.started,
+                    request: ctx.ingress_body.clone(),
+                    request_headers: redacted_header_pairs(&ctx.headers),
+                    max_body: state.config.raw_io.max_body_bytes,
+                    upstream: ctx.responses_upstream.clone(),
+                })
+        } else {
+            None
+        };
+        super::responses::adapt(response, input, capture).await
+    } else {
+        response
+    }
 }
 
 async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Response {
@@ -1297,7 +1544,7 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
         let (served_group, served_model, served_effort, served_fast) =
             match BackendGroup::from_kind(credential.kind()) {
                 BackendGroup::Codex => {
-                    let (model, effort, fast) = state.codex.request_meta(&ctx.body);
+                    let (model, effort, fast) = ctx.codex_meta(state);
                     (Some("codex".to_string()), Some(model), effort, fast)
                 }
                 BackendGroup::Grok => {
@@ -1375,6 +1622,135 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
             }
         }
 
+        if let Some(input) = &ctx.responses_input {
+            let mode = match compatibility_mode(&ctx.headers) {
+                Ok(mode) => mode,
+                Err(detail) => return invalid_request_response(state, ctx, &account, &detail),
+            };
+            let mut report = responses_request::CompatibilityReport::default();
+            if served == BackendGroup::Codex {
+                if input.get("max_output_tokens").is_some_and(|v| !v.is_null()) {
+                    if !input["max_output_tokens"].as_u64().is_some_and(|n| n > 0) {
+                        return invalid_request_response(
+                            state,
+                            ctx,
+                            &account,
+                            "max_output_tokens must be a positive integer",
+                        );
+                    }
+                    report.omitted_fields.push("max_output_tokens");
+                    report.warnings.push("max_output_tokens");
+                }
+            } else {
+                if let Err(detail) = super::responses::messages_request(input) {
+                    return invalid_request_response(state, ctx, &account, &detail);
+                }
+                if served == BackendGroup::Grok {
+                    let normalized = match super::responses::messages_request(input) {
+                        Ok(body) => body,
+                        Err(detail) => {
+                            return invalid_request_response(state, ctx, &account, &detail)
+                        }
+                    };
+                    report = match responses_request::validate_request(
+                        &normalized,
+                        responses_request::ResponsesFlavor::Grok,
+                        false,
+                    ) {
+                        Ok(report) => report,
+                        Err(err) => {
+                            return invalid_request_response(state, ctx, &account, &err.to_string())
+                        }
+                    };
+                }
+                if served == BackendGroup::Claude {
+                    if matches!(
+                        input
+                            .pointer("/reasoning/effort")
+                            .and_then(serde_json::Value::as_str),
+                        Some("minimal" | "ultra")
+                    ) {
+                        report.warnings.push("reasoning.effort");
+                    }
+                    if input.get("max_output_tokens").is_some()
+                        && (input
+                            .pointer("/text/format")
+                            .is_some_and(|f| f["type"] != "text")
+                            || input["tools"].as_array().is_some_and(|tools| {
+                                tools.iter().any(|t| {
+                                    matches!(
+                                        t["type"].as_str(),
+                                        Some("web_search" | "web_search_preview")
+                                    )
+                                })
+                            }))
+                    {
+                        report.warnings.push("max_output_tokens_semantics");
+                    }
+                    if input
+                        .get("service_tier")
+                        .is_some_and(|v| !v.is_null() && v != "auto" && v != "default")
+                    {
+                        return invalid_request_response(
+                            state,
+                            ctx,
+                            &account,
+                            "Claude Agent SDK does not expose service_tier",
+                        );
+                    }
+                    if input.pointer("/text/verbosity").is_some() {
+                        report.omitted_fields.push("text.verbosity");
+                        report.warnings.push("text.verbosity");
+                    }
+                    if input["parallel_tool_calls"] == false {
+                        return invalid_request_response(
+                            state,
+                            ctx,
+                            &account,
+                            "Claude Agent SDK cannot enforce parallel_tool_calls:false",
+                        );
+                    }
+                    for field in ["temperature", "top_p"] {
+                        if input.get(field).is_some_and(|v| !v.is_null()) {
+                            return invalid_request_response(
+                                state,
+                                ctx,
+                                &account,
+                                &format!("Claude Agent SDK does not expose {field}"),
+                            );
+                        }
+                    }
+                    if input
+                        .get("tool_choice")
+                        .is_some_and(|v| !matches!(v.as_str(), Some("auto" | "none")))
+                    {
+                        return invalid_request_response(
+                            state,
+                            ctx,
+                            &account,
+                            "Claude Agent SDK supports tool_choice auto or none",
+                        );
+                    }
+                    if input["input"]
+                        .as_array()
+                        .is_some_and(|a| a.iter().any(|i| i["type"] == "reasoning"))
+                    {
+                        report.omitted_fields.push("reasoning_history");
+                        report.warnings.push("reasoning_history");
+                    }
+                }
+            }
+            if mode == CompatibilityMode::Strict && !report.is_empty() {
+                return invalid_request_response(
+                    state,
+                    ctx,
+                    &account,
+                    &format!("backend cannot preserve: {}", report.warnings.join(",")),
+                );
+            }
+            ctx.compatibility = Some(report);
+        }
+
         // 3. Proactive refresh: oauth-style tokens (anthropic oauth AND
         // codex chatgpt tokens) expiring within 5 minutes.
         if let Some(expires_at_ms) = refreshable_expiry(&credential) {
@@ -1399,12 +1775,14 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                         }
                         continue;
                     }
-                    RefreshOutcome::Permanent { detail } => {
+                    RefreshOutcome::Permanent { detail, status } => {
                         // Only bench if the dead refresh token is still the
                         // account's live credential (relogin-trace B1).
-                        state
-                            .pool
-                            .record_auth_failure_if(&account, lease.fingerprint());
+                        state.pool.record_auth_failure_if(
+                            &account,
+                            lease.fingerprint(),
+                            Some(status),
+                        );
                         state.emit(ActivityEvent::Error {
                             context: Some("refresh".into()),
                             message: format!(
@@ -1426,7 +1804,7 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                     }
                     // Transient refresh failure: try the old token; a 401
                     // lands in the forced-refresh path below.
-                    RefreshOutcome::Failed => {}
+                    RefreshOutcome::Failed { .. } => {}
                 }
             }
         }
@@ -1458,7 +1836,7 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
         // Record the served provider so the activity log can show the right
         // group/model/effort even on the legacy (routing-off) path.
         ctx.served_by = Some(served);
-        if messages_only {
+        if messages_only && ctx.responses_input.is_none() {
             let path = request_path.as_str();
             if path == "/v1/messages/count_tokens" {
                 // OpenRouter only: the Responses flavors already answered
@@ -1497,12 +1875,110 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
         // `Some(client_stream)` marks the translate (codex/grok) transform
         // path; `None` is the untouched byte-identity passthrough.
         let mut translate_stream: Option<bool> = None;
-        let (upstream_req, endpoint) = if is_translate {
+        let (upstream_req, endpoint) = if let Some(input) = &ctx.responses_input {
+            if served == BackendGroup::Codex {
+                match state.codex.build_responses_request(input, &credential) {
+                    Ok(req) => (req, state.codex.endpoint().to_string()),
+                    Err(err) => {
+                        ctx.emit_finished(state, Some(&account), StatusCode::BAD_REQUEST, None);
+                        return error_response(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_request_error",
+                            &err.to_string(),
+                        );
+                    }
+                }
+            } else {
+                let body = match super::responses::messages_request(input) {
+                    Ok(body) => body,
+                    Err(err) => {
+                        ctx.emit_finished(state, Some(&account), StatusCode::BAD_REQUEST, None);
+                        return error_response(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_request_error",
+                            &err,
+                        );
+                    }
+                };
+                if served == BackendGroup::Claude {
+                    let mut body = body;
+                    match body
+                        .pointer("/output_config/effort")
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        Some("none") => {
+                            body["output_config"] = serde_json::json!({});
+                            body["thinking"] = serde_json::json!({"type":"disabled"});
+                        }
+                        Some("minimal") => {
+                            body["output_config"]["effort"] = serde_json::json!("low")
+                        }
+                        Some("ultra") => body["output_config"]["effort"] = serde_json::json!("max"),
+                        _ => {}
+                    }
+                    if let Some(model) = body["model"].as_str() {
+                        let resolved = crate::catalog::resolve_claude_alias(model).unwrap_or(model);
+                        body["model"] = serde_json::json!(resolved);
+                    }
+                    (
+                        ProviderRequest {
+                            method: Method::POST,
+                            path: "/v1/messages".into(),
+                            headers: HeaderMap::new(),
+                            body: Bytes::from(body.to_string()),
+                        },
+                        "claude-agent-sdk".into(),
+                    )
+                } else if served == BackendGroup::Grok {
+                    match state
+                        .grok
+                        .build_request(body.to_string().as_bytes(), &credential)
+                    {
+                        Ok((req, _)) => {
+                            translate_stream = Some(true);
+                            (req, state.grok.endpoint().to_string())
+                        }
+                        Err(err) => {
+                            return invalid_request_response(
+                                state,
+                                ctx,
+                                &account,
+                                &err.to_string(),
+                            );
+                        }
+                    }
+                } else {
+                    let original = std::mem::replace(&mut ctx.body, Bytes::from(body.to_string()));
+                    let built = build_openrouter_request(state, ctx, &credential).await;
+                    ctx.body = original;
+                    match built {
+                        Ok(req) => (req, state.openrouter.endpoint().to_string()),
+                        Err(err) => return rewrite_error(state, ctx, err.to_string()),
+                    }
+                }
+            }
+        } else if is_translate {
             let built = match served {
-                BackendGroup::Codex => state
-                    .codex
-                    .build_request(&ctx.body, &credential)
-                    .map(|out| (out, state.codex.endpoint().to_string())),
+                BackendGroup::Codex => {
+                    let request = if let Some(route) = &ctx.auto_classifier {
+                        state
+                            .codex
+                            .build_request_with_shape(&route.body, &credential, &route.shape)
+                            .and_then(|(mut request, stream)| {
+                                if let Some(format) = &route.title_format {
+                                    let mut body: serde_json::Value =
+                                        serde_json::from_slice(&request.body)
+                                            .map_err(|e| ProviderError::Convert(e.to_string()))?;
+                                    body["text"] = serde_json::json!({"format":format});
+                                    request.body = Bytes::from(body.to_string());
+                                }
+                                Ok((request, stream))
+                            })
+                    } else {
+                        state.codex.build_request(&ctx.body, &credential)
+                    };
+                    request.map(|out| (out, state.codex.endpoint().to_string()))
+                }
                 BackendGroup::Grok => state
                     .grok
                     .build_request(&ctx.body, &credential)
@@ -1568,10 +2044,46 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                 format_headers(&upstream_req.headers)
             ));
         }
+        if ctx.responses_input.is_some() {
+            ctx.responses_account = Some(account.0.clone());
+            ctx.responses_upstream = Some(crate::proxy::raw_io::UpstreamRaw {
+                url: Some(format!(
+                    "{}{}",
+                    endpoint.trim_end_matches('/'),
+                    upstream_req.path
+                )),
+                request_body: Some(crate::proxy::raw_io::bounded_body(
+                    &upstream_req.body,
+                    state.config.raw_io.max_body_bytes,
+                )),
+                request_headers: Some(redacted_header_pairs(&upstream_req.headers)),
+                ..Default::default()
+            });
+        }
         ctx.dispatched = Some(std::time::Instant::now());
-        let send_result = send_upstream(state, &endpoint, &upstream_req).await;
+        let mut sdk_account_rejected = false;
+        let send_result = if endpoint == "claude-agent-sdk" {
+            match crate::provider::claude_sdk::send(
+                &upstream_req.body,
+                &credential,
+                state.provider.endpoint(),
+            )
+            .await
+            {
+                Ok(sdk) => {
+                    sdk_account_rejected = sdk.account_rejected;
+                    Ok(sdk.response)
+                }
+                Err(detail) => {
+                    ctx.emit_finished(state, Some(&account), StatusCode::BAD_GATEWAY, None);
+                    return error_response(StatusCode::BAD_GATEWAY, "proxy_error", &detail);
+                }
+            }
+        } else {
+            send_upstream(state, &endpoint, &upstream_req).await
+        };
 
-        let response = match send_result {
+        let mut response = match send_result {
             Ok(response) => response,
             Err(err) => match classify_send_error(&err) {
                 UpstreamSignal::Transient => {
@@ -1596,7 +2108,7 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                     // pinned, not to whatever replaced it (relogin-trace B1).
                     state
                         .pool
-                        .record_auth_failure_if(&account, lease.fingerprint());
+                        .record_auth_failure_if(&account, lease.fingerprint(), err.status());
                     drop(lease);
                     switches += 1;
                     if switches > max_switches {
@@ -1613,6 +2125,19 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
             },
         };
 
+        if ctx.responses_input.is_some()
+            && served == BackendGroup::Codex
+            && response.status().is_success()
+        {
+            // Subscription gateway streams Responses even when content-type is absent.
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/event-stream"),
+            );
+            response
+                .headers_mut()
+                .insert("x-llmux-native-responses", HeaderValue::from_static("1"));
+        }
         // 4. Feed rate-limit evidence to the scheduler. If this evidence
         // just pushed the CURRENT account over a threshold, re-evaluate NOW
         // (FR3: selection runs when the current account becomes ineligible,
@@ -1626,7 +2151,12 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
         }
 
         // 5. Taxonomy.
-        match classify(response.status(), response.headers()) {
+        let signal = if sdk_account_rejected {
+            UpstreamSignal::Persistent
+        } else {
+            classify(response.status(), response.headers())
+        };
+        match signal {
             UpstreamSignal::Relay => {
                 return match translate_stream {
                     Some(client_stream) => {
@@ -1859,6 +2389,7 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                 }
             }
             UpstreamSignal::AuthRejected => {
+                let mut auth_status = response.status();
                 ctx.log("=== RESPONSE 401 ===".to_string());
                 drop(response);
                 let oauth = matches!(
@@ -1870,15 +2401,17 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                     // `Superseded` retries for the same reason `Refreshed`
                     // does: the pool now holds a credential this request has
                     // not tried yet (relogin-trace B2).
-                    if matches!(
-                        refresh_credential(state, &account, &credential, lease.fingerprint()).await,
-                        RefreshOutcome::Refreshed(_) | RefreshOutcome::Superseded
-                    ) {
-                        // Retry the SAME account with the refreshed token
-                        // (it is now the pool credential; re-leased next
-                        // iteration).
-                        drop(lease);
-                        continue;
+                    match refresh_credential(state, &account, &credential, lease.fingerprint())
+                        .await
+                    {
+                        RefreshOutcome::Refreshed(_) | RefreshOutcome::Superseded => {
+                            drop(lease);
+                            continue;
+                        }
+                        RefreshOutcome::Permanent { status, .. } => auth_status = status,
+                        RefreshOutcome::Failed { status } => {
+                            auth_status = status.unwrap_or(auth_status);
+                        }
                     }
                 }
                 // Second 401, refresh failure, or apikey account: auth is
@@ -1887,7 +2420,7 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                 // (relogin-trace B1).
                 state
                     .pool
-                    .record_auth_failure_if(&account, lease.fingerprint());
+                    .record_auth_failure_if(&account, lease.fingerprint(), Some(auth_status));
                 drop(lease);
                 switches += 1;
                 if switches > max_switches {
@@ -1918,9 +2451,19 @@ async fn run_taxonomy_loop(state: &AppState, ctx: &mut ForwardContext) -> Respon
                 return transient_response(&format!("upstream returned {status}"));
             }
             UpstreamSignal::Persistent => {
+                let status = response.status();
+                let detail = upstream_error_detail(response).await;
+                tracing::warn!(account = %account, %status, "SDK account rejected; switching");
+                ctx.log(format!(
+                    "=== RESPONSE {status} (account rejected) ===\n{detail}"
+                ));
+                state.emit(ActivityEvent::Error {
+                    context: Some("upstream".into()),
+                    message: format!("{status} from {account}: {detail}; switching account"),
+                });
                 state
                     .pool
-                    .record_auth_failure_if(&account, lease.fingerprint());
+                    .record_auth_failure_if(&account, lease.fingerprint(), Some(status));
                 drop(lease);
                 switches += 1;
                 if switches > max_switches {
@@ -2062,11 +2605,12 @@ fn resolve_group(
     }
     // Matched group is empty — apply the policy.
     let model = ctx.model.as_deref().unwrap_or("<none>");
-    if state
-        .config
-        .routing
-        .on_empty_group
-        .eq_ignore_ascii_case("fallback")
+    if ctx.auto_classifier.is_none()
+        && state
+            .config
+            .routing
+            .on_empty_group
+            .eq_ignore_ascii_case("fallback")
     {
         // Fixed fallback scan order Claude → Codex → Grok (spec §R5, C2b):
         // the first OTHER group with ≥1 configured account serves the
@@ -2122,9 +2666,9 @@ pub(crate) enum RefreshOutcome {
     /// without it the operator-visible message said only "refresh token dead",
     /// which hid the one distinction that matters — expired (just re-login)
     /// vs. rotated-out-from-under-us by a second daemon (iq-64, 2026-09-10..21).
-    Permanent { detail: String },
+    Permanent { detail: String, status: StatusCode },
     /// Transient refresh failure — old token may still work.
-    Failed,
+    Failed { status: Option<StatusCode> },
     /// The account was RE-CREDENTIALED (a re-login) while this refresh was in
     /// flight, so its tokens were discarded rather than applied
     /// (`docs/keys-history/relogin-trace.md` B2). Nothing was written to the
@@ -2277,7 +2821,7 @@ pub(crate) async fn refresh_credential(
         // Nothing to refresh: an anthropic API key and an OpenRouter key are
         // both long-lived secrets, not rotating tokens.
         AccountCredential::Apikey { .. } | AccountCredential::OpenRouter { .. } => {
-            return RefreshOutcome::Failed
+            return RefreshOutcome::Failed { status: None }
         }
     };
     match outcome {
@@ -2368,12 +2912,15 @@ pub(crate) async fn refresh_credential(
         Err(crate::auth::AuthError::RefreshPermanent { status, body }) => {
             tracing::warn!(account = %account, %status, %body, "refresh token dead; re-login required");
             RefreshOutcome::Permanent {
+                status,
                 detail: refresh_death_detail(&status, &body),
             }
         }
         Err(err) => {
             tracing::warn!(account = %account, error = %err, "token refresh failed (transient)");
-            RefreshOutcome::Failed
+            RefreshOutcome::Failed {
+                status: err.http_status(),
+            }
         }
     }
 }
@@ -2570,6 +3117,7 @@ async fn relay(
         let activity_id = ctx.activity_id;
         let method = ctx.method.to_string();
         let path = ctx.path_query.clone();
+        let endpoint_origin = ctx.endpoint_origin;
         let started = ctx.started;
         let dispatched = ctx.dispatched.unwrap_or(started);
         let FinishedMeta {
@@ -2594,7 +3142,7 @@ async fn relay(
         let raw_io_path = ctx.raw_io_path(state).map(std::path::Path::to_path_buf);
         let raw_io_request = raw_io_path
             .as_ref()
-            .map(|_| ctx.body.clone())
+            .map(|_| ctx.ingress_body.clone())
             .unwrap_or_default();
         let raw_io_req_headers = raw_io_path
             .as_ref()
@@ -2670,6 +3218,7 @@ async fn relay(
                 if let Some(events) = events {
                     let _ = events.try_send(ActivityEvent::RequestFinished {
                         id: activity_id,
+                        endpoint: endpoint_origin,
                         method,
                         path,
                         account: Some(account.0.clone()),
@@ -2831,6 +3380,22 @@ async fn relay_translate(
     served: BackendGroup,
     upstream_meta: Option<UpstreamMeta>,
 ) -> Response {
+    let quota_headers = if ctx.kind.as_deref() == Some("quota") && ctx.auto_classifier.is_some() {
+        let mut headers = HeaderMap::new();
+        for (name, value) in response.headers() {
+            if name.as_str().starts_with("x-codex-") {
+                headers.insert(name.clone(), value.clone());
+            }
+        }
+        headers.insert("x-llmux-quota-source", HeaderValue::from_static("codex"));
+        headers.insert(
+            "x-llmux-quota-mode",
+            HeaderValue::from_static("availability"),
+        );
+        headers
+    } else {
+        HeaderMap::new()
+    };
     let status = response.status();
     // Request trace (best-effort): input breakdown captured now from the
     // inbound body, terminal outcome written at each return below. `model` is
@@ -2842,10 +3407,7 @@ async fn relay_translate(
             state.config.grok.trace,
             state.grok.request_meta(&ctx.body).0,
         ),
-        _ => (
-            state.config.codex.trace,
-            state.codex.request_meta(&ctx.body).0,
-        ),
+        _ => (state.config.codex.trace, ctx.codex_meta(state).0),
     };
     let trace = crate::proxy::codex_trace::CodexTrace::from_request(
         trace_enabled,
@@ -2922,14 +3484,18 @@ async fn relay_translate(
         return client_error;
     }
 
-    if client_stream {
+    if client_stream && ctx.auto_classifier.as_ref().is_none_or(|r| !r.is_monitor()) {
         // Streaming transform relay: upstream Responses events in, Anthropic
         // SSE out. Usage accounting runs on the EMITTED events (converter
         // totals), so the dashboard keeps working.
         let converter = match served {
             BackendGroup::Grok => state.grok.converter(),
-            _ => state.codex.converter(),
-        };
+            _ => match &ctx.auto_classifier {
+                Some(route) => responses::ResponsesSseConverter::with_model(route.meta().0),
+                None => state.codex.converter(),
+            },
+        }
+        .with_safeguards_requested(responses::requests_tool_use_review(&ctx.body));
         let totals = state.totals.clone();
         let logger = state.logger.clone();
         let request_id = ctx.request_id;
@@ -2939,6 +3505,7 @@ async fn relay_translate(
         let activity_id = ctx.activity_id;
         let method = ctx.method.to_string();
         let path = ctx.path_query.clone();
+        let endpoint_origin = ctx.endpoint_origin;
         let started = ctx.started;
         let dispatched = ctx.dispatched.unwrap_or(started);
         let FinishedMeta {
@@ -2962,7 +3529,7 @@ async fn relay_translate(
         let raw_io_path = ctx.raw_io_path(state).map(std::path::Path::to_path_buf);
         let raw_io_request = raw_io_path
             .as_ref()
-            .map(|_| ctx.body.clone())
+            .map(|_| ctx.ingress_body.clone())
             .unwrap_or_default();
         let raw_io_req_headers = raw_io_path
             .as_ref()
@@ -2984,6 +3551,7 @@ async fn relay_translate(
                     .iter()
                     .map(|(name, value)| (name.to_string(), value.clone())),
             );
+            pairs.extend(redacted_header_pairs(&quota_headers));
             pairs
         });
         let raw_io_upstream_res_headers = raw_io_path
@@ -3088,6 +3656,7 @@ async fn relay_translate(
                 if let Some(events) = events {
                     let _ = events.try_send(ActivityEvent::RequestFinished {
                         id: activity_id,
+                        endpoint: endpoint_origin,
                         method,
                         path,
                         account: Some(account.0.clone()),
@@ -3114,6 +3683,7 @@ async fn relay_translate(
             },
         );
         let mut out = Response::new(body);
+        out.headers_mut().extend(quota_headers);
         *out.status_mut() = StatusCode::OK;
         out.headers_mut().insert(
             header::CONTENT_TYPE,
@@ -3131,8 +3701,12 @@ async fn relay_translate(
     use tokio_stream::StreamExt as _;
     let mut converter = match served {
         BackendGroup::Grok => state.grok.converter(),
-        _ => state.codex.converter(),
-    };
+        _ => match &ctx.auto_classifier {
+            Some(route) => responses::ResponsesSseConverter::with_model(route.meta().0),
+            None => state.codex.converter(),
+        },
+    }
+    .with_safeguards_requested(responses::requests_tool_use_review(&ctx.body));
     // Cloned before `bytes_stream()` consumes the response — the aggregate
     // raw-io capture below wants the upstream response headers.
     let upstream_headers = response.headers().clone();
@@ -3146,9 +3720,21 @@ async fn relay_translate(
     let mut events = sse::EventBuffer::new();
     let mut timing = sse::StreamTiming::default();
     let mut stream = Box::pin(response.bytes_stream());
+    let mut classifier_bytes = 0usize;
     while let Some(item) = stream.next().await {
         match item {
             Ok(chunk) => {
+                classifier_bytes = classifier_bytes.saturating_add(chunk.len());
+                if ctx.auto_classifier.as_ref().is_some_and(|r| r.is_monitor())
+                    && classifier_bytes > super::auto_classifier::RESPONSE_LIMIT
+                {
+                    ctx.emit_finished(state, Some(&account), StatusCode::BAD_GATEWAY, None);
+                    return error_response(
+                        StatusCode::BAD_GATEWAY,
+                        "api_error",
+                        "auto classifier response exceeded its buffer limit",
+                    );
+                }
                 timing.on_chunk();
                 if let Some(tee) = upstream_tee.as_mut() {
                     tee.push(&chunk);
@@ -3189,7 +3775,19 @@ async fn relay_translate(
     let trace_duration_ms = ctx.started.elapsed().as_millis();
     let error_message = converter.error_message().map(str::to_string);
     let result = match converter.into_message_json() {
-        Some(message) => {
+        Some(mut message) => {
+            if let Some(route) = &ctx.auto_classifier {
+                if let Err(detail) = route.finish(&mut message) {
+                    trace.write_error(detail, trace_events_seen, trace_duration_ms);
+                    ctx.emit_finished(
+                        state,
+                        Some(&account),
+                        StatusCode::BAD_GATEWAY,
+                        Some(token_counts(usage)),
+                    );
+                    return error_response(StatusCode::BAD_GATEWAY, "api_error", detail);
+                }
+            }
             ctx.log(format!(
                 "=== RESPONSE BODY (codex aggregate) ===\n{message}"
             ));
@@ -3202,15 +3800,26 @@ async fn relay_translate(
             // receives. Client response headers are the synthesized ones
             // (mirroring `out` below); the upstream's real headers + verbatim
             // pre-transform reply ride in the record's `upstream` half (UI-8).
-            let message_bytes = message.to_string();
+            let buffered_stream =
+                client_stream && ctx.auto_classifier.as_ref().is_some_and(|r| r.is_monitor());
+            let message_bytes = if buffered_stream {
+                super::auto_classifier::message_sse(&message)
+            } else {
+                message.to_string()
+            };
             let mut client_headers = HeaderMap::new();
             client_headers.insert(
                 header::CONTENT_TYPE,
-                HeaderValue::from_static("application/json"),
+                HeaderValue::from_static(if buffered_stream {
+                    "text/event-stream"
+                } else {
+                    "application/json"
+                }),
             );
             // Same losses, same headers as the streamed leg — the aggregate
             // client must not have to ask twice to learn what was dropped.
             apply_compatibility_headers(&mut client_headers, ctx.compatibility.as_ref());
+            client_headers.extend(quota_headers);
             let upstream_raw = upstream_meta.map(|m| {
                 m.into_raw(
                     raw_io_max_body,
@@ -3558,6 +4167,11 @@ mod tests {
 
     fn ctx_for_group(model: &str, group: BackendGroup) -> ForwardContext {
         ForwardContext {
+            endpoint_origin: crate::tui::Endpoint::Anthropic,
+            responses_input: None,
+            ingress_body: Bytes::new(),
+            responses_account: None,
+            responses_upstream: None,
             method: Method::POST,
             path_query: "/v1/messages".to_string(),
             headers: HeaderMap::new(),
@@ -3577,6 +4191,7 @@ mod tests {
             group: Some(group),
             served_by: None,
             compatibility: None,
+            auto_classifier: None,
         }
     }
 
@@ -4790,7 +5405,92 @@ mod tests {
             .find(|acct| acct.id.0 == "a")
             .expect("a");
         assert!(!a.healthy, "a marked AuthFailed after the second 401");
+        assert_eq!(
+            crate::scheduler::select::blocking_reason(
+                a,
+                crate::scheduler::select::IneligibleReason::AuthUnhealthy,
+                &state.select_params(),
+                SystemTime::now(),
+            ),
+            "! 401 auth X"
+        );
         assert_eq!(snapshot.legacy_current(), Some(&AccountId("b".into())));
+    }
+
+    /// Exercise the real OAuth HTTP parser and both request-time refresh paths.
+    /// Proactive refresh benches only for invalid_grant; a failed forced
+    /// refresh follows the existing401 bench policy. Ordinary inference
+    /// 404/503 responses keep their relay/transient classification.
+    #[tokio::test]
+    async fn auth_failure_status_survives_refresh_gateway() {
+        for status in [StatusCode::NOT_FOUND, StatusCode::SERVICE_UNAVAILABLE] {
+            for (proactive, permanent) in [(true, true), (false, true), (false, false)] {
+                let token_app = Router::new().route(
+                    "/token",
+                    post(move || async move {
+                        (
+                            status,
+                            if permanent {
+                                r#"{"error":"invalid_grant"}"#
+                            } else {
+                                r#"{"error":"temporarily_unavailable"}"#
+                            },
+                        )
+                    }),
+                );
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("bind");
+                let token_url = format!("http://{}/token", listener.local_addr().expect("addr"));
+                let server = tokio::spawn(async move { axum::serve(listener, token_app).await });
+                let shared = MockShared::default();
+                shared
+                    .script
+                    .lock()
+                    .expect("lock")
+                    .push_back(Scripted::RequireBearer {
+                        accept: &["at-b"],
+                        body: r#"{"ok":1}"#,
+                    });
+                let upstream = spawn_mock(shared).await;
+                let mut a = oauth_account("a", "at-a");
+                if proactive {
+                    if let AccountCredential::Oauth { expires_at_ms, .. } = &mut a.credential {
+                        *expires_at_ms = 1;
+                    }
+                }
+                let mut state = test_state(&upstream, vec![a, oauth_account("b", "at-b")]);
+                state.refresher = Arc::new(crate::auth::oauth::RefreshCoalescer::with_token_url(
+                    token_url,
+                ));
+                assert_eq!(
+                    forward(&state, client_request("{}")).await.status(),
+                    StatusCode::OK
+                );
+                let snapshot = state.pool.snapshot();
+                let a = snapshot.accounts.iter().find(|a| a.id.0 == "a").expect("a");
+                assert!(!a.healthy);
+                assert_eq!(a.auth_failure_status, Some(status.as_u16()));
+                assert_eq!(
+                    crate::scheduler::select::blocking_reason(
+                        a,
+                        crate::scheduler::select::IneligibleReason::AuthUnhealthy,
+                        &state.select_params(),
+                        SystemTime::now(),
+                    ),
+                    format!("! {} auth X", status.as_u16())
+                );
+                assert_eq!(
+                    classify(status, &HeaderMap::new()),
+                    if status.is_server_error() {
+                        UpstreamSignal::Transient
+                    } else {
+                        UpstreamSignal::Relay
+                    }
+                );
+                server.abort();
+            }
+        }
     }
 
     /// A tempdir + seeded config file for the tests that must see what

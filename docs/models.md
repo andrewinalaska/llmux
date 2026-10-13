@@ -15,16 +15,18 @@ out-of-catalog pin appears here as a **synthesized row** with null metadata (see
 - `GET /models`
 - `GET /llmux/models`
 
-Both return the **same** payload and sit behind the same loopback + proxy
-api-key gate as every other route:
+Both return the **same** llmux metadata payload under the data-plane `x-api-key`
+gate, with legacy keyless loopback access. `/llmux/models` is an explicit exception
+to the admin-only control routes:
 
 ```json
 { "models": [ /* ModelEntry, ... */ ] }
 ```
 
-Registering root `/models` reserves a path that previously fell through to the
-upstream proxy fallback. Anthropic exposes no root `/models`, and `/v1/models`
-is left untouched (still proxied upstream), so nothing regresses.
+`GET /v1/models` is a separate OpenAI-shaped catalog: `{ "object": "list",
+"data": [{ "id": "…", "object": "model", "created": 0, "owned_by": "claude" }] }`.
+It accepts Bearer or `x-api-key` llmux credentials and is served locally, not
+proxied upstream. Use `/llmux/models` for efforts, aliases and context metadata.
 
 ## Response schema
 
@@ -60,34 +62,35 @@ not that it is zero.
   exactly like `grok`. The same strip applies to the PIN itself, so a pinned
   `grok-4.7[1m]` also leaves llmux as `grok-4.7` — the suffix is display
   metadata on both sides.
-- **FORK-ONLY: bare `sol` → `gpt-6.1-sol`** (2026-09-29). Upstream keeps `sol`
-  on `gpt-5.6-sol`; this fork points it at the newest sol tier, so `sol` (and
-  `sol[1m]`) resolve to `gpt-6.1-sol` and the alias is advertised on that row.
-  `terra` / `luna` and bare `gpt-5.6` are unchanged. Revert = drop
-  `SOL_ALIAS_TARGET` in `src/provider/codex.rs` and move the alias back in
-  `src/catalog.rs`. Do not send this upstream.
-- **codex variant aliases** — `terra` / `luna` resolve to the latest gpt
-  generation of that variant (`gpt-5.6-sol` / `-terra` / `-luna`), and the bare
-  `gpt-5.6` id resolves to the `sol` flagship. `astra` and the bare `gpt-6` id
-  resolve to `gpt-6-astra[1m]` — deliberate asymmetry with the 5.6 rows: on
-  astra the bare aliases advertise the 1M row, so `astra` / `gpt-6` resolve to
-  that row's upstream slug and to the ~1,050,000-token window this catalog
-  publishes for it, while the explicit base id `gpt-6-astra` is the way to pick
-  the openai/codex catalog's 272000. That is catalog resolution, **not** a
-  client-side window: Claude Code sizes its readout off the id you submit, and
-  a bare `astra` / `gpt-6` — an id it does not know — gets its 200k assumption.
-  Type `astra[1m]` (or pick the `[1M]` picker row) to move the client-side
-  denominator too.
-  The bare `terra` / `luna` aliases stay on 5.6 (bare `sol` is fork-only
-  `gpt-6.1-sol`, above): the full ids
-  `gpt-6-sol` / `gpt-6-luna` (listed by the openai/codex catalog since it was
-  re-fetched 2026-09-28) are reachable and pass through verbatim, but own no
-  bare alias. These are advertised statically on the corresponding entries. The provider always
+- **codex variant aliases** — `sol` / `terra` / `luna` / `astra` resolve to the
+  NEWEST gpt generation that ships that variant (openai/codex `models.json`,
+  read 2026-10-06): `sol` → `gpt-6.1-sol` (released 2026-09-29), `luna` →
+  `gpt-6-luna` (2026-09-22), `astra` → `gpt-6-astra`, and `terra` →
+  `gpt-5.6-terra` (generation 6 shipped no terra tier, so moving it would
+  resolve to a slug that 404s upstream). The bare generation ids resolve to
+  that generation's flagship: `gpt-5.6` → `gpt-5.6-sol`, `gpt-6` →
+  `gpt-6-astra`, `gpt-6.1` → `gpt-6.1-sol`. `sol` moved from `gpt-5.6-sol` and
+  `luna` from `gpt-5.6-luna` on 2026-10-06 — the 5.6 rows stay in the catalog
+  and remain addressable by full id.
+  `astra` and the bare `gpt-6` id advertise on `gpt-6-astra[1m]` — a deliberate
+  asymmetry: on astra the bare aliases advertise the 1M row, so `astra` /
+  `gpt-6` resolve to that row's upstream slug and to the ~1,050,000-token window
+  this catalog publishes for it, while the explicit base id `gpt-6-astra` is the
+  way to pick the openai/codex catalog's 272000. The 6.1-sol / 6-sol / 6-luna
+  pairs follow the 5.6 convention instead (aliases on the base row; the `[1m]`
+  twin is an explicit opt-in). That is catalog resolution, **not** a client-side
+  window: Claude Code sizes its readout off the id you submit, and a bare alias
+  — an id it does not know — gets its 200k assumption. Type `sol[1m]` /
+  `astra[1m]` (or pick the `[1M]` picker row) to move the client-side
+  denominator too. These are advertised statically on the corresponding entries. The provider always
   strips a trailing `[1m]` before the request leaves llmux
   (`CLIENT_CONTEXT_SUFFIX` in `src/provider/codex.rs`, mirrored in
   `src/provider/grok.rs`), so bare and suffixed aliases reach the backend as the
   same upstream slug.
-- **claude aliases** — the claude rows carry short user-curated aliases that
+- **claude aliases** — the following wire-ID table describes incoming Messages.
+  Incoming Responses uses the Claude Agent SDK and preserves the resolved `[1m]`
+  suffix so the SDK can apply its context beta; see [Codex frontend](codex-frontend/README.md).
+  For Messages, the claude rows carry short user-curated aliases that
   both ROUTE to the claude group and are RESOLVED by the proxy: a bare alias is
   rewritten to its catalog id before the request leaves llmux, so the alias
   `GET /models` advertises is actually honored upstream.
@@ -104,8 +107,8 @@ not that it is zero.
   Matching is trimmed and case-insensitive (`"  OPUS  "` resolves), and an
   alias may carry the client-side `[1m]` context suffix — `fable[1m]` resolves
   exactly like `fable`, because alias resolution runs before the suffix strip.
-  That strip is syntactic only — it does not promise a 1M-capable target
-  (`haiku[1m]` resolves like `haiku`, to `claude-haiku-5-5[1m]`).
+  The strip is syntactic; the resolved model's context limit still applies.
+  `haiku[1m]` now resolves to `claude-haiku-5-5[1m]` (1M published context).
   Only aliases are rewritten: a real catalog id is not an alias and passes
   through untouched — the `[1m]` suffix strip is a separate, subsequent step,
   which is why `claude-opus-5[1m]` still reaches upstream as `claude-opus-5` —
@@ -155,14 +158,18 @@ not that it is zero.
   `opus` tracks the newest curated Opus and moved from `claude-opus-4-8[1m]` to
   `claude-opus-5[1m]` on 2026-07-27 (4.8 stays in the catalog; it just no longer
   owns an alias), then from `claude-opus-5[1m]` to `claude-opus-5-5[1m]` on
-  2026-09-23. The version alias `opus-5` did NOT move — it stays on
-  `claude-opus-5[1m]`, because floating a version-pinned alias onto a new model
-  would be silent substitution. `sonnet` follows the same rule: it moved from
-  `claude-sonnet-5[1m]` to `claude-sonnet-5-5[1m]` on 2026-09-29, and the
-  version alias `sonnet-5` stayed on `claude-sonnet-5[1m]`. Anyone who needs
-  one specific model must send its full catalog id — that is the stable
-  handle. Usage and pricing are booked against the resolved id, not the
-  alias, so alias traffic lands on the same row as id traffic.
+  2026-09-23. `sonnet` moved from `claude-sonnet-5[1m]` to
+  `claude-sonnet-5-5[1m]` on 2026-10-06 (Sonnet 5.5 released 2026-09-28), and
+  on the same day the codex `sol` alias moved from `gpt-5.6-sol` to
+  `gpt-6.1-sol` and `luna` from `gpt-5.6-luna` to `gpt-6-luna`. The version
+  aliases `opus-5` / `sonnet-5` and the bare generation id `gpt-5.6` did NOT
+  move — they stay on their generation, because floating a version-pinned
+  alias onto a new model would be silent substitution. Anyone who needs one specific model must send
+  its full catalog id — that is the stable handle. On 2026-10-08, `haiku`
+  moved from `claude-haiku-4-5` to `claude-haiku-5-5[1m]`; the explicit 4.5 id
+  remains available. Usage and pricing are booked against the
+  resolved id, not the alias, so alias traffic lands on the same row as id
+  traffic.
 
 ### Out-of-catalog grok pin
 
@@ -202,25 +209,26 @@ model it does not curate.
 | claude-opus-5       | —            | Claude Opus 5       | low, medium, high, xhigh, max        | 200000      | claude |
 | claude-opus-4-8[1m] | —            | Claude Opus 4.8     | low, medium, high, xhigh, max        | 1000000     | claude |
 | claude-opus-4-6[1m] | —            | Claude Opus 4.6     | low, medium, high, xhigh, max        | 1000000     | claude |
-| claude-sonnet-5-5[1m] | sonnet, sonnet-5-5 | Claude Sonnet 5.5 [1M] | low, medium, high, xhigh, max   | 1000000     | claude |
+| claude-sonnet-5-5[1m] | sonnet, sonnet-5-5 | Claude Sonnet 5.5 [1M] | low, medium, high, xhigh, max | 1000000     | claude |
 | claude-sonnet-5-5   | —            | Claude Sonnet 5.5   | low, medium, high, xhigh, max        | 200000      | claude |
 | claude-sonnet-5[1m] | sonnet-5     | Claude Sonnet 5 [1M]| low, medium, high, xhigh, max        | 1000000     | claude |
 | claude-sonnet-5     | —            | Claude Sonnet 5     | low, medium, high, xhigh, max        | 200000      | claude |
-| claude-haiku-5-5[1m] | haiku, haiku-5-5 | Claude Haiku 5.5 [1M] | low, medium, high, xhigh, max   | 1000000     |
-| claude-haiku-5-5    | —            | Claude Haiku 5.5    | low, medium, high, xhigh, max        | 200000      |
+| claude-haiku-5-5[1m] | haiku, haiku-5-5 | Claude Haiku 5.5 [1M] | low, medium, high, xhigh, max | 1000000 | claude |
+| claude-haiku-5-5 | — | Claude Haiku 5.5 | low, medium, high, xhigh, max | 1000000 | claude |
 | claude-haiku-4-5    | —            | Claude Haiku 4.5    | low, medium, high, xhigh, max        | 200000      | claude |
+| gpt-6.1-sol[1m]     | —            | GPT-6.1-Sol [1M]    | low, medium, high, xhigh, max, ultra | 1000000     | codex  |
+| gpt-6.1-sol         | sol, gpt-6.1 | GPT-6.1-Sol         | low, medium, high, xhigh, max, ultra | 272000      | codex  |
 | gpt-6-astra[1m]     | astra, gpt-6 | GPT-6-Astra [1M]    | low, medium, high, xhigh, max, ultra | 1000000     | codex  |
 | gpt-6-astra         | —            | GPT-6-Astra         | low, medium, high, xhigh, max, ultra | 272000      | codex  |
-| gpt-6.1-sol[1m]     | —            | GPT-6.1-Sol [1M]    | low, medium, high, xhigh, max, ultra | 1000000     | codex  |
-| gpt-6.1-sol         | —            | GPT-6.1-Sol         | low, medium, high, xhigh, max, ultra | 272000      | codex  |
 | gpt-6-sol[1m]       | —            | GPT-6-Sol [1M]      | low, medium, high, xhigh, max, ultra | 1000000     | codex  |
 | gpt-6-sol           | —            | GPT-6-Sol           | low, medium, high, xhigh, max, ultra | 272000      | codex  |
-| gpt-6-luna          | —            | GPT-6-Luna          | low, medium, high, xhigh, max        | 272000      | codex  |
+| gpt-6-luna[1m]      | —            | GPT-6-Luna [1M]     | low, medium, high, xhigh, max        | 1000000     | codex  |
+| gpt-6-luna          | luna         | GPT-6-Luna          | low, medium, high, xhigh, max        | 272000      | codex  |
 | gpt-5.6-sol[1m]     | —            | GPT-5.6-Sol [1M]    | low, medium, high, xhigh, max, ultra | 1000000     | codex  |
-| gpt-5.6-sol         | sol, gpt-5.6 | GPT-5.6-Sol         | low, medium, high, xhigh, max, ultra | 372000      | codex  |
+| gpt-5.6-sol         | gpt-5.6      | GPT-5.6-Sol         | low, medium, high, xhigh, max, ultra | 272000      | codex  |
 | gpt-5.6-terra[1m]   | —            | GPT-5.6-Terra [1M]  | low, medium, high, xhigh, max, ultra | 1000000     | codex  |
-| gpt-5.6-terra       | terra        | GPT-5.6-Terra       | low, medium, high, xhigh, max, ultra | 372000      | codex  |
-| gpt-5.6-luna        | luna         | GPT-5.6-Luna        | low, medium, high, xhigh, max        | 372000      | codex  |
+| gpt-5.6-terra       | terra        | GPT-5.6-Terra       | low, medium, high, xhigh, max, ultra | 272000      | codex  |
+| gpt-5.6-luna        | —            | GPT-5.6-Luna        | low, medium, high, xhigh, max        | 272000      | codex  |
 | gpt-5.5             | —            | GPT-5.5             | low, medium, high, xhigh             | 272000      | codex  |
 | grok-4.7            | grok (pinned)| Grok 4.7            | low, medium, high, xhigh             | 500000      | grok   |
 | grok-4.7[1m]        | —            | Grok 4.7 [1M] (500k upstream) | low, medium, high, xhigh   | 500000      | grok   |
@@ -255,7 +263,13 @@ rate and is reported unpriced, never as a free `$0`).
 
 `grok-4.7[1m]` and `grok-4.7` are the SAME upstream model — the provider strips
 one trailing `[1m]` before the request leaves llmux — which is why both rows
-advertise **500000**, xAI's real window from the live `/v1/models` probe. The
+advertise **500000**, the upper entry of xAI's window list from the live
+`/v1/models` probe. As of 2026-10-12 (first seen that day; the 2026-09-23 read
+still reported 500000) that endpoint publishes `context_window: 256000` next to
+`context_windows: [256000, 500000]`; llmux sends no window selector, and a
+306,103-input-token `grok-4.7` request through the daemon was still accepted
+that day, so the rows keep the 500000 upper entry — the ceiling itself was not
+re-probed (see [Model sweep: 2026-10-12](#model-sweep-2026-10-12)). The
 twin exists only because of how Claude Code sizes its own readout: for an id it
 does not know it assumes 200k, unless the id ends in `[1m]`, which it reads as a
 1M window (800k usable). Measured 2026-09-28 with Claude Code 2.1.283:
@@ -306,8 +320,8 @@ backend accepted 555,029 / ~801k / ~869k / 910,229 input tokens on
 `gpt-5.6-sol` and were rejected at ~936k with `Your input exceeds the context
 window of this model` (`gpt-5.6-terra` accepted 555,029). OpenAI publishes
 1,050,000 total for the gpt-5.6 family. The base rows keep the openai/codex
-catalog's 372000 — the window a client gets without opting in — exactly as the
-claude base rows keep 200000 next to their `[1m]` twins. There is deliberately
+catalog's current 272000 (re-read 2026-10-08), client metadata rather than a
+newly measured upstream limit. The `[1m]` twins keep their published 1M metadata. There is deliberately
 no `gpt-5.6-luna[1m]` (luna still returns "Model not found" upstream) and no
 `gpt-5.5[1m]` row (272k family).
 
@@ -324,6 +338,49 @@ the client, which sizes off the submitted id — type `astra[1m]` or pick the
 `[1M]` picker row for the 1M denominator. The catalog
 also lists an 872,000 `max_context_window` for astra, which llmux does not
 advertise.
+
+`gpt-6.1-sol[1m]`, `gpt-6-sol[1m]` and `gpt-6-luna[1m]` (added 2026-10-06)
+follow the same pattern as astra's twin — 1000000 advertised on the strength of
+OpenAI's published 1,050,000 window for those models, unprobed through the
+daemon — but keep the 5.6 alias convention: the bare `sol` / `luna` aliases
+sit on the BASE rows (`gpt-6.1-sol`, `gpt-6-luna`, catalog context 272000),
+and the `[1m]` twin is an explicit opt-in. models.json lists the same
+272,000 / 872,000 pair for all three, which llmux does not advertise.
+
+## Selecting a model
+
+There are three ways to select a catalog model:
+
+- **Claude Code**: `/model <id>` (the [picker below](#claude-code-model-picker)
+  lists this catalog), or `--model <id>` at launch.
+- **Per agent**: `model: <id>` in `.claude/agents/<name>.md`. The agent's
+  requests carry that id and llmux routes them by name, so one Claude Code
+  session can run Claude, GPT and Grok workers natively (measured 2026-10-08;
+  see [multi-model agents](multi-model-agents.md)).
+- **Codex**: `-m <id>`, or the injected [catalog picker](#codex-model-picker).
+
+The `/model` picker is a convenience for typing; agent delegation does not
+depend on it. Prefer explicit ids such as `gpt-6-astra[1m]` or `grok-4.7` in
+agent files so routing is readable; aliases (`astra`, `grok`) also work. Claude
+Code logs an `unrecognized_model` warning for non-Claude ids and still sends the
+request.
+
+Channel note: `haiku` → `claude-haiku-5-5[1m]` is on stable since v0.2.25
+(2026-10-08; [release availability](operational-reference.md#release-availability)).
+
+## Codex model picker
+
+`llmux run --codex` fetches `/llmux/models` and supplies a temporary Codex catalog
+with backend groups, effort menus and context windows. Native coding instructions
+come from the local Codex model cache when available; the fallback is an embedded
+coding prompt. Claude and other translated models use direct client tools.
+`--no-model-picker`, or an explicit `-c model_catalog_json=...`, preserves your
+client catalog; a fetch failure warns and does not block launch. User `-m` and
+`-c` arguments override injected launch defaults. No persistent Codex settings
+file is edited. See [Codex frontend](codex-frontend/README.md) for supported controls.
+
+The following Claude Code sections describe that client’s picker and context
+display workarounds; Codex gets context metadata from its injected catalog.
 
 ## Claude Code `/model` picker
 
@@ -372,8 +429,8 @@ Two opt-outs, plus one failure mode:
 
 Gateway model discovery (`CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY`) is NOT
 used: it keeps only ids containing `claude`/`anthropic` and needs a credential
-header, both of which defeat the purpose here. `/v1/models` stays proxied
-upstream, untouched.
+header, both of which defeat the purpose here. The separate `/v1/models` route
+now serves an OpenAI-shaped list; Claude Code picker injection uses `/llmux/models`.
 
 ### Alias exports
 
@@ -391,8 +448,8 @@ So the same fetch that builds the lineup also exports, for the same launch:
 | -------------------------------- | --------------------------------------- |
 | `ANTHROPIC_DEFAULT_OPUS_MODEL`   | `opus` owner (`claude-opus-5-5[1m]`)    |
 | `ANTHROPIC_DEFAULT_FABLE_MODEL`  | `fable` owner (`claude-fable-5-1[1m]`)  |
-| `ANTHROPIC_DEFAULT_SONNET_MODEL` | `sonnet` owner (`claude-sonnet-5-5[1m]`) |
-| `ANTHROPIC_DEFAULT_HAIKU_MODEL`  | `haiku` owner (`claude-haiku-5-5[1m]`) |
+| `ANTHROPIC_DEFAULT_SONNET_MODEL` | `sonnet` owner (`claude-sonnet-5-5[1m]`)  |
+| `ANTHROPIC_DEFAULT_HAIKU_MODEL`  | `haiku` owner (`claude-haiku-5-5[1m]`)      |
 
 The values are DERIVED from the catalog alias owners at launch, never
 hardcoded: re-curating an alias onto a new row moves the export with it, and an
@@ -420,6 +477,57 @@ To move the client-side denominator for those, the SUBMITTED id has to end in
 `[1m]`: pick the `[1M]` row in the picker, or type `/model astra[1m]` /
 `/model grok[1m]` (and for grok, mind the
 [500k upstream ceiling](#the-grok-1m-twin)).
+
+## Model sweep: 2026-10-12
+
+Checked all three subscription providers against their current primary sources.
+No provider lists a new model id, and no catalog row or reference price changed
+(one live availability finding on Codex, recorded in its row).
+
+| Provider | Result | Sources checked |
+| --- | --- | --- |
+| Claude | Current lineup unchanged: Fable 5.1, Opus 5.5, Sonnet 5.5, Haiku 5.5 are all present. There is no `claude-fable-5-5` on the platform (Claude Code 2.1.296 carries no such id either); Mythos 5.1 is limited availability (Claude Code 2.1.296 knows `claude-mythos-5-1`) and is not a catalog row. Pricing re-read: every reference rate in `src/pricing.rs` still matches (cache read: Fable 5.1 $0.25, Opus 5.5 $0.20, Sonnet 5.5 $0.10, Haiku 5.5 $0.01 in the ≤100K tier). | [current lineup](https://platform.claude.com/docs/en/models/overview), [pricing](https://platform.claude.com/docs/en/about-claude/pricing) |
+| Codex / OpenAI | `models.json` @ `a9b0815167c2` lists the same picker ids as on 2026-10-08 (GPT-6.1 Sol, GPT-6 Astra/Sol/Luna, GPT-5.6 Sol/Terra/Luna, GPT-5.5; 272K / 872K metadata unchanged, GPT-5.5 272K / 272K). The hidden `gpt-daybreak-*` and `codex-auto-review` ids remain non-picker. Live probe through the daemon the same day: every picker id tried (`gpt-6-astra`, `gpt-6.1-sol`, `gpt-6-sol`, `gpt-5.6-sol`) returned HTTP 400 `The '<model>' model is not supported when using Codex with a ChatGPT account.` — all on the scheduler's active codex account, whose token (refreshed 01:30Z that day; last 200 on that account 2026-10-10) now carries plan `free` (the other codex accounts carry `pro`; official Codex CLI 0.160.1 on a pro account answers normally). After pausing that account, `gpt-6.1-sol` and `gpt-6-astra` returned 200 on a pro account (`gpt-6-sol` / `gpt-5.6-sol` not re-tried after the pause). An account-eligibility problem, not a catalog change; llmux's missing failover is [#204](https://github.com/2lab-ai/llmux/issues/204). | [Codex model catalog](https://github.com/openai/codex/blob/main/codex-rs/models-manager/models.json) |
+| Grok / xAI | No new text model beyond the `grok-4.7` family (September: `grok-4.7` on the public API, Grok 4.7 Fast for Cursor/Grok Build only — the uncurated `grok-4.7-build-fast` — and `grok-voice-transcribe-2.0`; October: only the `grok-voice-transcribe-1.0` EOL on 2026-10-02). Live `cli-chat-proxy` `/v1/models` with a real subscription token: the same four ids (`grok-4.7`, `grok-4.7-build-fast`, `grok-4.6`, `grok-4.5`) and the same effort menus, but the response shape changed — `context_window` now reads **256000** on every id, next to a new `context_windows: [256000, 500000]` list and a compaction hint (`auto_compact_threshold_percent: 80`). llmux sends no window selector, so the row figure was re-checked by an acceptance probe through the daemon: a `grok-4.7` request with `usage.input_tokens` 306103 (+1152 cache read) returned HTTP 200, i.e. `grok-4.7` still takes prompts well above the published 256k default (only `grok-4.7` was probed; the 500000 ceiling itself was not). The rows keep **500000**, the upper `context_windows` entry that the 2026-07-14 … 2026-09-23 reads reported as `context_window`; the selectable-window / compaction fields are a feature question ([#203](https://github.com/2lab-ai/llmux/issues/203)), not a catalog fact. See [The grok `[1m]` twin](#the-grok-1m-twin). | [Release notes](https://docs.x.ai/developers/release-notes), live `/v1/models` and daemon probe (2026-10-12) |
+
+## Model sweep: 2026-10-08
+
+Checked all three subscription providers against their current primary sources:
+
+| Provider | Result | Sources checked |
+| --- | --- | --- |
+| Claude | Added `claude-haiku-5-5` (released 2026-10-07), 1M context / 128K max output; floated `haiku`. Both base and `[1m]` rows publish 1M; the suffix additionally selects Claude Code's context display. On stable since v0.2.25 (2026-10-08). | [Haiku specifications](https://platform.claude.com/docs/en/models/haiku-5-5/overview), [current lineup](https://platform.claude.com/docs/en/models/overview) |
+| Codex / OpenAI | Current listed coding IDs are already present: GPT-6.1 Sol, GPT-6 Astra/Sol/Luna and GPT-5.6 Sol/Terra/Luna, GPT-5.5. Corrected the three 5.6 base rows from older 372K metadata to the current catalog's 272K; existing 1M twins remain. Hidden specialty/auto-review IDs and non-text APIs are not ordinary picker additions. | [Codex model catalog](https://github.com/openai/codex/blob/main/codex-rs/models-manager/models.json), [API model index](https://developers.openai.com/api/docs/models), [current guidance](https://developers.openai.com/api/docs/guides/latest-model) |
+| Grok / xAI | Latest general-purpose text model remains `grok-4.7` (released 2026-09-21), already present. Grok 4.7 Fast is a service variant limited to Cursor/Grok Build, not a newly documented public API model ID; recent voice/image releases do not belong in this catalog. | [Release notes](https://docs.x.ai/developers/release-notes), [models](https://docs.x.ai/developers/models) |
+
+### Current Claude reference prices
+
+USD per million tokens, verified 2026-10-08 against [Anthropic pricing](https://platform.claude.com/docs/en/about-claude/pricing)
+and [Haiku 5.5 specifications](https://platform.claude.com/docs/en/models/haiku-5-5/overview):
+
+| Model / prompt length | Input | Output | Cache read | Cache write, 5m | Cache write, 1h |
+| --- | --- | --- | --- | --- | --- |
+| Haiku 5.5, ≤100,000 tokens | $0.10 | $0.50 | $0.01 | $0.125 | $0.20 |
+| Haiku 5.5, >100,000 tokens | $0.50 | $2.50 | $0.05 | $0.625 | $1.00 |
+| Sonnet 5.5 | $2.00 | $10.00 | $0.10 | $2.50 | $4.00 |
+| Fable 5.1 | $10.00 | $50.00 | $0.25 | $12.50 | $20.00 |
+
+Sonnet 5.5 cache reads were reduced from $0.20 to $0.10 on
+[2026-10-07](https://www.anthropic.com/claude-haiku-5-5). Fable 5.1 now has its
+own $0.25 cache-read reference rate. Explicit older Sonnet 5, Fable 5 and
+Haiku 4.5 keep their own prices.
+
+**Estimator scope:** `src/pricing.rs` uses static reference rates: Haiku 5.5's
+≤100K tier and 5-minute cache writes. It does **not** apply Haiku's >100K tier
+(5× all rates), 1-hour write rates, service-tier premiums or historical prices.
+Aggregated counters do not retain the request-length/TTL detail needed to
+reconstruct these charges; crossing 100K in accumulated monthly usage does not
+mean any individual request crossed it. Displayed costs can therefore understate
+long-context/1h-cache API cost. These are API-equivalent estimates, never a
+subscription invoice. Existing config price overrides still take precedence.
+
+Haiku 5.5's published API limits are metadata, not a new live subscription
+compatibility claim. See the [provider contract](provider-compatibility.md#haiku-55-catalog-update).
 
 ## Sources
 
@@ -459,7 +567,7 @@ again 2026-09-23 (the new `grok-4.7` row, and the default pin moved 4.6 → 4.7
   output: Fable 5.1 $10 / $12.50 / $20 / $0.25 / $50; Fable 5 $10 / $12.50 /
   $20 / $1.00 / $50; Opus 5.5 $4 / $5 / $8 / $0.20 / $20; Opus 5, 4.8, 4.7,
   4.6, 4.5 $5 / $6.25 / $10 / $0.50 / $25; Opus 4.1 and 4 (retired) $15 /
-  $18.75 / $30 / $1.50 / $75; Sonnet 5.5 and 5 $2 / $2.50 / $4 / $0.20 / $10;
+  $18.75 / $30 / $1.50 / $75; Sonnet 5 $2 / $2.50 / $4 / $0.20 / $10 and Sonnet 5.5 $2 / $2.50 / $4 / $0.10 / $10 (cache read cut 2026-10-07);
   Sonnet 4.6, 4.5, 4 $3 / $3.75 / $6 / $0.30 / $15; Haiku 5.5 $0.10 / $0.125 / $0.20 / $0.01 / $0.50 for prompts up to 100K tokens, $0.50 / $0.625 / $1 / $0.05 / $2.50 for prompts over 100K (whole request, modeled as a long-context tier); Haiku 4.5 $1 / $1.25 / $2 /
   $0.10 / $5; Haiku 3.5 (retired, `claude-3-5-haiku-*`) $0.80 / $1 / $1.60 /
   $0.08 / $4. Both write rates are modeled: each request's 1-hour share of its
@@ -498,9 +606,8 @@ again 2026-09-23 (the new `grok-4.7` row, and the default pin moved 4.6 → 4.7
   through the daemon. Both join the provider passthrough list. Pricing (standard
   tier, per 1M tokens, launched 2026-09-22; OpenAI API pricing page, read
   2026-09-28): `gpt-6-sol` $2 in / $10 out / $0.20 cached input; `gpt-6-luna`
-  $0.10 in / $0.50 out / $0.01 cached input; no cache-creation charge, per the
-  codex convention (the page lists cache writes at $2.50 / $0.125, which do not
-  apply to subscription traffic). The >272k-prompt tier (sol $4 in / $15 out,
+  $0.10 in / $0.50 out / $0.01 cached input; cache writes $2.50 / $0.125 (1.25×
+  input, per the page; the wire reports `cache_write_tokens`, 0 today). The >272k-prompt tier (sol $4 in / $15 out,
   luna $0.20 in / $0.75 out) is not modeled. The `[1m]` twin for sol reuses
   astra's 1000000 client denominator and has not been probed.
 - **gpt-6.1-sol** — released 2026-09-29. Codex catalog: `gpt-6.1-sol`
@@ -508,8 +615,7 @@ again 2026-09-23 (the new `grok-4.7` row, and the default pin moved 4.6 → 4.7
   effort low, `supported_in_api`, low→ultra. Joins the provider passthrough
   list and owns no bare alias. Pricing (standard tier, per 1M tokens; OpenAI
   API pricing page, read 2026-09-29): $2 in / $10 out / $0.10 cached input
-  (gpt-6-sol's cached input is $0.20); no cache-creation charge per the codex
-  convention. The >272k-prompt tier ($4 / $15 / $0.20 cached) is not modeled.
+  (gpt-6-sol's cached input is $0.20); cache write $2.50 (1.25× input). The >272k-prompt tier ($4 / $15 / $0.20 cached) is not modeled.
   The `[1m]` twin reuses gpt-6-sol's 1000000 client denominator and has not
   been probed.
 - **Codex `[1m]` context window** — live probes through the daemon against the
@@ -548,7 +654,14 @@ again 2026-09-23 (the new `grok-4.7` row, and the default pin moved 4.6 → 4.7
   grok set is `grok-4.7` (the default pin, plus its `[1m]` twin), `grok-4.6`
   and `grok-4.5`; other
   known grok ids (`grok-4.3`, `grok-3-mini`, …) pass through at request time and
-  synthesize a null-metadata row when pinned.
+  synthesize a null-metadata row when pinned. Re-probed 2026-10-12 with a real
+  subscription token: the same four ids and effort menus, but `context_window`
+  now reads 256000 on every id next to `context_windows: [256000, 500000]` and
+  `auto_compact_threshold_percent: 80`. The rows keep 500000, the upper
+  `context_windows` entry; a 306,103-input-token `grok-4.7` request through the
+  daemon was accepted (HTTP 200), so the 256000 default is not enforced for
+  `grok-4.7`. Neither the 500000 ceiling nor `grok-4.6` / `grok-4.5` above
+  256000 was re-probed.
 - **Grok pricing** — docs.x.ai/developers/pricing, read 2026-09-28: `grok-4.7`
   and `grok-4.6` are $2.00 in / $6.00 out / $0.50 cached input per 1M tokens,
   `grok-4.5` $2.00 / $6.00 / $0.30. A request whose prompt (fresh input + cached

@@ -10,12 +10,18 @@ Cut a formal **stable** release: version bump → tag `v*` → CI stable release
 
 A `v*` release ships **both** the CLI binaries and the macOS app
 (`LlmuxIslands-<version>.zip`, built by the `islands` job in `release.yml`), and the tap
-`bump.yml` then refreshes **both** the `llmux` formula and the `llmux-islands` cask — so
+scheduled update or the shared reference’s reviewed template fallback refreshes
+**both** the `llmux` formula and the `llmux-islands` cask — so
 `brew install llmux` (CLI only) and `brew install llmux-islands` (app + CLI via `depends_on`)
 track the same version. After step 6, also confirm `brew info --cask llmux-islands` == `<new>`.
 
 Shared mechanics: `.claude/skills/_shared/cd-reference.md` (procedure A = hot-deploy,
 procedure B = publish+verify brew).
+
+Docs-only followups to a verified release use the shared reference’s `[skip ci]`
+documentation path; they do not need a new version, tag or daemon restart. Filtered
+build contexts must retain the three embedded bridge assets, and SDK changes need
+`just check-bridge` alongside the Rust gate.
 
 ## Steps
 
@@ -43,8 +49,11 @@ procedure B = publish+verify brew).
    gh run watch --repo 2lab-ai/llmux "$rid" --exit-status
    ```
    Then confirm: `gh release view v<new> --repo 2lab-ai/llmux` (this is the new "Latest").
-6. **Publish + verify brew (stable)** — procedure B with `formula=llmux`. Dispatch the
-   tap `bump.yml`, watch it, `brew update && brew upgrade llmux`, confirm
+6. **Publish + verify brew (stable)** — procedure B with `formula=llmux`. Inspect the
+   current tap trigger: as of 2026-10-08 its llmux jobs run only on schedule, so manual
+   dispatch does not update llmux. For immediate delivery, render the exact stable
+   formula and cask from their templates using verified release-asset hashes; review
+   and publish only those two files. Then `brew update && brew upgrade llmux`; confirm
    `brew info --json=v2 llmux | ...installed[0].version` == `<new>`.
    *(If only `llmux-preview` is currently installed, `brew install 2lab-ai/tap/llmux`;
    both provide `bin/llmux` via `link_overwrite`.)*
@@ -52,7 +61,9 @@ procedure B = publish+verify brew).
    `/opt/homebrew/bin/llmux restart`. Verify `--version` reports `<new> (stable <id>)`.
 8. **Final verify — client AND server.** `/opt/homebrew/bin/llmux status`: both the local
    client view and the running daemon's accounts reflect the new build. This is the owner's
-   required end-state.
+   required end-state. For frontend/runtime changes, also run the shared reference’s
+   installed native-Codex and Claude-SDK tool smokes; ensure daemon Node/npm and
+   packaged SDK bootstrap work without a repository runtime override.
 9. **Report** new version, release URL, brew version, and the `status` summary.
 
 ## Common mistakes
@@ -60,7 +71,8 @@ procedure B = publish+verify brew).
 - **tag ≠ Cargo.toml version** — #1 failure; bump first (step 2) then tag (step 4). Re-tagging
   means deleting the bad tag locally + remotely.
 - Reusing an existing version (e.g. `v0.1.0`) — always go forward.
-- Forgetting to dispatch the tap `bump.yml` — brew stays on the old stable.
+- Assuming manual tap dispatch updates llmux: verify the current trigger and use
+  the scoped reviewed fallback when llmux jobs are schedule-only.
 - "Already up-to-date" → `brew update` then re-check `brew info` before trusting it.
 - Pushing main/PR without the user's go-ahead (version itself defaults to a patch bump —
   see step 1).
