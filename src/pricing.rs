@@ -52,7 +52,7 @@
 //! Tiered today: claude-haiku-5-5 (`> 100k`, i.e. threshold 100_001), grok-4.5 / grok-4.6 / grok-4.7 (xAI, `>= 200k`, every rate
 //! doubles; docs.x.ai read 2026-09-28) — and therefore the `grok` group
 //! fallback — and the OpenAI rows gpt-5.5, gpt-5.6-{sol,terra,luna} and
-//! gpt-6-{astra,sol,luna} (`>= 272k`, input and cache double, output x1.5; the
+//! gpt-6-{astra,sol,luna} and gpt-6.1-sol (`>= 272k`, input and cache double, output x1.5; the
 //! OpenAI pricing page, read 2026-09-28). The threshold is carried by the
 //! built-in row ([`long_context_threshold`]), so a dated snapshot classifies
 //! exactly as it prices. Deliberately NOT tiered: Claude rows (Claude 4.6+ bill
@@ -526,6 +526,7 @@ const BUILTIN_TIERED_ROWS: &[ModelPrice] = &[
     GPT_5_6_LUNA,
     GPT_6_ASTRA,
     GPT_6_SOL,
+    GPT_6_1_SOL,
     GPT_6_LUNA,
     GROK_4_5,
     GROK_4_6,
@@ -563,7 +564,7 @@ fn builtin_price(model_norm_lower: &str) -> Option<ModelPrice> {
         "gpt-5.6-luna" => Some(GPT_5_6_LUNA),
         "gpt-6" | "gpt-6-astra" => Some(GPT_6_ASTRA),
         "gpt-6-sol" => Some(GPT_6_SOL),
-        "gpt-6.1-sol" => Some(GPT_6_1_SOL),
+        "gpt-6.1" | "gpt-6.1-sol" => Some(GPT_6_1_SOL),
         "gpt-6-luna" => Some(GPT_6_LUNA),
         "grok-4.5" => Some(GROK_4_5),
         "grok-4.7" => Some(GROK_4_7),
@@ -1225,6 +1226,16 @@ mod tests {
             approx(per_m("codex", model, 1), output);
             approx(per_m("codex", model, 2), cached);
         }
+    }
+
+    #[test]
+    fn bare_gpt_6_1_prices_like_gpt_6_1_sol_and_is_tiered() {
+        assert_eq!(builtin_price("gpt-6.1"), Some(GPT_6_1_SOL));
+        assert_eq!(builtin_price("gpt-6.1-sol"), Some(GPT_6_1_SOL));
+        assert!(
+            BUILTIN_TIERED_ROWS.contains(&GPT_6_1_SOL),
+            "gpt-6.1-sol carries a long-context tier"
+        );
     }
 
     #[test]
