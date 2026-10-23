@@ -131,6 +131,7 @@ Stable is v0.2.25 (2026-10-08). Preview is rolling and carries whatever landed o
 | `llmux env --codex` | no — `env` prints Claude Code exports only | yes | yes |
 | Haiku 5.5 catalog row (`haiku` → `claude-haiku-5-5[1m]`) | no | yes | yes |
 | Numeric combined auth states in `status` / Islands | no | yes | yes |
+| Explicit Haiku 4.5 ids served by Haiku 5.5 on Claude Code / Agent SDK–shaped requests with default sampling and the bare `quota` probe (bare, custom-system or non-default-sampling requests still reach Haiku 4.5; row retired), Claude Code system block on the bare `quota` probe ([models](models.md#alias-semantics)) | no | no | yes |
 
 Note on 0.2.24 local control: the 0.2.24 Islands app sends loopback requests without a key, while the daemon requires an admin credential on `/llmux/*`, so that app cannot read a daemon locally. This is confirmed from source (`LlmuxClient.swift`, `server.rs`), not reproduced in a running GUI. `llmux update` moves a 0.2.24 install to 0.2.25.
 
