@@ -569,8 +569,11 @@ pub fn find_record(path: Option<&std::path::Path>, id: u64, at_ms: u64) -> Optio
 /// record appended mid-prune is never lost ("history behind live": kept-old
 /// records keep their order, the live tail follows).
 ///
-/// Strictly best-effort: a `None` path, a missing/unreadable file, or any IO
-/// error on read/write leaves the file as-is (the temp file is discarded).
+/// Strictly best-effort: a `None` path, a missing file, or any IO error on
+/// read/write leaves the file as-is (the temp file is discarded) — every such
+/// give-up other than "no file" logs a warning with the reason, and a completed
+/// rewrite logs an info line with bytes and records kept/dropped. Non-UTF-8
+/// lines are read as bytes and dropped like any other unparseable line.
 /// Never panics. The rewrite goes through a sibling temp file + atomic rename
 /// so a crash mid-prune can't truncate the log.
 pub fn prune(path: Option<&std::path::Path>, retention_days: u64, now_ms: u64) {
@@ -581,45 +584,95 @@ pub fn prune(path: Option<&std::path::Path>, retention_days: u64, now_ms: u64) {
         return;
     };
     let cutoff = now_ms.saturating_sub(retention_days.saturating_mul(MS_PER_DAY));
-    if !needs_prune(path, cutoff) {
-        return; // nothing to drop — no temp written, original untouched
+    let path_disp = path.display();
+    match needs_prune(path, cutoff) {
+        Ok(false) => return, // nothing to drop — no temp written, original untouched
+        Ok(true) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return, // no log yet
+        Err(e) => {
+            tracing::warn!(path = %path_disp, error = %e, "raw-io prune skipped: pre-scan failed; file left as-is");
+            return;
+        }
     }
-    let Some(stage) = prune_scan(path, cutoff) else {
-        return; // nothing to drop, or scan failed — original left as-is
+    let stage = match prune_scan(path, cutoff) {
+        Ok(Some(stage)) => stage,
+        // The log changed between the pre-pass and the scan (e.g. an external
+        // truncation); nothing left to drop is a legitimate no-op.
+        Ok(None) => {
+            tracing::info!(path = %path_disp, "raw-io prune: nothing to drop after scan");
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(path = %path_disp, error = %e, "raw-io prune aborted: scan failed; file left as-is");
+            return;
+        }
     };
-    prune_commit(path, stage);
+    match prune_commit(path, &stage) {
+        Ok((bytes_before, bytes_after)) => tracing::info!(
+            path = %path_disp,
+            bytes_before,
+            bytes_after,
+            records_kept = stage.kept,
+            records_dropped = stage.dropped,
+            "raw-io prune complete"
+        ),
+        Err(reason) => tracing::warn!(
+            path = %path_disp,
+            reason,
+            "raw-io prune aborted at commit; file left as-is"
+        ),
+    }
 }
 
-/// Read-only pre-pass: would the retention window drop anything? `true` on the
-/// first out-of-window, wrong-version, unparseable, or blank line — exactly
-/// the lines [`prune_scan`] rewrites the file to shed. A missing/unreadable
-/// file or a torn final line (no trailing newline — crash artifact or an
-/// append racing this scan; the rewrite carries it over verbatim either way)
-/// is not by itself a reason to rewrite.
-fn needs_prune(path: &std::path::Path, cutoff: u64) -> bool {
-    let Ok(file) = std::fs::File::open(path) else {
-        return false;
-    };
-    let mut reader = std::io::BufReader::new(file);
-    let mut line = String::new();
+/// Strip the line terminator and surrounding ASCII whitespace from a raw line.
+fn trim_bytes(mut line: &[u8]) -> &[u8] {
+    while let [first, rest @ ..] = line {
+        if first.is_ascii_whitespace() {
+            line = rest;
+        } else {
+            break;
+        }
+    }
+    while let [rest @ .., last] = line {
+        if last.is_ascii_whitespace() {
+            line = rest;
+        } else {
+            break;
+        }
+    }
+    line
+}
+
+/// Is this (trimmed, non-empty) line a record the window keeps? Parsed from
+/// BYTES: a non-UTF-8 line (torn write, binary garbage) simply fails to parse
+/// and counts as droppable instead of aborting the whole prune.
+fn keeps(trimmed: &[u8], cutoff: u64) -> bool {
+    matches!(
+        serde_json::from_slice::<RawIoRecord>(trimmed),
+        Ok(record) if record.v == RECORD_VERSION && record.ts_ms >= cutoff
+    )
+}
+
+/// Read-only pre-pass: would the retention window drop anything? `Ok(true)` on
+/// the first out-of-window, wrong-version, unparseable (incl. non-UTF-8), or
+/// blank line — exactly the lines [`prune_scan`] rewrites the file to shed. A
+/// torn final line (no trailing newline — crash artifact or an append racing
+/// this scan; the rewrite carries it over verbatim either way) is not by itself
+/// a reason to rewrite. `Err` is a genuine IO failure, reported by the caller.
+fn needs_prune(path: &std::path::Path, cutoff: u64) -> std::io::Result<bool> {
+    let mut reader = std::io::BufReader::new(std::fs::File::open(path)?);
+    let mut line = Vec::new();
     loop {
         line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) => return false, // EOF, everything in window
-            Ok(_) => {
-                if !line.ends_with('\n') {
-                    return false; // torn final line — not a drop candidate
-                }
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    return true;
-                }
-                match serde_json::from_str::<RawIoRecord>(trimmed) {
-                    Ok(record) if record.v == RECORD_VERSION && record.ts_ms >= cutoff => {}
-                    _ => return true,
-                }
-            }
-            Err(_) => return false, // unreadable — leave the file as-is
+        if reader.read_until(b'\n', &mut line)? == 0 {
+            return Ok(false); // EOF, everything in window
+        }
+        if line.last() != Some(&b'\n') {
+            return Ok(false); // torn final line — not a drop candidate
+        }
+        let trimmed = trim_bytes(&line);
+        if trimmed.is_empty() || !keeps(trimmed, cutoff) {
+            return Ok(true);
         }
     }
 }
@@ -630,96 +683,108 @@ fn needs_prune(path: &std::path::Path, cutoff: u64) -> bool {
 struct PruneStage {
     tmp: std::path::PathBuf,
     consumed: u64,
+    kept: u64,
+    dropped: u64,
 }
 
 /// Phase 1 (unlocked, streaming): scan `path` line by line, writing in-window
-/// parseable records to a sibling temp file. Returns `None` when there is
-/// nothing to rewrite (every line kept verbatim, or any IO error — the temp is
-/// discarded either way).
-fn prune_scan(path: &std::path::Path, cutoff: u64) -> Option<PruneStage> {
-    let file = std::fs::File::open(path).ok()?; // missing/unreadable = nothing to prune
-    let mut reader = std::io::BufReader::new(file);
+/// parseable records to a sibling temp file. `Ok(None)` when there is nothing
+/// to rewrite (every line kept verbatim); `Err` on any IO error. The temp is
+/// discarded in both cases.
+fn prune_scan(path: &std::path::Path, cutoff: u64) -> std::io::Result<Option<PruneStage>> {
+    let mut reader = std::io::BufReader::new(std::fs::File::open(path)?);
     let tmp = path.with_extension("jsonl.prune.tmp");
     // `create` truncates a stale temp left by a crashed prune.
-    let out = std::fs::File::create(&tmp).ok()?;
-    let mut writer = std::io::BufWriter::new(out);
-
-    let mut consumed: u64 = 0;
-    let mut changed = false;
-    let mut line = String::new();
-    let discard = |writer: std::io::BufWriter<std::fs::File>, tmp: &std::path::Path| {
-        drop(writer);
-        let _ = std::fs::remove_file(tmp);
-    };
-    loop {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) => break, // EOF
-            Ok(n) => {
-                if !line.ends_with('\n') {
-                    // Partial final line: either a crash artifact or an append
-                    // racing this scan mid-write. Leave it for the commit's
-                    // verbatim tail copy (do NOT count it as consumed) so it is
-                    // carried over whole once the writer finishes.
-                    break;
-                }
-                consumed += n as u64;
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    changed = true;
-                    continue;
-                }
-                match serde_json::from_str::<RawIoRecord>(trimmed) {
-                    Ok(record) if record.v == RECORD_VERSION && record.ts_ms >= cutoff => {
-                        if writer
-                            .write_all(trimmed.as_bytes())
-                            .and_then(|()| writer.write_all(b"\n"))
-                            .is_err()
-                        {
-                            discard(writer, &tmp);
-                            return None;
-                        }
-                    }
-                    // Out of window, wrong version, or unparseable → drop it.
-                    _ => changed = true,
-                }
+    let mut writer = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
+    let result = (|| -> std::io::Result<Option<(u64, u64, u64)>> {
+        let (mut consumed, mut kept, mut dropped) = (0u64, 0u64, 0u64);
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            let n = reader.read_until(b'\n', &mut line)?;
+            if n == 0 {
+                break; // EOF
             }
-            Err(_) => {
-                discard(writer, &tmp);
-                return None;
+            if line.last() != Some(&b'\n') {
+                // Partial final line: either a crash artifact or an append
+                // racing this scan mid-write. Leave it for the commit's
+                // verbatim tail copy (do NOT count it as consumed) so it is
+                // carried over whole once the writer finishes.
+                break;
+            }
+            consumed += n as u64;
+            let trimmed = trim_bytes(&line);
+            if !trimmed.is_empty() && keeps(trimmed, cutoff) {
+                writer.write_all(trimmed)?;
+                writer.write_all(b"\n")?;
+                kept += 1;
+            } else {
+                dropped += 1; // blank, out of window, wrong version, or unparseable
             }
         }
+        writer.flush()?;
+        Ok((dropped > 0).then_some((consumed, kept, dropped)))
+    })();
+    drop(writer);
+    match result {
+        Ok(Some((consumed, kept, dropped))) => Ok(Some(PruneStage {
+            tmp,
+            consumed,
+            kept,
+            dropped,
+        })),
+        Ok(None) => {
+            let _ = std::fs::remove_file(&tmp);
+            Ok(None)
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
     }
-    // Nothing to do (every line kept verbatim), or the kept set failed to
-    // flush: discard the temp and leave the original untouched.
-    if !changed || writer.flush().is_err() {
-        discard(writer, &tmp);
-        return None;
-    }
-    Some(PruneStage { tmp, consumed })
 }
 
 /// Phase 2 (under [`IO_LOCK`]): copy any bytes appended past the scanned
 /// offset verbatim onto the temp file, then atomically rename it over the
-/// original. On any IO error the temp is discarded and the original is left
-/// as-is.
-fn prune_commit(path: &std::path::Path, stage: PruneStage) {
+/// original. Returns `(bytes_before, bytes_after)`. On any error the temp is
+/// discarded and the original is left as-is.
+fn prune_commit(path: &std::path::Path, stage: &PruneStage) -> Result<(u64, u64), String> {
     let _guard = IO_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let copied_tail = (|| -> std::io::Result<()> {
-        let mut src = std::fs::File::open(path)?;
-        let len = src.metadata()?.len();
-        if len > stage.consumed {
-            src.seek(std::io::SeekFrom::Start(stage.consumed))?;
-            let mut out = std::fs::OpenOptions::new().append(true).open(&stage.tmp)?;
-            std::io::copy(&mut src, &mut out)?;
+    let result = (|| -> Result<(u64, u64), String> {
+        let mut src = std::fs::File::open(path).map_err(|e| format!("reopen original: {e}"))?;
+        let len = src
+            .metadata()
+            .map_err(|e| format!("stat original: {e}"))?
+            .len();
+        if len < stage.consumed {
+            // The file shrank or was replaced since the scan; the temp no
+            // longer corresponds to it, and renaming would lose live records.
+            return Err(format!(
+                "original shrank during scan ({len} < {} bytes scanned)",
+                stage.consumed
+            ));
         }
-        Ok(())
+        let mut out = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&stage.tmp)
+            .map_err(|e| format!("open temp for tail copy: {e}"))?;
+        if len > stage.consumed {
+            src.seek(std::io::SeekFrom::Start(stage.consumed))
+                .map_err(|e| format!("seek to appended tail: {e}"))?;
+            std::io::copy(&mut src, &mut out)
+                .map_err(|e| format!("copy appended tail ({} bytes): {e}", len - stage.consumed))?;
+        }
+        out.flush().map_err(|e| format!("flush temp: {e}"))?;
+        let after = out.metadata().map_err(|e| format!("stat temp: {e}"))?.len();
+        std::fs::rename(&stage.tmp, path).map_err(|e| format!("rename temp over original: {e}"))?;
+        Ok((len, after))
     })();
-    if copied_tail.is_err() || std::fs::rename(&stage.tmp, path).is_err() {
+    if result.is_err() {
         let _ = std::fs::remove_file(&stage.tmp);
     }
+    result
 }
 
 #[cfg(test)]
@@ -1161,9 +1226,11 @@ mod tests {
 
         // Drive the two phases by hand to interleave an append deterministically.
         let cutoff = now.saturating_sub(90 * MS_PER_DAY);
-        let stage = prune_scan(&path, cutoff).expect("old record → rewrite staged");
+        let stage = prune_scan(&path, cutoff)
+            .expect("scan ok")
+            .expect("old record → rewrite staged");
         append(Some(&path), &rec(3, 99 * MS_PER_DAY)); // lands after the scan
-        prune_commit(&path, stage);
+        prune_commit(&path, &stage).expect("commit ok");
 
         let contents = std::fs::read_to_string(&path).expect("file");
         let ids: Vec<u64> = contents
@@ -1176,6 +1243,103 @@ mod tests {
             vec![2, 3],
             "old dropped; kept record first, mid-prune append preserved behind it"
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    fn ids_in(path: &std::path::Path) -> Vec<u64> {
+        std::fs::read(path)
+            .expect("file")
+            .split(|b| *b == b'\n')
+            .filter_map(|l| serde_json::from_slice::<RawIoRecord>(l).ok())
+            .map(|r| r.id)
+            .collect()
+    }
+
+    /// Regression: a non-UTF-8 line used to make `read_line` fail, so the prune
+    /// silently left the file as-is on every start. It must now be shed, the
+    /// torn final line carried over verbatim, and in-window records kept.
+    #[test]
+    fn prune_handles_non_utf8_line_and_torn_final_line() {
+        use std::io::Write as _;
+        let path = tmp_path("prune-nonutf8");
+        let now = 100 * MS_PER_DAY;
+        append(Some(&path), &rec(1, MS_PER_DAY)); // old → dropped
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .expect("open");
+            f.write_all(b"\xff\xfe not utf8 \x80\n").expect("write");
+        }
+        append(Some(&path), &rec(2, 99 * MS_PER_DAY)); // kept
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .expect("open");
+            f.write_all(b"{\"v\":1,\"torn\xc3").expect("write"); // torn, no newline
+        }
+
+        prune(Some(&path), 90, now);
+
+        let bytes = std::fs::read(&path).expect("file");
+        assert_eq!(
+            ids_in(&path),
+            vec![2],
+            "old + non-UTF-8 dropped, recent kept"
+        );
+        assert!(
+            !bytes.windows(3).any(|w| w == b"\xff\xfe "),
+            "non-UTF-8 line shed"
+        );
+        assert!(
+            bytes.ends_with(b"{\"v\":1,\"torn\xc3"),
+            "torn final line preserved verbatim"
+        );
+        assert!(
+            !path.with_extension("jsonl.prune.tmp").exists(),
+            "temp cleaned"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// An all-out-of-window file actually shrinks.
+    #[test]
+    fn prune_out_of_window_file_shrinks() {
+        let path = tmp_path("prune-shrink");
+        let now = 100 * MS_PER_DAY;
+        for id in 0..20 {
+            append(Some(&path), &rec(id, MS_PER_DAY));
+        }
+        append(Some(&path), &rec(99, 99 * MS_PER_DAY));
+        let before = std::fs::metadata(&path).expect("stat").len();
+
+        prune(Some(&path), 90, now);
+
+        let after = std::fs::metadata(&path).expect("stat").len();
+        assert!(after < before / 10, "shrank: {before} -> {after}");
+        assert_eq!(ids_in(&path), vec![99]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Commit refuses to rename when the original shrank under the scan.
+    #[test]
+    fn prune_commit_aborts_when_original_shrank() {
+        let path = tmp_path("prune-shrunk");
+        let now = 100 * MS_PER_DAY;
+        append(Some(&path), &rec(1, MS_PER_DAY));
+        append(Some(&path), &rec(2, 99 * MS_PER_DAY));
+        let stage = prune_scan(&path, now - 90 * MS_PER_DAY)
+            .expect("scan ok")
+            .expect("staged");
+        std::fs::write(&path, b"").expect("truncate");
+        assert!(prune_commit(&path, &stage).is_err());
+        assert_eq!(
+            std::fs::metadata(&path).expect("stat").len(),
+            0,
+            "untouched"
+        );
+        assert!(!stage.tmp.exists(), "temp discarded");
         let _ = std::fs::remove_file(&path);
     }
 }
