@@ -683,6 +683,9 @@ fn needs_prune(path: &std::path::Path, cutoff: u64) -> std::io::Result<bool> {
 struct PruneStage {
     tmp: std::path::PathBuf,
     consumed: u64,
+    /// Inode of the scanned file; a different one at commit means it was
+    /// rotated/replaced and the scanned offset no longer applies.
+    ino: Option<u64>,
     kept: u64,
     dropped: u64,
 }
@@ -692,7 +695,9 @@ struct PruneStage {
 /// to rewrite (every line kept verbatim); `Err` on any IO error. The temp is
 /// discarded in both cases.
 fn prune_scan(path: &std::path::Path, cutoff: u64) -> std::io::Result<Option<PruneStage>> {
-    let mut reader = std::io::BufReader::new(std::fs::File::open(path)?);
+    let src_file = std::fs::File::open(path)?;
+    let ino = file_ino(&src_file.metadata()?);
+    let mut reader = std::io::BufReader::new(src_file);
     let tmp = path.with_extension("jsonl.prune.tmp");
     // `create` truncates a stale temp left by a crashed prune.
     let mut writer = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
@@ -730,6 +735,7 @@ fn prune_scan(path: &std::path::Path, cutoff: u64) -> std::io::Result<Option<Pru
         Ok(Some((consumed, kept, dropped))) => Ok(Some(PruneStage {
             tmp,
             consumed,
+            ino,
             kept,
             dropped,
         })),
@@ -744,6 +750,17 @@ fn prune_scan(path: &std::path::Path, cutoff: u64) -> std::io::Result<Option<Pru
     }
 }
 
+#[cfg(unix)]
+fn file_ino(meta: &std::fs::Metadata) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt as _;
+    Some(meta.ino())
+}
+
+#[cfg(not(unix))]
+fn file_ino(_: &std::fs::Metadata) -> Option<u64> {
+    None
+}
+
 /// Phase 2 (under [`IO_LOCK`]): copy any bytes appended past the scanned
 /// offset verbatim onto the temp file, then atomically rename it over the
 /// original. Returns `(bytes_before, bytes_after)`. On any error the temp is
@@ -754,10 +771,11 @@ fn prune_commit(path: &std::path::Path, stage: &PruneStage) -> Result<(u64, u64)
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let result = (|| -> Result<(u64, u64), String> {
         let mut src = std::fs::File::open(path).map_err(|e| format!("reopen original: {e}"))?;
-        let len = src
-            .metadata()
-            .map_err(|e| format!("stat original: {e}"))?
-            .len();
+        let meta = src.metadata().map_err(|e| format!("stat original: {e}"))?;
+        let len = meta.len();
+        if file_ino(&meta) != stage.ino {
+            return Err("original was replaced during scan (inode changed)".into());
+        }
         if len < stage.consumed {
             // The file shrank or was replaced since the scan; the temp no
             // longer corresponds to it, and renaming would lose live records.
@@ -776,7 +794,8 @@ fn prune_commit(path: &std::path::Path, stage: &PruneStage) -> Result<(u64, u64)
             std::io::copy(&mut src, &mut out)
                 .map_err(|e| format!("copy appended tail ({} bytes): {e}", len - stage.consumed))?;
         }
-        out.flush().map_err(|e| format!("flush temp: {e}"))?;
+        // Durable before the rename drops the only other copy of the history.
+        out.sync_all().map_err(|e| format!("sync temp: {e}"))?;
         let after = out.metadata().map_err(|e| format!("stat temp: {e}"))?.len();
         std::fs::rename(&stage.tmp, path).map_err(|e| format!("rename temp over original: {e}"))?;
         Ok((len, after))
