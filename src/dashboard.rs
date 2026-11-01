@@ -935,6 +935,12 @@ pub struct SelectParamsDoc {
     /// `priority-drain` 5h spill switch (additive; older daemons → true).
     #[serde(default = "crate::config::default_true")]
     pub spill_on_five_hour: bool,
+    /// `priority-drain` overlap promotion switch (additive; older daemons → off).
+    #[serde(default)]
+    pub overlap_promote: bool,
+    /// Default overlap-ramp target (additive; older daemons → 0.99).
+    #[serde(default = "crate::config::default_seven_day_max_end")]
+    pub seven_day_max_end: f64,
     pub usage_max_age_secs: u64,
 }
 
@@ -946,6 +952,8 @@ impl From<&SelectParams> for SelectParamsDoc {
             fable_weekly_max: params.fable_weekly_max,
             mode: params.mode,
             spill_on_five_hour: params.spill_on_five_hour,
+            overlap_promote: params.overlap_promote,
+            seven_day_max_end: params.seven_day_max_end,
             usage_max_age_secs: params.usage_max_age.as_secs(),
         }
     }
@@ -959,6 +967,8 @@ impl From<&SelectParamsDoc> for SelectParams {
             fable_weekly_max: doc.fable_weekly_max,
             mode: doc.mode,
             spill_on_five_hour: doc.spill_on_five_hour,
+            overlap_promote: doc.overlap_promote,
+            seven_day_max_end: doc.seven_day_max_end,
             usage_max_age: Duration::from_secs(doc.usage_max_age_secs),
         }
     }
@@ -1916,7 +1926,7 @@ pub(crate) fn dashboard_doc(
             let cooling = account.cooldown_until.is_some_and(|until| until > now);
             // The account's EFFECTIVE Fable ceiling: per-account override else
             // global — the doc's `constraining` then matches the selector.
-            let fable_max = select::effective_limits(account, params).2;
+            let fable_max = select::effective_limits(account, params, now).2;
             let lifetime = totals.get(&account.id);
             let session = hub
                 .account_totals
@@ -2512,6 +2522,8 @@ mod tests {
             fable_weekly_max: 0.98,
             mode: crate::config::SchedulerMode::Default,
             spill_on_five_hour: true,
+            overlap_promote: false,
+            seven_day_max_end: 0.99,
             usage_max_age: Duration::from_secs(600),
         }
     }

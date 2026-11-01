@@ -3067,6 +3067,14 @@ fn config_rows(view: &DashboardView, chrome: &Chrome) -> Vec<CfgRow> {
         },
         CfgRow {
             section: "scheduler",
+            label: "overlap promote",
+            value: format!("{}", view.select_params.overlap_promote),
+            state: CfgState::ReadOnly,
+            note: "scheduler.overlap_promote · ramp target: scheduler.seven_day_max_end (per account: account_limits)",
+            action: None,
+        },
+        CfgRow {
+            section: "scheduler",
             label: "priority-drain 5h spill",
             value: format!("{}", view.select_params.spill_on_five_hour),
             state: CfgState::ReadOnly,
@@ -3781,7 +3789,7 @@ fn account_modal_lines(
     lines.push(modal_row("7d raw", raw_window(&account.seven_day)));
 
     // --- model-scoped limits ----------------------------------------------
-    let fable_ceiling = select::effective_limits(account, params).2;
+    let fable_ceiling = select::effective_limits(account, params, now).2;
     lines.push(modal_section("scoped"));
     if account.scoped_limits.is_empty() {
         lines.push(modal_row("scope", format!("{dash} (none recorded)")));
@@ -3843,7 +3851,7 @@ fn account_modal_lines(
     }
 
     // --- ceilings ----------------------------------------------------------
-    let (five_max, seven_max, fable_max) = select::effective_limits(account, params);
+    let (five_max, seven_max, fable_max) = select::effective_limits(account, params, now);
     let override_of = |value: Option<f64>, global: f64| match value {
         Some(v) => format!("{} (override)", format::percent(v)),
         None => format!("{dash} (global {})", format::percent(global)),
@@ -5256,7 +5264,7 @@ fn account_row<'a>(
             consecutive_failures,
             ctx.quota_display,
             ctx.reset_absolute,
-            select::effective_limits(account, params).2,
+            select::effective_limits(account, params, now).2,
             bar_width,
         ));
     }
@@ -8950,6 +8958,8 @@ mod tests {
                 fable_weekly_max: 0.98,
                 mode: crate::config::SchedulerMode::Default,
                 spill_on_five_hour: true,
+                overlap_promote: false,
+                seven_day_max_end: 0.99,
                 usage_max_age: Duration::from_secs(600),
             },
             refresh_ahead: Duration::from_secs(25_200),
@@ -9566,6 +9576,7 @@ mod tests {
         use crate::routing::BackendGroup;
         use crate::scheduler::{AccountId, AccountSnapshot};
         let account = |name: &str, kind: &'static str, group| AccountSnapshot {
+            overlap_start: None,
             id: AccountId(name.into()),
             healthy: true,
             auth_failure_status: None,
@@ -12575,6 +12586,7 @@ mod tests {
         let now = SystemTime::now();
         let mut view = view_with(Vec::new());
         view.snapshot.accounts = vec![AccountSnapshot {
+            overlap_start: None,
             id: AccountId(name.clone()),
             healthy: true,
             auth_failure_status: None,
@@ -12620,6 +12632,7 @@ mod tests {
                 seven_day_max: Some(0.95),
                 fable_weekly_max: None,
                 priority: None,
+                seven_day_max_end: None,
             },
         }];
         view.snapshot
@@ -12756,6 +12769,7 @@ mod tests {
         let mut view = view_with(Vec::new());
         let acct =
             |name: &str, kind: &'static str, group, five: Option<QuotaWindow>| AccountSnapshot {
+                overlap_start: None,
                 id: AccountId(name.into()),
                 healthy: true,
                 auth_failure_status: None,
@@ -12863,6 +12877,7 @@ mod tests {
         let now = SystemTime::now();
         let mut view = view_with(Vec::new());
         let acct = |name: &str, kind: &'static str, group, park: Option<u64>| AccountSnapshot {
+            overlap_start: None,
             id: AccountId(name.into()),
             healthy: true,
             auth_failure_status: None,
@@ -13249,6 +13264,7 @@ mod tests {
         use crate::routing::BackendGroup;
         use crate::scheduler::{AccountId, AccountSnapshot};
         let acct = |name: &str, paused: bool| AccountSnapshot {
+            overlap_start: None,
             id: AccountId(name.into()),
             healthy: true,
             auth_failure_status: None,
@@ -13302,6 +13318,7 @@ mod tests {
         use crate::routing::BackendGroup;
         use crate::scheduler::{AccountId, AccountSnapshot};
         let acct = |name: &str, kind: &'static str, group: BackendGroup| AccountSnapshot {
+            overlap_start: None,
             id: AccountId(name.into()),
             auth_failure_status: None,
             healthy: true,
@@ -13461,6 +13478,7 @@ mod tests {
                 seven_day_max: Some(0.5),
                 fable_weekly_max: Some(0.5),
                 priority: Some(2),
+                seven_day_max_end: Some(0.99),
             },
         );
         config.events.push(crate::config::EventBanner {
@@ -13565,6 +13583,8 @@ mod tests {
                 fable_weekly_max: _,
                 mode: _,
                 spill_on_five_hour: _,
+                overlap_promote: _,
+                seven_day_max_end: _,
             } = scheduler;
             let crate::config::RoutingConfig {
                 enabled: _,
@@ -13637,6 +13657,8 @@ mod tests {
             "scheduler.usage_poll_secs",
             "scheduler.refresh_ahead_secs",
             "scheduler.spill_on_five_hour",
+            "scheduler.overlap_promote",
+            "scheduler.seven_day_max_end",
             "claude_code.gpt_model_mapping.opus",
             "claude_code.gpt_model_mapping.sonnet",
             "claude_code.gpt_model_mapping.haiku",
@@ -13834,6 +13856,7 @@ mod tests {
         use crate::scheduler::{AccountId, AccountSnapshot};
         let now = SystemTime::now();
         AccountSnapshot {
+            overlap_start: None,
             id: AccountId("claude:me@example.com".into()),
             healthy: true,
             auth_failure_status: None,
@@ -14085,6 +14108,7 @@ mod tests {
         };
         let account =
             |name: &str, kind: &'static str, group, five: Option<QuotaWindow>| AccountSnapshot {
+                overlap_start: None,
                 id: AccountId(name.into()),
                 healthy: true,
                 auth_failure_status: None,
@@ -14530,6 +14554,7 @@ mod tests {
         let now = SystemTime::now();
         let mut view = view_with(Vec::new());
         view.snapshot.accounts = vec![AccountSnapshot {
+            overlap_start: None,
             id: AccountId("claude:cold@example.com".into()),
             healthy: true,
             auth_failure_status: None,
@@ -14592,6 +14617,7 @@ mod tests {
         let now = SystemTime::now();
         let mut view = view_with(Vec::new());
         view.snapshot.accounts = vec![AccountSnapshot {
+            overlap_start: None,
             id: AccountId("claude:icedac@example.com".into()),
             healthy: true,
             auth_failure_status: None,
@@ -14665,6 +14691,7 @@ mod tests {
         let now = SystemTime::now();
         let mut view = view_with(Vec::new());
         view.snapshot.accounts = vec![AccountSnapshot {
+            overlap_start: None,
             id: AccountId("claude:icedac@example.com".into()),
             healthy: true,
             auth_failure_status: None,
@@ -14762,6 +14789,7 @@ mod tests {
         }]);
         view.email_anonymous = true;
         view.snapshot.accounts = vec![AccountSnapshot {
+            overlap_start: None,
             id: AccountId(LEAK.into()),
             healthy: true,
             auth_failure_status: None,

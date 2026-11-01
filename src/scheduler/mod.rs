@@ -875,6 +875,12 @@ impl PoolState {
 
     /// Immutable snapshot for the pure selector and for `/llmux/status`.
     pub fn snapshot(&self) -> PoolSnapshot {
+        let mut snapshot = self.raw_snapshot();
+        select::annotate_overlap(&mut snapshot.accounts, SystemTime::now());
+        snapshot
+    }
+
+    fn raw_snapshot(&self) -> PoolSnapshot {
         PoolSnapshot {
             accounts: self
                 .accounts
@@ -904,6 +910,7 @@ impl PoolState {
                     last_refresh_ms: a.credential.last_refresh_ms(),
                     paused: a.paused,
                     limits: a.limits,
+                    overlap_start: None,
                 })
                 .collect(),
             current: self.current.clone(),
@@ -1020,6 +1027,12 @@ pub struct AccountSnapshot {
     /// Per-account ceiling overrides (config `account_limits`); `None` fields
     /// fall back to the global [`select::SelectParams`] ceilings.
     pub limits: crate::config::AccountLimits,
+    /// Start of this account's weekly OVERLAP: the newest 7d-window start among
+    /// same-group peers that rolled over after this account's own window began
+    /// (and within half a week of its reset), while this window is still open.
+    /// Derived per snapshot by [`select::annotate_overlap`]; `None` when no
+    /// peer is fresher or any `resets_at` is missing/expired.
+    pub overlap_start: Option<SystemTime>,
 }
 
 impl AccountSnapshot {
@@ -1723,6 +1736,8 @@ mod tests {
             fable_weekly_max: 0.98,
             mode: crate::config::SchedulerMode::Default,
             spill_on_five_hour: true,
+            overlap_promote: false,
+            seven_day_max_end: 0.99,
             usage_max_age: Duration::from_secs(600),
         }
     }

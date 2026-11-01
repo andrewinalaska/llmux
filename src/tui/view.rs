@@ -189,7 +189,7 @@ impl DashboardView {
         // Fbl gauge's freshness reads as populated (it never gates scheduling),
         // and its poll-degraded state still surfaces from the poller health.
         let received_at = SystemTime::now();
-        let accounts: Vec<AccountSnapshot> = doc
+        let mut accounts: Vec<AccountSnapshot> = doc
             .accounts
             .iter()
             .map(|a| AccountSnapshot {
@@ -236,8 +236,12 @@ impl DashboardView {
                 last_refresh_ms: a.last_refresh_ms,
                 paused: a.paused,
                 limits: a.limits.unwrap_or_default(),
+                overlap_start: None,
             })
             .collect();
+        // Attach mode rebuilds the snapshot from JSON, so re-derive the overlap
+        // the daemon's scheduler sees (display order / next-in-line parity).
+        crate::scheduler::select::annotate_overlap(&mut accounts, received_at);
         // Rebuild the per-group current map. A current daemon sends the full
         // per-group map (`current_by_group`), so each group's sticky slot
         // renders independently (req1). Fall back to the representative scalar

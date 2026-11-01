@@ -851,10 +851,13 @@ impl AppState {
             known = c.accounts.iter().any(|a| a.name == name);
             if known {
                 // The TUI / endpoint edit only the three ceilings; the drain
-                // tier is config-file-only, so carry it over instead of
-                // letting a ceiling edit silently erase it.
+                // tier and overlap ramp target are config-file-only, so carry them
+                // over instead of letting a ceiling edit silently erase them.
                 let mut next = limits;
-                next.priority = c.account_limits.get(name).and_then(|l| l.priority);
+                if let Some(old) = c.account_limits.get(name) {
+                    next.priority = old.priority;
+                    next.seven_day_max_end = old.seven_day_max_end;
+                }
                 if next.is_empty() {
                     c.account_limits.remove(name);
                 } else {
@@ -3449,7 +3452,8 @@ async fn account_limits_endpoint(
         five_hour_max: body.five_hour_max,
         seven_day_max: body.seven_day_max,
         fable_weekly_max: body.fable_weekly_max,
-        priority: None, // preserved from the stored entry by set_account_limits
+        // priority / seven_day_max_end are preserved from the stored entry by set_account_limits
+        ..Default::default()
     };
     match state.set_account_limits(&name, limits) {
         Ok(true) => (
@@ -4004,6 +4008,8 @@ mod tests {
             fable_weekly_max: 0.98,
             mode: crate::config::SchedulerMode::Default,
             spill_on_five_hour: true,
+            overlap_promote: false,
+            seven_day_max_end: 0.99,
             usage_max_age: Duration::from_secs(600),
         }
     }
@@ -4519,6 +4525,7 @@ mod tests {
                 "tech".into(),
                 crate::config::AccountLimits {
                     priority: Some(1),
+                    seven_day_max_end: Some(0.99),
                     ..Default::default()
                 },
             );
@@ -4533,6 +4540,7 @@ mod tests {
         let saved = crate::config::load_path(&path).expect("load");
         let kept = saved.account_limits.get("tech").expect("entry kept");
         assert_eq!(kept.priority, Some(1), "ceiling edit must not erase tier");
+        assert_eq!(kept.seven_day_max_end, Some(0.99));
         assert_eq!(kept.seven_day_max, Some(1.0));
         // Clearing every ceiling must keep the entry while a tier is set.
         state
