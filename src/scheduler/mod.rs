@@ -1243,6 +1243,13 @@ impl AccountPool {
             },
             None => true,
         };
+        // `priority-drain`: a better position is serving (tier return,
+        // promotion start/end) — refuse the sticky lease so the caller
+        // re-evaluates now instead of leaking up to one tick onto the
+        // outranked account. A manual pin outranks tiers, as in `pick`.
+        let unusable = unusable
+            || (!pinned_current
+                && select::current_outranked(&snapshot, params, group, scope, &current, now));
         if unusable {
             return Err(no_account(&state));
         }
@@ -2806,6 +2813,40 @@ mod tests {
         pool.record_429(&id("a"), Some(Duration::from_secs(3600)), SystemTime::now());
         let err = pool.lease_for(None, &params()).unwrap_err();
         assert!(err.retry_after.is_some());
+    }
+
+    #[test]
+    fn lease_for_refuses_an_outranked_tier_current_in_priority_drain_only() {
+        let mut drain = params();
+        drain.mode = crate::config::SchedulerMode::PriorityDrain;
+        let pool = AccountPool::new(&[oauth_account("andrew"), oauth_account("tech")]);
+        let tier = |p: u32| crate::config::AccountLimits {
+            priority: Some(p),
+            ..Default::default()
+        };
+        pool.apply_limits(
+            &[
+                ("andrew".to_string(), tier(2)),
+                ("tech".to_string(), tier(1)),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        // Sticky on the overflow account while tech@ is eligible again.
+        pool.write()
+            .commit_switch(None, None, &id("andrew"), &params(), now())
+            .expect("seed current");
+        assert!(pool.lease_for(None, &params()).is_ok(), "default: sticky");
+        assert!(
+            pool.lease_for(None, &drain).is_err(),
+            "priority-drain: the sticky lease must not outlive the tier change"
+        );
+        // The fall-through evaluation moves traffic back to tier 1 at once.
+        assert_eq!(
+            pool.evaluate(None, &drain, now()),
+            Decision::Switch { to: id("tech") }
+        );
+        assert_eq!(pool.lease_for(None, &drain).expect("lease").id, id("tech"));
     }
 
     #[test]

@@ -723,11 +723,7 @@ fn drain_key(account: &AccountSnapshot, params: &SelectParams, now: SystemTime) 
 /// promoted accounts — the earliest 7d reset, then the configured tier. Smaller
 /// serves first. The pick, the display order and the "why not serving" text all
 /// compare this, so they cannot disagree.
-fn drain_order(
-    account: &AccountSnapshot,
-    params: &SelectParams,
-    now: SystemTime,
-) -> (u64, Option<SystemTime>, u32) {
+fn drain_order(account: &AccountSnapshot, params: &SelectParams, now: SystemTime) -> DrainOrder {
     let key = drain_key(account, params, now);
     if key == 0 {
         (
@@ -740,8 +736,14 @@ fn drain_order(
     }
 }
 
+/// Serving position of a [`DrainPlan`] (see [`drain_order`]).
+type DrainOrder = (u64, Option<SystemTime>, u32);
+
 /// Outcome of the `priority-drain` tier walk.
 struct DrainPlan<'a> {
+    /// Position of the serving (or strictly holding) tier; `None` when every
+    /// tier is out.
+    order: Option<DrainOrder>,
     /// Gate-eligible accounts of the first tier that has any (empty when
     /// every tier is out, or when a strict 5h hold applies).
     candidates: Vec<&'a AccountSnapshot>,
@@ -808,11 +810,13 @@ fn drain_plan<'a>(
             .collect();
         // Equal resets: the configured tier breaks the tie.
         let tier = soonest_set.iter().map(|a| account_priority(a)).min();
+        let candidates: Vec<&AccountSnapshot> = soonest_set
+            .into_iter()
+            .filter(|a| Some(account_priority(a)) == tier)
+            .collect();
         return DrainPlan {
-            candidates: soonest_set
-                .into_iter()
-                .filter(|a| Some(account_priority(a)) == tier)
-                .collect(),
+            order: candidates.first().map(|a| drain_order(a, params, now)),
+            candidates,
             hold: None,
         };
     }
@@ -834,6 +838,7 @@ fn drain_plan<'a>(
             .collect();
         if !ok.is_empty() {
             return DrainPlan {
+                order: ok.first().map(|a| drain_order(a, params, now)),
                 candidates: ok,
                 hold: None,
             };
@@ -846,6 +851,7 @@ fn drain_plan<'a>(
                 .min();
             if reset.is_some() {
                 return DrainPlan {
+                    order: Some((u64::from(tier) + 1, None, tier)),
                     candidates: Vec::new(),
                     hold: reset,
                 };
@@ -853,9 +859,49 @@ fn drain_plan<'a>(
         }
     }
     DrainPlan {
+        order: None,
         candidates: Vec::new(),
         hold: None,
     }
+}
+
+/// True when `priority-drain` is serving (or strictly holding) a position that
+/// sorts ahead of `current`'s — a tier return, or a promotion starting/ending
+/// — so the sticky lease must not keep feeding the outranked account until the
+/// next evaluation tick. A current that sorts at or ahead of the serving
+/// position (gated only by a ceiling the lease deliberately ignores) is left
+/// to the tick, as before.
+pub fn current_outranked(
+    snapshot: &PoolSnapshot,
+    params: &SelectParams,
+    group: Option<BackendGroup>,
+    scope: RequestScope,
+    current: &AccountId,
+    now: SystemTime,
+) -> bool {
+    if params.mode != crate::config::SchedulerMode::PriorityDrain {
+        return false;
+    }
+    let Some(me) = snapshot.accounts.iter().find(|a| &a.id == current) else {
+        return false;
+    };
+    let headers_only = headers_only_mode(snapshot, params, group, now);
+    let heuristic_degraded = heuristic_degraded_mode(snapshot, params, group, now);
+    let gated: Vec<_> = snapshot
+        .accounts
+        .iter()
+        .filter(|a| in_group(a, group))
+        .map(|a| {
+            (
+                a,
+                gate_scoped(a, params, now, headers_only, heuristic_degraded, scope),
+            )
+        })
+        .collect();
+    let plan = drain_plan(&gated, params, now, &|a| {
+        gate_without_five_hour(a, params, now, headers_only, heuristic_degraded, scope)
+    });
+    plan.order.is_some_and(|o| o < drain_order(me, params, now))
 }
 
 /// Why a gate-eligible account is NOT being served under `priority-drain`
@@ -4402,5 +4448,40 @@ mod tests {
             eligibility(&tech, &params(), now(), false),
             Some(IneligibleReason::CoolingDown)
         );
+    }
+
+    #[test]
+    fn sticky_current_is_outranked_only_by_a_better_serving_position() {
+        let drain = drain_params(true);
+        let outranked = |accounts: Vec<AccountSnapshot>, params: &SelectParams, cur: &str| {
+            let snap = pool(accounts, Some(cur));
+            current_outranked(&snap, params, None, RequestScope::NonFable, &id(cur), now())
+        };
+        // Tier return: tech@ (tier 1) is serving, so andrew@ (current) is outranked.
+        assert!(outranked(after(), &drain, "andrew"));
+        assert!(!outranked(after(), &drain, "tech"));
+        // Promotion start: andrew@ outranks the sticky tech@; end flips it back.
+        assert!(outranked(during(), &ov_params(true), "tech"));
+        assert!(!outranked(during(), &ov_params(true), "andrew"));
+        assert!(outranked(after(), &ov_params(true), "andrew"));
+        // Other modes never use positions.
+        assert!(!outranked(after(), &params(), "andrew"));
+        // A current gated only by a ceiling the lease ignores is NOT outranked
+        // by the tier below it (the evaluation tick handles that).
+        let mut accounts = after();
+        accounts[1].seven_day = Some(window(0.9995, 150 * HOUR));
+        assert!(!outranked(accounts, &drain, "tech"));
+        // Strict 5h hold on tech@: the overflow current is outranked.
+        let mut accounts = after();
+        accounts[1].five_hour = Some(window(0.95, 12 * HOUR));
+        assert!(outranked(accounts.clone(), &drain_params(false), "andrew"));
+        assert!(!outranked(accounts, &drain_params(true), "andrew"));
+        // Several promoted accounts: the sticky later-reset one is outranked.
+        let mut accounts = stagger(167, 5);
+        let mut a1 = tiered("a1", Some(2), 0.10, 0.50, 2);
+        a1.limits.seven_day_max = Some(0.95);
+        accounts.push(a1);
+        assert!(outranked(accounts.clone(), &ov_params(true), "andrew"));
+        assert!(!outranked(accounts, &ov_params(true), "a1"));
     }
 }
