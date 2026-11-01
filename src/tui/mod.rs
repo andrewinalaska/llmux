@@ -3239,14 +3239,15 @@ impl App {
         }
     }
 
-    /// Flip the scheduler between default and round-robin (persisted server
+    /// Cycle the scheduler default → round-robin → priority-drain (persisted server
     /// side; see README "Schedulers").
     fn toggle_scheduler_mode(&mut self, view: Option<&DashboardView>) {
         use crate::config::SchedulerMode;
         let current = view.map_or(SchedulerMode::Default, |v| v.select_params.mode);
         let next = match current {
             SchedulerMode::Default => SchedulerMode::RoundRobin,
-            SchedulerMode::RoundRobin => SchedulerMode::Default,
+            SchedulerMode::RoundRobin => SchedulerMode::PriorityDrain,
+            SchedulerMode::PriorityDrain => SchedulerMode::Default,
         };
         match &mut self.backend {
             Backend::Local(state) => match state.set_scheduler_mode(next) {
@@ -5893,6 +5894,7 @@ fn parse_limits_input(raw: &str) -> Result<crate::config::AccountLimits, String>
         five_hour_max: vals[0],
         seven_day_max: vals[1],
         fable_weekly_max: vals[2],
+        priority: None, // preserved from the stored entry by set_account_limits
     })
 }
 
@@ -8596,6 +8598,7 @@ mod tests {
                 seven_day_max: 0.99,
                 fable_weekly_max: 0.98,
                 mode: crate::config::SchedulerMode::Default,
+                spill_on_five_hour: true,
                 usage_max_age: Duration::from_secs(600),
             },
             refresh_ahead: Duration::from_secs(25_200),

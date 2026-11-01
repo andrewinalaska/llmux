@@ -19,7 +19,7 @@ Pick the thing you want to do.
 - [Release availability](operational-reference.md#release-availability) — which features are on stable 0.2.25 vs the rolling preview channel, and what changed per release.
 - [Configuration](configuration.md) — config path, proxy/scheduler/routing keys, frontend/SDK runtime, Codex/Grok shaping, account types, email-anonymous mode.
 - [Models](models.md) — catalog, aliases, `max_context`, group routing.
-- [Schedulers](schedulers.md) — eligibility gates, `default` vs `round-robin`, adding a scheduler mode.
+- [Schedulers](schedulers.md) — eligibility gates, `default`, `round-robin`, `priority-drain`, adding a scheduler mode.
 - [Fable scheduling](fable-scheduling.md) — how the Fable lane picks a subscription: gauges (poll + 7d_oi headers), gates, perishability ranking, manual pin, pause.
 - [Provider compatibility](provider-compatibility.md) — what each backend group actually honors: forwarded vs dropped vs refused request fields, the Codex/Grok `max_tokens` receipts, diagnostic headers, known unknowns.
 - [Codex frontend](codex-frontend/README.md) — `llmux run --codex`, Responses API, model picker, Agent SDK prerequisites and limits. [Activity origin](codex-frontend/activity.md) covers endpoint coloring.

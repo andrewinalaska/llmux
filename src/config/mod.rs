@@ -9,11 +9,11 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 pub use schema::{
-    default_domain_abbrev, default_fable_weekly_max, AccountConfig, AccountCredential,
-    AccountLimits, ClientKey, ClientKeyKind, CodexConfig, Config, EventBanner, GrokConfig,
-    IdleProbeConfig, OpenRouterConfig, ProxyConfig, QuotaDisplay, RawIoConfig, RemoteConfig,
-    RoutingConfig, SchedulerConfig, SchedulerMode, TuiGradient, Upsert, DEFAULT_CODEX_TOKEN_URL,
-    DEFAULT_MAX_REQUEST_BYTES, DEFAULT_PORT, DEFAULT_UPSTREAM,
+    default_domain_abbrev, default_fable_weekly_max, default_true, AccountConfig,
+    AccountCredential, AccountLimits, ClientKey, ClientKeyKind, CodexConfig, Config, EventBanner,
+    GrokConfig, IdleProbeConfig, OpenRouterConfig, ProxyConfig, QuotaDisplay, RawIoConfig,
+    RemoteConfig, RoutingConfig, SchedulerConfig, SchedulerMode, TuiGradient, Upsert,
+    DEFAULT_CODEX_TOKEN_URL, DEFAULT_MAX_REQUEST_BYTES, DEFAULT_PORT, DEFAULT_UPSTREAM,
 };
 
 /// Environment variable overriding the config file location.
@@ -662,6 +662,36 @@ mod tests {
         assert_eq!(config.scheduler.usage_max_age_secs, 600);
         assert_eq!(config.scheduler.refresh_ahead_secs, 7 * 3600);
         assert!(config.accounts.is_empty());
+    }
+
+    #[test]
+    fn priority_drain_keys_parse_and_default_to_unchanged_behavior() {
+        let dir = TempDir::new();
+        let path = dir.path().join("llmux.json");
+        fs::write(&path, r#"{ "proxy": { "port": 9999 } }"#).expect("write");
+        let config = load_path(&path).expect("load");
+        assert_eq!(config.scheduler.mode, SchedulerMode::Default);
+        assert!(config.scheduler.spill_on_five_hour);
+        assert!(config.account_limits.is_empty());
+
+        fs::write(
+            &path,
+            r#"{ "scheduler": { "mode": "priority-drain", "spill_on_five_hour": false },
+                 "account_limits": { "tech": { "priority": 1, "seven_day_max": 1.0 } } }"#,
+        )
+        .expect("write");
+        let config = load_path(&path).expect("load");
+        assert_eq!(config.scheduler.mode, SchedulerMode::PriorityDrain);
+        assert!(!config.scheduler.spill_on_five_hour);
+        assert_eq!(config.account_limits["tech"].priority, Some(1));
+        assert_eq!(config.account_limits["tech"].seven_day_max, Some(1.0));
+        for mode in [
+            SchedulerMode::Default,
+            SchedulerMode::RoundRobin,
+            SchedulerMode::PriorityDrain,
+        ] {
+            assert_eq!(SchedulerMode::from_u8(mode.as_u8()), mode);
+        }
     }
 
     #[test]

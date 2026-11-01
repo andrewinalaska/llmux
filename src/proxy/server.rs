@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -201,7 +201,7 @@ impl UsageTotals {
 }
 
 /// Live (no-restart) values of the runtime-tunable settings, following the
-/// `email_anonymous`/`round_robin` holder convention: seeded from config at
+/// `email_anonymous`/`scheduler_mode` holder convention: seeded from config at
 /// boot, flipped by `POST /llmux/settings` (persist-then-apply), read by
 /// their consumers each use — `AppState.config` is a per-clone snapshot, so
 /// shared mutable state must ride an `Arc`. Ceilings are stored as f64 bits
@@ -345,12 +345,12 @@ pub struct AppState {
     /// Live runtime-tunable settings (see [`SettingsLive`]).
     pub settings_live: Arc<SettingsLive>,
     /// Live scheduler mode (config `scheduler.mode`), same atomic convention
-    /// as `email_anonymous`: `false` = default, `true` = round-robin. A TUI
+    /// as `email_anonymous`, encoded by `SchedulerMode::as_u8`. A TUI
     /// `S` / `POST /llmux/scheduler-mode` flip reflects in the very next
     /// `select_params()` without restart.
-    pub round_robin: Arc<AtomicBool>,
+    pub scheduler_mode: Arc<AtomicU8>,
     /// LIVE value of the top-of-dashboard event banners (config `events`), same
-    /// live-holder convention as `email_anonymous`/`round_robin`: seeded from
+    /// live-holder convention as `email_anonymous`/`scheduler_mode`: seeded from
     /// `config.events` at boot, updated by `POST /llmux/events` (via
     /// [`Self::upsert_event`] / [`Self::remove_event`]) after the persist, and
     /// read into the dashboard document each frame/poll — so a running daemon
@@ -485,9 +485,7 @@ impl AppState {
             bound_port: Arc::new(AtomicU16::new(config.proxy.port)),
             email_anonymous: Arc::new(AtomicBool::new(config.email_anonymous)),
             settings_live: Arc::new(SettingsLive::from_config(&config)),
-            round_robin: Arc::new(AtomicBool::new(
-                config.scheduler.mode == crate::config::SchedulerMode::RoundRobin,
-            )),
+            scheduler_mode: Arc::new(AtomicU8::new(config.scheduler.mode.as_u8())),
             event_banners: Arc::new(RwLock::new(config.events.clone())),
             keys: Arc::new(crate::proxy::keys::KeyRegistry::from_config(&config)),
             key_mutation: Arc::new(Mutex::new(())),
@@ -512,11 +510,8 @@ impl AppState {
     pub fn select_params(&self) -> SelectParams {
         let mut params = SelectParams::from(&self.config.scheduler);
         // The live atomics win over the boot-time config snapshot.
-        params.mode = if self.round_robin.load(Ordering::Relaxed) {
-            crate::config::SchedulerMode::RoundRobin
-        } else {
-            crate::config::SchedulerMode::Default
-        };
+        params.mode =
+            crate::config::SchedulerMode::from_u8(self.scheduler_mode.load(Ordering::Relaxed));
         let live = &self.settings_live;
         params.five_hour_max = f64::from_bits(live.five_hour_max.load(Ordering::Relaxed));
         params.seven_day_max = f64::from_bits(live.seven_day_max.load(Ordering::Relaxed));
@@ -538,10 +533,7 @@ impl AppState {
             return Err(crate::config::ConfigError::PersistenceUnavailable);
         };
         crate::config::update_path(path, |c| c.scheduler.mode = mode)?;
-        self.round_robin.store(
-            mode == crate::config::SchedulerMode::RoundRobin,
-            Ordering::Relaxed,
-        );
+        self.scheduler_mode.store(mode.as_u8(), Ordering::Relaxed);
         tracing::info!(mode = mode.label(), "scheduler mode updated");
         Ok(mode)
     }
@@ -858,10 +850,15 @@ impl AppState {
         let merged = crate::config::update_path(path, |c| {
             known = c.accounts.iter().any(|a| a.name == name);
             if known {
-                if limits.is_empty() {
+                // The TUI / endpoint edit only the three ceilings; the drain
+                // tier is config-file-only, so carry it over instead of
+                // letting a ceiling edit silently erase it.
+                let mut next = limits;
+                next.priority = c.account_limits.get(name).and_then(|l| l.priority);
+                if next.is_empty() {
                     c.account_limits.remove(name);
                 } else {
-                    c.account_limits.insert(name.to_string(), limits);
+                    c.account_limits.insert(name.to_string(), next);
                 }
             }
         })?;
@@ -2157,11 +2154,13 @@ pub fn status_json(
                     "ok"
                 };
                 let blocked =
-                    crate::scheduler::select::eligibility(account, params, now, headers_only).map(
-                        |reason| {
+                    crate::scheduler::select::eligibility(account, params, now, headers_only)
+                        .map(|reason| {
                             crate::scheduler::select::blocking_reason(account, reason, params, now)
-                        },
-                    );
+                        })
+                        .or_else(|| {
+                            crate::scheduler::select::tier_withheld(snapshot, params, account, now)
+                        });
                 let lifetime = totals.get(&account.id);
                 serde_json::json!({
                     "name": account.id.0,
@@ -3450,6 +3449,7 @@ async fn account_limits_endpoint(
         five_hour_max: body.five_hour_max,
         seven_day_max: body.seven_day_max,
         fable_weekly_max: body.fable_weekly_max,
+        priority: None, // preserved from the stored entry by set_account_limits
     };
     match state.set_account_limits(&name, limits) {
         Ok(true) => (
@@ -4003,6 +4003,7 @@ mod tests {
             seven_day_max: 0.99,
             fable_weekly_max: 0.98,
             mode: crate::config::SchedulerMode::Default,
+            spill_on_five_hour: true,
             usage_max_age: Duration::from_secs(600),
         }
     }
@@ -4505,6 +4506,49 @@ mod tests {
             .await
             .expect("body");
         serde_json::from_slice(&bytes).expect("json")
+    }
+
+    #[test]
+    fn ceiling_edit_keeps_the_drain_priority_and_live_mode_round_trips() {
+        let dir = TempDir::new();
+        let path = dir.path().join("llmux.json");
+        let state = endpoint_state(&path, vec![oauth_account("tech")]);
+        crate::config::update_path(&path, |c| {
+            c.scheduler.mode = crate::config::SchedulerMode::PriorityDrain;
+            c.account_limits.insert(
+                "tech".into(),
+                crate::config::AccountLimits {
+                    priority: Some(1),
+                    ..Default::default()
+                },
+            );
+        })
+        .expect("seed priority");
+        // A TUI / endpoint ceiling edit carries `priority: None`.
+        let edit = crate::config::AccountLimits {
+            seven_day_max: Some(1.0),
+            ..Default::default()
+        };
+        assert!(state.set_account_limits("tech", edit).expect("set"));
+        let saved = crate::config::load_path(&path).expect("load");
+        let kept = saved.account_limits.get("tech").expect("entry kept");
+        assert_eq!(kept.priority, Some(1), "ceiling edit must not erase tier");
+        assert_eq!(kept.seven_day_max, Some(1.0));
+        // Clearing every ceiling must keep the entry while a tier is set.
+        state
+            .set_account_limits("tech", Default::default())
+            .expect("clear");
+        let saved = crate::config::load_path(&path).expect("load");
+        assert_eq!(saved.account_limits["tech"].priority, Some(1));
+        // The live mode atomic carries all three modes (a bool would drop it).
+        state
+            .set_scheduler_mode(crate::config::SchedulerMode::PriorityDrain)
+            .expect("mode");
+        assert_eq!(
+            state.select_params().mode,
+            crate::config::SchedulerMode::PriorityDrain
+        );
+        assert!(state.select_params().spill_on_five_hour, "default spills");
     }
 
     // ---- C10: POST /llmux/grok ----

@@ -932,6 +932,9 @@ pub struct SelectParamsDoc {
     /// the daemon's actual scheduler.
     #[serde(default)]
     pub mode: crate::config::SchedulerMode,
+    /// `priority-drain` 5h spill switch (additive; older daemons → true).
+    #[serde(default = "crate::config::default_true")]
+    pub spill_on_five_hour: bool,
     pub usage_max_age_secs: u64,
 }
 
@@ -942,6 +945,7 @@ impl From<&SelectParams> for SelectParamsDoc {
             seven_day_max: params.seven_day_max,
             fable_weekly_max: params.fable_weekly_max,
             mode: params.mode,
+            spill_on_five_hour: params.spill_on_five_hour,
             usage_max_age_secs: params.usage_max_age.as_secs(),
         }
     }
@@ -954,6 +958,7 @@ impl From<&SelectParamsDoc> for SelectParams {
             seven_day_max: doc.seven_day_max,
             fable_weekly_max: doc.fable_weekly_max,
             mode: doc.mode,
+            spill_on_five_hour: doc.spill_on_five_hour,
             usage_max_age: Duration::from_secs(doc.usage_max_age_secs),
         }
     }
@@ -1615,7 +1620,8 @@ pub(crate) fn account_status_blocked(
         "ok"
     };
     let blocked = select::eligibility(account, params, now, headers_only)
-        .map(|reason| select::blocking_reason(account, reason, params, now));
+        .map(|reason| select::blocking_reason(account, reason, params, now))
+        .or_else(|| select::tier_withheld(snapshot, params, account, now));
     (status, blocked)
 }
 
@@ -2505,6 +2511,7 @@ mod tests {
             seven_day_max: 0.99,
             fable_weekly_max: 0.98,
             mode: crate::config::SchedulerMode::Default,
+            spill_on_five_hour: true,
             usage_max_age: Duration::from_secs(600),
         }
     }
