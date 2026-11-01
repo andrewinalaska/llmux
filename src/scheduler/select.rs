@@ -426,7 +426,9 @@ pub fn pick_scoped(
     // `priority-drain`: only the lowest tier with capacity (or a strict 5h
     // hold) is a candidate; every other mode keeps all gate-eligible accounts.
     let (eligible, drain_hold) = if params.mode == crate::config::SchedulerMode::PriorityDrain {
-        let plan = drain_plan(&gated, params, now);
+        let plan = drain_plan(&gated, params, now, &|a| {
+            gate_without_five_hour(a, params, now, headers_only, heuristic_degraded, scope)
+        });
         (plan.candidates, plan.hold)
     } else {
         let all = gated.iter().filter(|(_, r)| r.is_none()).map(|(a, _)| *a);
@@ -610,18 +612,28 @@ struct DrainPlan<'a> {
     hold: Option<Duration>,
 }
 
-/// A tier member that is out only for the 5h window: weekly capacity left.
-fn five_hour_only(
+/// The scope-aware gate with the 5h ceiling lifted: `None` means the 5h
+/// window is this account's ONLY blocker. `gate_scoped` reports the first
+/// failure, so a 5h-over account may also be stale, over its weekly ceiling or
+/// Fable-exhausted — those must not read as a mere 5h hold.
+fn gate_without_five_hour(
     account: &AccountSnapshot,
-    reason: Option<IneligibleReason>,
     params: &SelectParams,
     now: SystemTime,
-) -> bool {
-    let seven = account
-        .seven_day
-        .map_or(0.0, |w| w.effective_utilization(now));
-    reason == Some(IneligibleReason::FiveHourOverThreshold)
-        && seven <= effective_limits(account, params).1
+    headers_only: bool,
+    heuristic_degraded: bool,
+    scope: RequestScope,
+) -> Option<IneligibleReason> {
+    let mut lifted = account.clone();
+    lifted.limits.five_hour_max = Some(f64::INFINITY);
+    gate_scoped(
+        &lifted,
+        params,
+        now,
+        headers_only,
+        heuristic_degraded,
+        scope,
+    )
 }
 
 /// Walk tiers lowest-first: the first tier with a gate-eligible account is the
@@ -633,7 +645,11 @@ fn drain_plan<'a>(
     gated: &[(&'a AccountSnapshot, Option<IneligibleReason>)],
     params: &SelectParams,
     now: SystemTime,
+    without_five_hour: &dyn Fn(&AccountSnapshot) -> Option<IneligibleReason>,
 ) -> DrainPlan<'a> {
+    let five_hour_only = |a: &AccountSnapshot, r: Option<IneligibleReason>| {
+        r == Some(IneligibleReason::FiveHourOverThreshold) && without_five_hour(a).is_none()
+    };
     let mut tiers: Vec<u32> = gated.iter().map(|(a, _)| account_priority(a)).collect();
     tiers.sort_unstable();
     tiers.dedup();
@@ -655,7 +671,7 @@ fn drain_plan<'a>(
         }
         if !params.spill_on_five_hour {
             let reset = members()
-                .filter(|(a, r)| five_hour_only(a, *r, params, now))
+                .filter(|(a, r)| five_hour_only(a, *r))
                 .filter_map(|(a, _)| a.five_hour)
                 .filter_map(|w| w.resets_at.duration_since(now).ok())
                 .min();
@@ -703,7 +719,10 @@ pub fn tier_withheld(
     if !gated.iter().any(|(a, r)| a.id == account.id && r.is_none()) {
         return None;
     }
-    let plan = drain_plan(&gated, params, now);
+    let without_five_hour = |a: &AccountSnapshot| {
+        gate_without_five_hour(a, params, now, headers_only, heuristic_degraded, scope)
+    };
+    let plan = drain_plan(&gated, params, now, &without_five_hour);
     if plan.candidates.iter().any(|a| a.id == account.id) {
         return None;
     }
@@ -718,7 +737,11 @@ pub fn tier_withheld(
         .or_else(|| {
             gated
                 .iter()
-                .find(|(a, r)| lower(a) && five_hour_only(a, *r, params, now))
+                .find(|(a, r)| {
+                    lower(a)
+                        && *r == Some(IneligibleReason::FiveHourOverThreshold)
+                        && without_five_hour(a).is_none()
+                })
                 .map(|(a, _)| (a.id.0.clone(), "5h-held"))
         });
     by.map(|(name, why)| format!("tier {mine}: lower tier {name} {why}"))
@@ -3526,6 +3549,25 @@ mod tests {
         );
         // 5h AND weekly over is "out for the week", not a 5h-only gate.
         let snap = pool(tech_andrew(0.95, 0.97), Some("tech"));
+        assert_eq!(
+            pick(&snap, &drain_params(false), None, now()),
+            Decision::Switch { to: id("andrew") }
+        );
+    }
+
+    #[test]
+    fn drain_five_hour_gate_hides_other_blockers_so_it_is_not_a_hold() {
+        // tech@ is over its 5h ceiling AND its usage is stale (the gate only
+        // reports the 5h reason): stale is not capacity, so strict drain must
+        // still spill instead of 429-ing for hours.
+        let mut accounts = tech_andrew(0.95, 0.30);
+        accounts[1].five_hour = Some(window_fetched(0.95, 12 * HOUR, NOW_SECS - 5_000));
+        accounts[1].seven_day = Some(window_fetched(0.30, 150 * HOUR, NOW_SECS - 5_000));
+        let snap = pool(accounts, Some("tech"));
+        assert_eq!(
+            eligibility(&snap.accounts[1], &drain_params(false), now(), false),
+            Some(IneligibleReason::FiveHourOverThreshold)
+        );
         assert_eq!(
             pick(&snap, &drain_params(false), None, now()),
             Decision::Switch { to: id("andrew") }
