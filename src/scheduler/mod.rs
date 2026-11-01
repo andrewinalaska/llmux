@@ -1722,6 +1722,7 @@ mod tests {
             seven_day_max: 0.99,
             fable_weekly_max: 0.98,
             mode: crate::config::SchedulerMode::Default,
+            spill_on_five_hour: true,
             usage_max_age: Duration::from_secs(600),
         }
     }

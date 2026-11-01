@@ -332,6 +332,10 @@ pub struct AccountLimits {
     /// Override of `scheduler.fable_weekly_max` (0..=1).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fable_weekly_max: Option<f64>,
+    /// Drain tier for `scheduler.mode = "priority-drain"` (lower drains
+    /// first; unset = last tier). Ignored by every other mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<u32>,
 }
 
 impl AccountLimits {
@@ -340,6 +344,7 @@ impl AccountLimits {
         self.five_hour_max.is_none()
             && self.seven_day_max.is_none()
             && self.fable_weekly_max.is_none()
+            && self.priority.is_none()
     }
 }
 
@@ -882,6 +887,14 @@ pub struct SchedulerConfig {
     /// older configs load `default`.
     #[serde(default)]
     pub mode: SchedulerMode,
+    /// `priority-drain` only: when a lower tier is blocked ONLY by its 5h
+    /// ceiling (weekly capacity left), let the next tier serve meanwhile
+    /// (`true`, default — never 429 while any tier is eligible), or refuse
+    /// with a 429 until the 5h window clears (`false` — the higher tier is
+    /// touched only once the lower tier is out for the week, paused,
+    /// unhealthy, stale or cooling down). Additive.
+    #[serde(default = "default_true")]
+    pub spill_on_five_hour: bool,
 }
 
 /// Selection algorithm (config `scheduler.mode`).
@@ -896,14 +909,37 @@ pub enum SchedulerMode {
     /// ineligible, then move to the NEXT account in roster order (wrapping).
     /// Minimizes account switches (prompt-cache friendly).
     RoundRobin,
+    /// Tiered drain: accounts carry `account_limits.<name>.priority` (lower
+    /// drains first, unset = last); a higher tier serves only once every
+    /// lower tier is ineligible. Perishability scoring applies within a tier.
+    PriorityDrain,
 }
 
 impl SchedulerMode {
+    /// Compact encoding for the live-mode atomic (inverse of [`Self::from_u8`]).
+    pub fn as_u8(self) -> u8 {
+        match self {
+            SchedulerMode::Default => 0,
+            SchedulerMode::RoundRobin => 1,
+            SchedulerMode::PriorityDrain => 2,
+        }
+    }
+
+    /// Decode [`Self::as_u8`]; unknown values fall back to `Default`.
+    pub fn from_u8(raw: u8) -> Self {
+        match raw {
+            1 => SchedulerMode::RoundRobin,
+            2 => SchedulerMode::PriorityDrain,
+            _ => SchedulerMode::Default,
+        }
+    }
+
     /// Stable wire/display label (matches the serde encoding).
     pub fn label(self) -> &'static str {
         match self {
             SchedulerMode::Default => "default",
             SchedulerMode::RoundRobin => "round-robin",
+            SchedulerMode::PriorityDrain => "priority-drain",
         }
     }
 }
@@ -918,6 +954,7 @@ impl Default for SchedulerConfig {
             refresh_ahead_secs: default_refresh_ahead_secs(),
             fable_weekly_max: default_fable_weekly_max(),
             mode: SchedulerMode::default(),
+            spill_on_five_hour: true,
         }
     }
 }
@@ -1234,7 +1271,7 @@ fn default_version() -> u32 {
     1
 }
 
-fn default_true() -> bool {
+pub fn default_true() -> bool {
     true
 }
 

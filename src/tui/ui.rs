@@ -3066,6 +3066,14 @@ fn config_rows(view: &DashboardView, chrome: &Chrome) -> Vec<CfgRow> {
             action: None,
         },
         CfgRow {
+            section: "scheduler",
+            label: "priority-drain 5h spill",
+            value: format!("{}", view.select_params.spill_on_five_hour),
+            state: CfgState::ReadOnly,
+            note: "scheduler.spill_on_five_hour · tiers: account_limits.<name>.priority",
+            action: None,
+        },
+        CfgRow {
             section: "daemon",
             label: "schema version",
             value: "derived".into(),
@@ -8941,6 +8949,7 @@ mod tests {
                 seven_day_max: 0.99,
                 fable_weekly_max: 0.98,
                 mode: crate::config::SchedulerMode::Default,
+                spill_on_five_hour: true,
                 usage_max_age: Duration::from_secs(600),
             },
             refresh_ahead: Duration::from_secs(25_200),
@@ -12610,6 +12619,7 @@ mod tests {
                 five_hour_max: None,
                 seven_day_max: Some(0.95),
                 fable_weekly_max: None,
+                priority: None,
             },
         }];
         view.snapshot
@@ -13450,6 +13460,7 @@ mod tests {
                 five_hour_max: Some(0.5),
                 seven_day_max: Some(0.5),
                 fable_weekly_max: Some(0.5),
+                priority: Some(2),
             },
         );
         config.events.push(crate::config::EventBanner {
@@ -13553,6 +13564,7 @@ mod tests {
                 refresh_ahead_secs: _,
                 fable_weekly_max: _,
                 mode: _,
+                spill_on_five_hour: _,
             } = scheduler;
             let crate::config::RoutingConfig {
                 enabled: _,
@@ -13624,6 +13636,7 @@ mod tests {
             "scheduler.usage_max_age_secs",
             "scheduler.usage_poll_secs",
             "scheduler.refresh_ahead_secs",
+            "scheduler.spill_on_five_hour",
             "claude_code.gpt_model_mapping.opus",
             "claude_code.gpt_model_mapping.sonnet",
             "claude_code.gpt_model_mapping.haiku",

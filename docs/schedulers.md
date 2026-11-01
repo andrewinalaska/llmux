@@ -10,11 +10,12 @@ this lifecycle; see [SDK error mapping](provider-compatibility.md#claude-agent-s
 - **Quota is finite and perishable.** Each account has a 5-hour and a 7-day window that reset on fixed timestamps; quota left unspent at a reset is gone.
 - **`default` spends perishable quota first.** It prefers an eligible account whose soon-to-reset quota would otherwise expire unused, but stays on the current account unless another scores clearly higher (>25%), so prompt caches survive. This is a scoring preference, not a promise to always use the soonest-expiring account.
 - **`round-robin` never switches proactively.** Fewest switches and best cache locality, at the cost of letting other accounts' quota expire.
+- **`priority-drain` empties accounts in a fixed order.** Give accounts a tier; the lowest tier with an eligible account serves everything, and higher tiers are overflow. Use it to keep a bigger account untouched by automation while a smaller one is drained first.
 - **You can pin or pause an account manually** (`p` in the TUI switcher; context menu in llmux-islands). Paused accounts are never selected.
 
 ## How selection works
 
-Which account serves the next request is decided by the scheduler. Two algorithms ship; switch live with `S` in the TUI (persisted to `scheduler.mode`), or `POST /llmux/scheduler-mode {"mode": "default" | "round-robin"}`.
+Which account serves the next request is decided by the scheduler. Three algorithms ship; cycle live with `S` in the TUI (persisted to `scheduler.mode`), or `POST /llmux/scheduler-mode {"mode": "default" | "round-robin" | "priority-drain"}`.
 
 **Why switching matters:** the upstream prompt cache is scoped per account — every account switch invalidates it, and the next request re-reads the full conversation context uncached (token cost + latency). Both schedulers are therefore sticky on the current account; they differ in *when* they move and *who* is next.
 
@@ -39,6 +40,32 @@ Ranks eligible accounts by `score = servable_now × urgency`: `servable_now` = m
 ## `round-robin` — sequential exhaust (fewest switches)
 
 Stays on the current account until it is **hard ineligible** (ceiling hit, cooldown, auth, pause) — never a proactive switch — then moves to the **next account in roster order**, wrapping. Deterministic, score-free, and the minimum possible number of switches, at the cost of letting other accounts' soon-to-reset quota expire unused. Pick this when prompt-cache locality (long agent sessions) matters more than squeezing every window.
+
+## `priority-drain` — tiered overflow
+
+`scheduler.mode = "priority-drain"` adds a drain order on top of `default`. Each account may carry `account_limits.<name>.priority` (integer, **lower drains first**; unset = after every configured tier). Existing configs are unchanged: the key is ignored by the other modes, and with no priorities set every account shares one tier, so decisions equal `default`.
+
+- **Within a tier** the `default` perishability score and 25% stickiness margin apply unchanged.
+- **Across tiers** a higher tier is a candidate only when every account of every lower tier is ineligible: weekly ceiling hit, paused, auth-unhealthy, stale usage, or in a 429 cooldown. Per-account `seven_day_max` still applies on top, so a ceiling on the overflow account is a hard floor.
+- **5h-only gating** (`scheduler.spill_on_five_hour`, default `true`): a lower-tier account that is blocked only by its 5h ceiling (weekly capacity left) lets the next tier serve until the window clears, so the pool never 429s while any tier is eligible. Set `false` for strict drain: the higher tier is then untouched until the lower tier is out for the week, and requests get a `429` whose `retry-after` is the held account's own 5h reset (up to ~5h; clients stall for that long).
+- **Return is immediate.** When a lower tier becomes eligible again, the next evaluation (every 60s) moves traffic back with no switch margin. Requests already leased on the overflow account finish there.
+- **All tiers out:** the usual `429` with the soonest `retry-after`.
+- **A manual pin** (`s` in the TUI) outranks tiers, like every other automatic policy.
+- **Visibility:** `limits.priority` is in `/llmux/status` and the dashboard document; an account that passes its gates but is not being served shows `blocked: "tier 2: lower tier tech serving"` (or `... 5h-held` under strict drain).
+
+Example: drain a Max 5x account before a Max 20x one, never letting automation take the 20x account past 95% weekly:
+
+```json
+{
+  "scheduler": { "mode": "priority-drain", "spill_on_five_hour": true },
+  "account_limits": {
+    "claude:tech@bethelchurchak.org": { "priority": 1, "seven_day_max": 1.0 },
+    "claude:andrew@alaskaautorental.com": { "priority": 2, "seven_day_max": 0.95 }
+  }
+}
+```
+
+Hand edits to the config file take effect on `llmux restart`; the `S` toggle and TUI/endpoint limit edits apply live. Editing ceilings from the TUI (`L`) keeps an existing `priority`; the tier itself is set in the config file.
 
 ## Adding a scheduler
 
