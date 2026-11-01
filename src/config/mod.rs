@@ -9,10 +9,10 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 pub use schema::{
-    default_domain_abbrev, default_fable_weekly_max, default_true, AccountConfig,
-    AccountCredential, AccountLimits, ClientKey, ClientKeyKind, CodexConfig, Config, EventBanner,
-    GrokConfig, IdleProbeConfig, OpenRouterConfig, ProxyConfig, QuotaDisplay, RawIoConfig,
-    RemoteConfig, RoutingConfig, SchedulerConfig, SchedulerMode, TuiGradient, Upsert,
+    default_domain_abbrev, default_fable_weekly_max, default_seven_day_max_end, default_true,
+    AccountConfig, AccountCredential, AccountLimits, ClientKey, ClientKeyKind, CodexConfig, Config,
+    EventBanner, GrokConfig, IdleProbeConfig, OpenRouterConfig, ProxyConfig, QuotaDisplay,
+    RawIoConfig, RemoteConfig, RoutingConfig, SchedulerConfig, SchedulerMode, TuiGradient, Upsert,
     DEFAULT_CODEX_TOKEN_URL, DEFAULT_MAX_REQUEST_BYTES, DEFAULT_PORT, DEFAULT_UPSTREAM,
 };
 
@@ -672,19 +672,26 @@ mod tests {
         let config = load_path(&path).expect("load");
         assert_eq!(config.scheduler.mode, SchedulerMode::Default);
         assert!(config.scheduler.spill_on_five_hour);
+        assert!(!config.scheduler.overlap_promote, "off by default");
+        assert!((config.scheduler.seven_day_max_end - 0.99).abs() < 1e-9);
         assert!(config.account_limits.is_empty());
 
         fs::write(
             &path,
-            r#"{ "scheduler": { "mode": "priority-drain", "spill_on_five_hour": false },
-                 "account_limits": { "tech": { "priority": 1, "seven_day_max": 1.0 } } }"#,
+            r#"{ "scheduler": { "mode": "priority-drain", "spill_on_five_hour": false,
+                             "overlap_promote": true, "seven_day_max_end": 0.97 },
+                 "account_limits": { "tech": { "priority": 1, "seven_day_max": 1.0,
+                                  "seven_day_max_end": 0.99 } } }"#,
         )
         .expect("write");
         let config = load_path(&path).expect("load");
         assert_eq!(config.scheduler.mode, SchedulerMode::PriorityDrain);
         assert!(!config.scheduler.spill_on_five_hour);
+        assert!(config.scheduler.overlap_promote);
+        assert!((config.scheduler.seven_day_max_end - 0.97).abs() < 1e-9);
         assert_eq!(config.account_limits["tech"].priority, Some(1));
         assert_eq!(config.account_limits["tech"].seven_day_max, Some(1.0));
+        assert_eq!(config.account_limits["tech"].seven_day_max_end, Some(0.99));
         for mode in [
             SchedulerMode::Default,
             SchedulerMode::RoundRobin,

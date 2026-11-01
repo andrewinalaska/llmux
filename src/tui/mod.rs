@@ -5894,7 +5894,8 @@ fn parse_limits_input(raw: &str) -> Result<crate::config::AccountLimits, String>
         five_hour_max: vals[0],
         seven_day_max: vals[1],
         fable_weekly_max: vals[2],
-        priority: None, // preserved from the stored entry by set_account_limits
+        // priority / seven_day_max_end are preserved from the stored entry by set_account_limits
+        ..Default::default()
     })
 }
 
@@ -6401,6 +6402,7 @@ mod tests {
         use crate::scheduler::{AccountId, AccountSnapshot};
         use crossterm::event::{MouseEvent, MouseEventKind};
         let acct = |name: &str| AccountSnapshot {
+            overlap_start: None,
             id: AccountId(name.into()),
             healthy: true,
             auth_failure_status: None,
@@ -6475,6 +6477,7 @@ mod tests {
         use crate::routing::BackendGroup;
         use crate::scheduler::{AccountId, AccountSnapshot};
         let acct = |name: &str| AccountSnapshot {
+            overlap_start: None,
             id: AccountId(name.into()),
             healthy: true,
             auth_failure_status: None,
@@ -8556,6 +8559,7 @@ mod tests {
         use crate::scheduler::{AccountId, AccountSnapshot};
         let mut v = stats_view();
         v.snapshot.accounts = vec![AccountSnapshot {
+            overlap_start: None,
             id: AccountId("claude:me@example.com".into()),
             healthy: true,
             auth_failure_status: None,
@@ -8599,6 +8603,8 @@ mod tests {
                 fable_weekly_max: 0.98,
                 mode: crate::config::SchedulerMode::Default,
                 spill_on_five_hour: true,
+                overlap_promote: false,
+                seven_day_max_end: 0.99,
                 usage_max_age: Duration::from_secs(600),
             },
             refresh_ahead: Duration::from_secs(25_200),
@@ -8643,6 +8649,7 @@ mod tests {
         use crate::routing::BackendGroup;
         use crate::scheduler::{AccountId, AccountSnapshot};
         let account = |name: &str, kind: &'static str, group| AccountSnapshot {
+            overlap_start: None,
             id: AccountId(name.into()),
             healthy: true,
             auth_failure_status: None,

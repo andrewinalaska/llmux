@@ -512,6 +512,7 @@ mod tests {
 
     fn account(id: &str) -> AccountSnapshot {
         AccountSnapshot {
+            overlap_start: None,
             id: AccountId(id.to_string()),
             healthy: true,
             auth_failure_status: None,
@@ -547,6 +548,8 @@ mod tests {
             fable_weekly_max: 0.98,
             mode: crate::config::SchedulerMode::Default,
             spill_on_five_hour: true,
+            overlap_promote: false,
+            seven_day_max_end: 0.99,
             usage_max_age: Duration::from_secs(600),
         }
     }

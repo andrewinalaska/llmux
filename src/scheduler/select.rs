@@ -25,6 +25,12 @@ pub struct SelectParams {
     /// `priority-drain`: spill to the next tier while a lower tier is gated
     /// only by its 5h ceiling (config `scheduler.spill_on_five_hour`).
     pub spill_on_five_hour: bool,
+    /// `priority-drain`: promote + ramp the ceiling of an account whose weekly
+    /// window overlaps a fresher peer's (config `scheduler.overlap_promote`).
+    pub overlap_promote: bool,
+    /// Default ceiling an overlapped account ramps to (config
+    /// `scheduler.seven_day_max_end`, default 0.99).
+    pub seven_day_max_end: f64,
     /// Usage data older than this makes an account ineligible — unless ALL
     /// accounts are stale, in which case selection falls back to
     /// headers-only mode (429-driven, the always-true path).
@@ -39,6 +45,8 @@ impl From<&SchedulerConfig> for SelectParams {
             fable_weekly_max: cfg.fable_weekly_max,
             mode: cfg.mode,
             spill_on_five_hour: cfg.spill_on_five_hour,
+            overlap_promote: cfg.overlap_promote,
+            seven_day_max_end: cfg.seven_day_max_end,
             usage_max_age: Duration::from_secs(cfg.usage_max_age_secs),
         }
     }
@@ -117,15 +125,113 @@ pub enum RequestScope {
 /// window is a cold account — utilization 0, immediately eligible.
 /// The 5h/7d/Fable ceilings that apply to THIS account: the per-account
 /// override (config `account_limits`) when set, else the global params.
-pub fn effective_limits(account: &AccountSnapshot, params: &SelectParams) -> (f64, f64, f64) {
+pub fn effective_limits(
+    account: &AccountSnapshot,
+    params: &SelectParams,
+    now: SystemTime,
+) -> (f64, f64, f64) {
+    let seven = account.limits.seven_day_max.unwrap_or(params.seven_day_max);
     (
         account.limits.five_hour_max.unwrap_or(params.five_hour_max),
-        account.limits.seven_day_max.unwrap_or(params.seven_day_max),
+        ramped_seven_day_max(account, params, seven, now),
         account
             .limits
             .fable_weekly_max
             .unwrap_or(params.fable_weekly_max),
     )
+}
+
+/// The 7d ceiling ramped toward `seven_day_max_end` across THIS account's
+/// overlap with a fresher peer (see [`annotate_overlap`]): linear from `base` at
+/// the overlap start (the newest peer rollover) to `end` at this account's own
+/// reset, so quota held back as headroom is spent while the peer's fresh week
+/// covers for it. Needs `scheduler.overlap_promote` in `priority-drain` mode,
+/// an `end` above `base` (capped at 1.0) and a live overlap; anything else
+/// returns `base` unchanged.
+fn ramped_seven_day_max(
+    account: &AccountSnapshot,
+    params: &SelectParams,
+    base: f64,
+    now: SystemTime,
+) -> f64 {
+    let end = account
+        .limits
+        .seven_day_max_end
+        .unwrap_or(params.seven_day_max_end)
+        .min(1.0);
+    if !overlap_active(params) || end <= base {
+        return base;
+    }
+    let (Some(start), Some(reset)) = (account.overlap_start, live_reset(&account.seven_day, now))
+    else {
+        return base;
+    };
+    let span = reset.duration_since(start).map_or(0.0, |d| d.as_secs_f64());
+    if span <= 0.0 {
+        return base;
+    }
+    let elapsed = now.duration_since(start).map_or(0.0, |d| d.as_secs_f64());
+    base + (end - base) * (elapsed / span).clamp(0.0, 1.0)
+}
+
+/// Overlap promotion and the ceiling ramp only exist in `priority-drain`.
+fn overlap_active(params: &SelectParams) -> bool {
+    params.overlap_promote && params.mode == crate::config::SchedulerMode::PriorityDrain
+}
+
+const WEEK: Duration = Duration::from_secs(7 * 24 * 3600);
+/// A peer must have rolled over by MORE than this to open an overlap, so the
+/// sub-second `resets_at` jitter between two accounts that really reset
+/// together never reads as a fresher week.
+const OVERLAP_EPSILON: Duration = Duration::from_secs(60);
+
+/// Derive each account's weekly overlap from the pool's own window data.
+///
+/// `window_start(X) = X.seven_day.resets_at - 7d`. Account A overlaps when a
+/// same-group peer B has `window_start(B) > window_start(A)` (B already rolled
+/// into a fresher week, B's start not in the future) while A's window is still
+/// open. `overlap_start` is the NEWEST such B start. The freshest-rolled
+/// account has no newer peer and is never overlapped; every other account is,
+/// from the newest peer rollover until its own reset — so with the switch on
+/// the pool drains soonest-reset-first. Missing or expired `resets_at` on A or
+/// on a peer contributes no overlap — selection falls back to the normal order.
+pub fn annotate_overlap(accounts: &mut [AccountSnapshot], now: SystemTime) {
+    let starts: Vec<Option<SystemTime>> = accounts
+        .iter()
+        .map(|a| live_reset(&a.seven_day, now).and_then(|r| r.checked_sub(WEEK)))
+        .collect();
+    let overlaps: Vec<Option<SystemTime>> = accounts
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            // Codex stays the legacy cross-group overflow pool (see `rank`):
+            // no overlap, so neither promotion nor the ceiling ramp touch it.
+            if a.credential_kind == "codex" {
+                return None;
+            }
+            let own = starts[i]?;
+            let reset = live_reset(&a.seven_day, now)?;
+            let newest = accounts
+                .iter()
+                .enumerate()
+                .filter(|(j, b)| *j != i && b.group == a.group)
+                .filter_map(|(j, _)| starts[j])
+                .filter(|peer| *peer <= now && *peer > own + OVERLAP_EPSILON)
+                .max()?;
+            (newest < reset).then_some(newest)
+        })
+        .collect();
+    for (a, o) in accounts.iter_mut().zip(overlaps) {
+        a.overlap_start = o;
+    }
+}
+
+/// True while `account` sits in a live weekly overlap and overlap promotion is
+/// on (`priority-drain` + `scheduler.overlap_promote`).
+pub fn overlapped(account: &AccountSnapshot, params: &SelectParams, now: SystemTime) -> bool {
+    overlap_active(params)
+        && account.overlap_start.is_some_and(|start| start <= now)
+        && live_reset(&account.seven_day, now).is_some()
 }
 
 pub fn eligibility(
@@ -172,7 +278,7 @@ pub fn gate(
     {
         return Some(IneligibleReason::CoolingDown);
     }
-    let (five_max, seven_max, _) = effective_limits(account, params);
+    let (five_max, seven_max, _) = effective_limits(account, params, now);
     let five = account
         .five_hour
         .map_or(0.0, |w| w.effective_utilization(now));
@@ -226,7 +332,7 @@ pub fn gate_scoped(
         if account.fable_cooldown_active(now) {
             return Some(IneligibleReason::FableCoolingDown);
         }
-        if account.fable_weekly_exhausted(now, effective_limits(account, params).2) {
+        if account.fable_weekly_exhausted(now, effective_limits(account, params, now).2) {
             return Some(IneligibleReason::FableWeeklyExhausted);
         }
     }
@@ -602,6 +708,38 @@ pub fn account_priority(account: &AccountSnapshot) -> u32 {
     account.limits.priority.unwrap_or(u32::MAX)
 }
 
+/// Walk order of an account: an overlapped account (key 0) ahead of every
+/// configured tier, then `priority` lowest-first (+1 so a configured
+/// `priority: 0` still sorts after a promotion).
+fn drain_key(account: &AccountSnapshot, params: &SelectParams, now: SystemTime) -> u64 {
+    if overlapped(account, params, now) {
+        0
+    } else {
+        u64::from(account_priority(account)) + 1
+    }
+}
+
+/// Total serving order under `priority-drain`: the walk key, then — among
+/// promoted accounts — the earliest 7d reset, then the configured tier. Smaller
+/// serves first. The pick, the display order and the "why not serving" text all
+/// compare this, so they cannot disagree.
+fn drain_order(
+    account: &AccountSnapshot,
+    params: &SelectParams,
+    now: SystemTime,
+) -> (u64, Option<SystemTime>, u32) {
+    let key = drain_key(account, params, now);
+    if key == 0 {
+        (
+            0,
+            live_reset(&account.seven_day, now),
+            account_priority(account),
+        )
+    } else {
+        (key, None, account_priority(account))
+    }
+}
+
 /// Outcome of the `priority-drain` tier walk.
 struct DrainPlan<'a> {
     /// Gate-eligible accounts of the first tier that has any (empty when
@@ -636,17 +774,48 @@ fn gate_without_five_hour(
     )
 }
 
-/// Walk tiers lowest-first: the first tier with a gate-eligible account is the
-/// only candidate set. A tier with none is skipped (weekly ceiling, paused,
-/// unhealthy, stale, 429 cooldown) — unless it is gated only by its 5h
-/// ceiling and `spill_on_five_hour` is off, in which case the walk stops and
-/// the pool answers Exhausted until that window clears.
+/// Walk the drain order. First any gate-eligible OVERLAPPED account (key 0,
+/// `overlap_promote`) is the candidate set. Otherwise walk the configured
+/// `priority` tiers lowest-first over ALL accounts (an overlapped-but-gated
+/// account simply keeps its normal place): the first tier with a gate-eligible
+/// account is the only candidate set. A tier with none is skipped (weekly
+/// ceiling, paused, unhealthy, stale, 429 cooldown) — unless it is gated only
+/// by its 5h ceiling and `spill_on_five_hour` is off, in which case the walk
+/// stops and the pool answers Exhausted until that window clears. A gated
+/// promotion therefore falls through to the normal order and never holds.
 fn drain_plan<'a>(
     gated: &[(&'a AccountSnapshot, Option<IneligibleReason>)],
     params: &SelectParams,
     now: SystemTime,
     without_five_hour: &dyn Fn(&AccountSnapshot) -> Option<IneligibleReason>,
 ) -> DrainPlan<'a> {
+    let promoted: Vec<&AccountSnapshot> = gated
+        .iter()
+        .filter(|(a, r)| r.is_none() && overlapped(a, params, now))
+        .map(|(a, _)| *a)
+        .collect();
+    if !promoted.is_empty() {
+        // Earliest `resets_at` first, enforced on the CANDIDATE set so the
+        // stickiness margin (and the Fable ranking) cannot keep a later-reset
+        // promoted account.
+        let soonest = promoted
+            .iter()
+            .filter_map(|a| live_reset(&a.seven_day, now))
+            .min();
+        let soonest_set: Vec<&AccountSnapshot> = promoted
+            .into_iter()
+            .filter(|a| live_reset(&a.seven_day, now) == soonest)
+            .collect();
+        // Equal resets: the configured tier breaks the tie.
+        let tier = soonest_set.iter().map(|a| account_priority(a)).min();
+        return DrainPlan {
+            candidates: soonest_set
+                .into_iter()
+                .filter(|a| Some(account_priority(a)) == tier)
+                .collect(),
+            hold: None,
+        };
+    }
     let five_hour_only = |a: &AccountSnapshot, r: Option<IneligibleReason>| {
         r == Some(IneligibleReason::FiveHourOverThreshold) && without_five_hour(a).is_none()
     };
@@ -727,13 +896,21 @@ pub fn tier_withheld(
         return None;
     }
     let mine = account_priority(account);
+    let my_order = drain_order(account, params, now);
     // The blocker: the gate-eligible lower tier serving, else the 5h-held one.
-    let lower = |a: &AccountSnapshot| account_priority(a) < mine;
+    let lower = |a: &AccountSnapshot| drain_order(a, params, now) < my_order;
     let by = plan
         .candidates
         .iter()
         .find(|a| lower(a))
-        .map(|a| (a.id.0.clone(), "serving"))
+        .map(|a| {
+            let why = if overlapped(a, params, now) {
+                "promoted"
+            } else {
+                "serving"
+            };
+            (a.id.0.clone(), why)
+        })
         .or_else(|| {
             gated
                 .iter()
@@ -744,7 +921,10 @@ pub fn tier_withheld(
                 })
                 .map(|(a, _)| (a.id.0.clone(), "5h-held"))
         });
-    by.map(|(name, why)| format!("tier {mine}: lower tier {name} {why}"))
+    by.map(|(name, why)| match why {
+        "promoted" => format!("tier {mine}: {name} promoted (peer rolled, expiring 7d)"),
+        _ => format!("tier {mine}: lower tier {name} {why}"),
+    })
 }
 
 /// Round-robin choice: the first ELIGIBLE account after the current one in
@@ -859,7 +1039,7 @@ pub fn account_score(account: &AccountSnapshot, params: &SelectParams, now: Syst
     let seven = account
         .seven_day
         .map_or(0.0, |w| w.effective_utilization(now));
-    let (five_max, seven_max, _) = effective_limits(account, params);
+    let (five_max, seven_max, _) = effective_limits(account, params, now);
     let r5 = (five_max - five).max(0.0);
     let r7 = (seven_max - seven).max(0.0);
     let servable_now = r5.min(r7);
@@ -903,7 +1083,7 @@ pub fn fable_score(account: &AccountSnapshot, params: &SelectParams, now: System
         .map_or(0.0, |w| w.effective_utilization(now));
     let fable_window = account.fable_weekly().map(|s| s.window);
     let fable = fable_window.map_or(0.0, |w| w.effective_utilization(now));
-    let (five_max, seven_max, fable_max) = effective_limits(account, params);
+    let (five_max, seven_max, fable_max) = effective_limits(account, params, now);
     let r5 = (five_max - five).max(0.0);
     let r7 = (seven_max - seven).max(0.0);
     let rf = (fable_max - fable).max(0.0);
@@ -1007,9 +1187,10 @@ fn rank(
         }
     }
     if params.mode == crate::config::SchedulerMode::PriorityDrain {
-        let by_priority = account_priority(a).cmp(&account_priority(b));
-        if by_priority != Ordering::Equal {
-            return by_priority;
+        // Overlapped accounts first (earliest 7d reset, then tier), then tiers.
+        let by_drain = drain_order(a, params, now).cmp(&drain_order(b, params, now));
+        if by_drain != Ordering::Equal {
+            return by_drain;
         }
     }
     // Higher score first (descending).
@@ -1229,7 +1410,7 @@ pub fn blocking_reason(
             format!(
                 "5h {:.1}% > {:.0}%",
                 util * 100.0,
-                effective_limits(account, params).0 * 100.0
+                effective_limits(account, params, now).0 * 100.0
             )
         }
         IneligibleReason::SevenDayOverThreshold => {
@@ -1239,7 +1420,7 @@ pub fn blocking_reason(
             format!(
                 "7d {:.1}% > {:.0}%",
                 util * 100.0,
-                effective_limits(account, params).1 * 100.0
+                effective_limits(account, params, now).1 * 100.0
             )
         }
         IneligibleReason::UsageStale => {
@@ -1430,6 +1611,8 @@ mod tests {
 
     fn params() -> SelectParams {
         SelectParams {
+            seven_day_max_end: 0.99,
+            overlap_promote: false,
             five_hour_max: 0.90,
             seven_day_max: 0.99,
             fable_weekly_max: 0.98,
@@ -1455,6 +1638,7 @@ mod tests {
 
     fn account(id: &str) -> AccountSnapshot {
         AccountSnapshot {
+            overlap_start: None,
             id: AccountId(id.to_string()),
             healthy: true,
             auth_failure_status: None,
@@ -1573,6 +1757,8 @@ mod tests {
         if let Some(c) = current {
             map.insert(BackendGroup::Claude, AccountId(c.to_string()));
         }
+        let mut accounts = accounts;
+        annotate_overlap(&mut accounts, now());
         PoolSnapshot {
             accounts,
             current: map,
@@ -3022,6 +3208,8 @@ mod tests {
         // The simulation's new-policy scorer must equal the real account_score
         // (with five_max 0.90, seven_max 1.0, a fresh 5h window).
         let p = SelectParams {
+            seven_day_max_end: 0.99,
+            overlap_promote: false,
             five_hour_max: 0.90,
             seven_day_max: 1.0,
             fable_weekly_max: 0.98,
@@ -3714,5 +3902,505 @@ mod tests {
         let snap = pool(tech_andrew(0.10, 0.10), None);
         let order = selection_order(&snap, &drain_params(false), now());
         assert_eq!(snap.accounts[order[0]].id, id("tech"));
+    }
+
+    // ---- overlap promotion (staggered weekly windows) ----
+
+    fn ov_params(spill: bool) -> SelectParams {
+        let mut p = drain_params(spill);
+        p.overlap_promote = true;
+        p
+    }
+
+    /// tech@ (tier 1, ceiling 0.999) and andrew@ (tier 2, ceiling 0.95 ramping
+    /// to 0.99, no 5h window), with the given hours LEFT in each 7d window.
+    /// The live fleet: tech@ rolls Sat 15:59, andrew@ Sat 22:00 (6h later).
+    fn stagger(tech_left_h: u64, andrew_left_h: u64) -> Vec<AccountSnapshot> {
+        let mut tech = tiered("tech", Some(1), 0.10, 0.10, tech_left_h);
+        tech.limits.seven_day_max = Some(0.999);
+        let mut andrew = tiered("andrew", Some(2), 0.10, 0.50, andrew_left_h);
+        andrew.five_hour = None;
+        andrew.limits.seven_day_max = Some(0.95);
+        andrew.limits.seven_day_max_end = Some(0.99);
+        vec![andrew, tech]
+    }
+
+    /// Before tech@ rolls / inside the 6h overlap / after both rolled.
+    fn before() -> Vec<AccountSnapshot> {
+        stagger(4, 10)
+    }
+    fn during() -> Vec<AccountSnapshot> {
+        stagger(167, 5)
+    }
+    fn after() -> Vec<AccountSnapshot> {
+        stagger(161, 167)
+    }
+
+    fn overlap_of(accounts: &[AccountSnapshot], name: &str) -> Option<u64> {
+        let mut accounts = accounts.to_vec();
+        annotate_overlap(&mut accounts, now());
+        accounts
+            .iter()
+            .find(|a| a.id.0 == name)
+            .and_then(|a| a.overlap_start)
+            .map(|t| t.duration_since(at(0)).unwrap().as_secs())
+    }
+
+    fn ov_pick(accounts: Vec<AccountSnapshot>, current: Option<&str>, spill: bool) -> Decision {
+        pick(&pool(accounts, current), &ov_params(spill), None, now())
+    }
+
+    #[test]
+    fn overlap_follows_the_freshest_rolled_peer_and_never_the_freshest_account() {
+        // (name, accounts, tech@ overlap start, andrew@ overlap start)
+        for (name, accounts, tech, andrew) in [
+            // andrew@ rolled 6h before tech@ last week: tech@ trails it.
+            ("before", before(), Some(NOW_SECS - 158 * HOUR), None),
+            // tech@ just rolled (1h ago): andrew@ is the stale one.
+            ("during", during(), None, Some(NOW_SECS - HOUR)),
+            // both rolled; andrew@ is the freshest again.
+            ("after", after(), Some(NOW_SECS - HOUR), None),
+        ] {
+            assert_eq!(overlap_of(&accounts, "tech"), tech, "{name}: tech@");
+            assert_eq!(overlap_of(&accounts, "andrew"), andrew, "{name}: andrew@");
+        }
+    }
+
+    #[test]
+    fn overlap_start_is_the_newest_newer_peer_start_with_three_accounts() {
+        let mut accounts = stagger(167, 5); // tech@ rolled 1h ago
+        let mut mid = tiered("mid", Some(3), 0.10, 0.10, 165); // rolled 3h ago
+        mid.limits.seven_day_max = Some(0.95);
+        accounts.push(mid);
+        // andrew@ has two newer peers; the NEWEST start (tech@, 1h ago) wins.
+        assert_eq!(overlap_of(&accounts, "andrew"), Some(NOW_SECS - HOUR));
+        // mid@ rolled 3h ago: tech@ is newer than it, so it overlaps too.
+        assert_eq!(overlap_of(&accounts, "mid"), Some(NOW_SECS - HOUR));
+        assert_eq!(overlap_of(&accounts, "tech"), None);
+    }
+
+    /// X rolls Wed 15:59 (96h after tech@), tech@ Sat 15:59 (hour 0),
+    /// andrew@ Sat 22:00 (hour 6). Sweep a full week from tech@'s roll.
+    fn three_at(t: u64) -> Vec<AccountSnapshot> {
+        let left = |roll: u64| 168 - (t + 168 - roll) % 168; // hours to next roll
+        let mut x = tiered("x", Some(3), 0.10, 0.40, left(96));
+        x.limits.seven_day_max = Some(0.95);
+        let mut tech = tiered("tech", Some(1), 0.10, 0.10, left(0));
+        tech.limits.seven_day_max = Some(0.999);
+        let mut andrew = tiered("andrew", Some(2), 0.10, 0.50, left(6));
+        andrew.five_hour = None;
+        andrew.limits.seven_day_max = Some(0.95);
+        vec![andrew, tech, x]
+    }
+
+    #[test]
+    fn three_staggered_accounts_drain_soonest_reset_first_all_week() {
+        // (hours since tech@ rolled, expected pick, expected freshest)
+        let sweep = [
+            (1, "andrew", "tech"),   // Sat 16:59: andrew@'s 6h overlap
+            (5, "andrew", "tech"),   // Sat 20:59
+            (7, "x", "andrew"),      // Sat 22:59: andrew@ rolled; x leftover (Wed)
+            (50, "x", "andrew"),     // Mon
+            (95, "x", "andrew"),     // Wed 14:59, an hour before x rolls
+            (97, "tech", "x"),       // Wed 16:59: x fresh; tech@ resets next
+            (150, "tech", "x"),      // Fri
+            (167, "tech", "x"),      // Sat 14:59
+            (169, "andrew", "tech"), // next Sat 16:59: andrew@ again
+        ];
+        for (t, want, freshest) in sweep {
+            let t = t % 168;
+            let accounts = three_at(t);
+            let snap = pool(accounts.clone(), None);
+            let p = ov_params(true);
+            assert_eq!(
+                pick(&snap, &p, None, now()),
+                Decision::Switch { to: id(want) },
+                "t={t}h"
+            );
+            for a in &snap.accounts {
+                assert_eq!(
+                    overlapped(a, &p, now()),
+                    a.id.0 != freshest,
+                    "t={t}h {}: the freshest-rolled account is the only one never promoted",
+                    a.id.0
+                );
+                // Independent derivation of the ramp span start: the newest
+                // peer start that is newer than this account's own.
+                let elapsed = |n: &str| {
+                    let roll = match n {
+                        "tech" => 0,
+                        "andrew" => 6,
+                        _ => 96,
+                    };
+                    (t + 168 - roll) % 168
+                };
+                let own = elapsed(&a.id.0);
+                let newest = ["tech", "andrew", "x"]
+                    .iter()
+                    .filter(|n| **n != a.id.0)
+                    .map(|n| elapsed(n))
+                    .filter(|e| *e < own)
+                    .min();
+                assert_eq!(
+                    a.overlap_start,
+                    newest.map(|e| at(NOW_SECS - e * HOUR)),
+                    "t={t}h {}",
+                    a.id.0
+                );
+            }
+            // Switch off: tiers alone decide (tech@ first all week).
+            assert_eq!(
+                pick(&snap, &drain_params(true), None, now()),
+                Decision::Switch { to: id("tech") },
+                "t={t}h overlap_promote off"
+            );
+        }
+    }
+
+    #[test]
+    fn tiers_only_break_ties_and_order_overflow_when_overlap_promote_is_on() {
+        // x (tier 3) is soonest-reset: it wins over tier-1 tech@ ...
+        let snap = pool(three_at(50), None);
+        assert_eq!(
+            pick(&snap, &ov_params(true), None, now()),
+            Decision::Switch { to: id("x") }
+        );
+        // ... and when x is out, the next-soonest non-freshest account, then
+        // the freshest, in that order (overflow).
+        for (out, want) in [("x", "tech"), ("tech", "andrew")] {
+            let mut accounts = three_at(50);
+            accounts
+                .iter_mut()
+                .filter(|a| a.id.0 == "x" || a.id.0 == out)
+                .for_each(|a| a.paused = true);
+            assert_eq!(
+                pick(&pool(accounts, None), &ov_params(true), None, now()),
+                Decision::Switch { to: id(want) },
+                "x and {out} out"
+            );
+        }
+    }
+
+    #[test]
+    fn equal_or_jittery_window_starts_are_not_an_overlap() {
+        for left in [(100, 100), (100, 100)] {
+            let accounts = stagger(left.0, left.1);
+            assert_eq!(overlap_of(&accounts, "andrew"), None);
+            assert_eq!(overlap_of(&accounts, "tech"), None);
+        }
+        // 30s of resets_at jitter is below the epsilon.
+        let mut accounts = stagger(100, 100);
+        accounts[1].seven_day = Some(window(0.1, 100 * HOUR + 30));
+        assert_eq!(overlap_of(&accounts, "andrew"), None);
+    }
+
+    #[test]
+    fn missing_expired_or_cross_group_windows_never_overlap() {
+        let derive = |f: fn(&mut Vec<AccountSnapshot>)| {
+            let mut a = during();
+            f(&mut a);
+            annotate_overlap(&mut a, now());
+            overlap_of(&a, "andrew")
+        };
+        assert_eq!(derive(|a| a[0].seven_day = None), None, "A missing");
+        assert_eq!(
+            derive(|a| a[0].seven_day = Some(window(0.5, 0))),
+            None,
+            "A past"
+        );
+        assert_eq!(derive(|a| a[1].seven_day = None), None, "peer missing");
+        assert_eq!(
+            derive(|a| a[1].seven_day = Some(window(0.1, 0))),
+            None,
+            "peer past"
+        );
+        assert_eq!(
+            derive(|a| a[1] = codex_account("tech")),
+            None,
+            "a codex peer is a different group"
+        );
+        // A peer whose start would be in the future is bogus data.
+        assert_eq!(
+            derive(|a| a[1].seven_day = Some(window(0.1, 170 * HOUR))),
+            None
+        );
+    }
+
+    #[test]
+    fn promotion_burns_andrew_first_only_inside_the_overlap_and_without_the_margin() {
+        for (name, accounts, in_overlap) in [
+            ("before", before(), false),
+            ("during", during(), true),
+            ("after", after(), false),
+        ] {
+            for current in [None, Some("tech"), Some("andrew")] {
+                let want = |to: &str| {
+                    if current == Some(to) {
+                        Decision::Stay
+                    } else {
+                        Decision::Switch { to: id(to) }
+                    }
+                };
+                let expected = if in_overlap {
+                    want("andrew")
+                } else {
+                    want("tech")
+                };
+                assert_eq!(
+                    ov_pick(accounts.clone(), current, true),
+                    expected,
+                    "{name} current {current:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn overlap_promote_off_or_outside_priority_drain_is_unchanged() {
+        let snap = pool(during(), Some("tech"));
+        assert_eq!(
+            pick(&snap, &drain_params(true), None, now()),
+            Decision::Stay,
+            "switch off == today's behavior"
+        );
+        let mut default_mode = ov_params(true);
+        default_mode.mode = crate::config::SchedulerMode::Default;
+        let accounts = during();
+        let mut annotated = accounts.clone();
+        annotate_overlap(&mut annotated, now());
+        for a in &annotated {
+            assert!(!overlapped(a, &default_mode, now()));
+        }
+        // The ceiling ramp is off with the switch / outside priority-drain too.
+        let andrew = pool(during(), None).accounts.remove(0);
+        for p in [drain_params(true), default_mode] {
+            assert!((effective_limits(&andrew, &p, now()).1 - 0.95).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn ceiling_ramps_linearly_across_the_overlap_only() {
+        let ceiling = |tech_left, andrew_left| {
+            let a = pool(stagger(tech_left, andrew_left), None)
+                .accounts
+                .remove(0);
+            effective_limits(&a, &ov_params(true), now()).1
+        };
+        assert!(
+            (ceiling(167, 5) - (0.95 + 0.04 / 6.0)).abs() < 1e-9,
+            "1h in"
+        );
+        assert!((ceiling(165, 3) - 0.97).abs() < 1e-9, "halfway");
+        assert!((ceiling(162, 1) - (0.95 + 0.04 * 6.0 / 7.0)).abs() < 1e-9);
+        assert!((ceiling(4, 10) - 0.95).abs() < 1e-9, "freshest: no ramp");
+        assert!((ceiling(161, 167) - 0.95).abs() < 1e-9, "freshest: no ramp");
+        // The ramp starts at the account's OWN effective limit, wherever set.
+        let mut a = pool(stagger(165, 3), None).accounts.remove(0);
+        a.limits.seven_day_max = None; // falls back to the global ceiling
+        let mut p = ov_params(true);
+        p.seven_day_max = 0.90;
+        assert!((effective_limits(&a, &p, now()).1 - 0.945).abs() < 1e-9);
+        // end: per-account override, else the global default.
+        a.limits.seven_day_max_end = None;
+        assert!((effective_limits(&a, &p, now()).1 - 0.945).abs() < 1e-9);
+        p.seven_day_max_end = 0.80; // not above base: inert
+        assert!((effective_limits(&a, &p, now()).1 - 0.90).abs() < 1e-9);
+        // Unset per-account end = the 0.99 global default; end not above base
+        // is inert; end is capped at 1.0.
+        let mut a = pool(stagger(165, 3), None).accounts.remove(0);
+        a.limits.seven_day_max_end = None;
+        assert!((effective_limits(&a, &ov_params(true), now()).1 - 0.97).abs() < 1e-9);
+        a.limits.seven_day_max_end = Some(0.90);
+        assert!((effective_limits(&a, &ov_params(true), now()).1 - 0.95).abs() < 1e-9);
+        a.limits.seven_day_max_end = Some(5.0);
+        assert!((effective_limits(&a, &ov_params(true), now()).1 - 0.975).abs() < 1e-9);
+    }
+
+    #[test]
+    fn ramp_opens_the_gate_and_the_score_late_in_the_overlap() {
+        // 0.97 is over the 0.95 base: gated early in the overlap (ceiling
+        // 0.957), eligible once the ramp passes it (4.5h of 6h → 0.98).
+        let with_u7 = |tech_left, andrew_left, u7| {
+            let mut a = stagger(tech_left, andrew_left);
+            a[0].seven_day = Some(window(u7, andrew_left * HOUR));
+            pool(a, None).accounts.remove(0)
+        };
+        let early = with_u7(167, 5, 0.97);
+        let late = with_u7(163, 1, 0.97);
+        let p = ov_params(true);
+        assert_eq!(
+            eligibility(&early, &p, now(), false),
+            Some(IneligibleReason::SevenDayOverThreshold)
+        );
+        assert_eq!(eligibility(&late, &p, now(), false), None);
+        assert!(account_score(&late, &p, now()) > 0.0);
+        assert_eq!(account_score(&early, &p, now()), 0.0);
+        // The same account with the switch off stays gated.
+        assert!(eligibility(&late, &drain_params(true), now(), false).is_some());
+    }
+
+    #[test]
+    fn a_gated_promoted_account_falls_through_to_the_normal_order() {
+        type Gate = (&'static str, fn(&mut AccountSnapshot));
+        let mutate: [Gate; 6] = [
+            ("weekly", |a| a.seven_day = Some(window(0.97, 5 * HOUR))),
+            ("five_hour", |a| a.five_hour = Some(window(0.95, 3 * HOUR))),
+            ("paused", |a| a.paused = true),
+            ("unhealthy", |a| a.healthy = false),
+            ("cooldown", |a| {
+                a.cooldown_until = Some(at(NOW_SECS + 60));
+                a.cooldown_source = Some(CooldownSource::RetryAfter);
+            }),
+            ("stale", |a| {
+                a.five_hour = Some(window_fetched(0.10, 3 * HOUR, NOW_SECS - 5_000));
+                a.seven_day = Some(window_fetched(0.50, 5 * HOUR, NOW_SECS - 5_000));
+            }),
+        ];
+        for (name, f) in mutate {
+            for spill in [true, false] {
+                let mut accounts = during();
+                f(&mut accounts[0]);
+                assert!(
+                    eligibility(
+                        &pool(accounts.clone(), None).accounts[0],
+                        &ov_params(spill),
+                        now(),
+                        false
+                    )
+                    .is_some(),
+                    "{name} must gate the promoted account"
+                );
+                assert_eq!(
+                    ov_pick(accounts, Some("andrew"), spill),
+                    Decision::Switch { to: id("tech") },
+                    "{name} spill={spill}: a gated promotion never holds the pool"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn several_overlapped_accounts_burn_the_earliest_reset_first() {
+        // tech@ rolled 1h ago; a2 resets in 5h, a1 in 2h: both overlap tech@
+        // (and a1 overlaps a2). Earliest resets_at first.
+        let mut accounts = stagger(167, 5);
+        accounts[0].id = id("a2");
+        let mut a1 = tiered("a1", Some(2), 0.10, 0.50, 2);
+        a1.limits.seven_day_max = Some(0.95);
+        accounts.push(a1);
+        for order in [[0, 1, 2], [2, 1, 0]] {
+            let reordered: Vec<_> = order.iter().map(|i| accounts[*i].clone()).collect();
+            // Sticky on the later-reset promoted account: no 25% margin.
+            for current in [None, Some("a2"), Some("tech")] {
+                assert_eq!(
+                    ov_pick(reordered.clone(), current, true),
+                    Decision::Switch { to: id("a1") },
+                    "current {current:?}"
+                );
+            }
+            assert_eq!(ov_pick(reordered, Some("a1"), true), Decision::Stay);
+        }
+    }
+
+    #[test]
+    fn equal_reset_promoted_accounts_fall_back_to_the_configured_tier() {
+        // a1/a2 reset together (5h) and both overlap tech@; a2 has the lower
+        // tier number, so it wins and stickiness on a1 does not keep it.
+        let mut accounts = stagger(167, 5);
+        accounts[0].id = id("a1");
+        let mut a2 = tiered("a2", Some(1), 0.10, 0.50, 5);
+        a2.limits.seven_day_max = Some(0.95);
+        accounts.push(a2);
+        for current in [None, Some("a1"), Some("tech")] {
+            assert_eq!(
+                ov_pick(accounts.clone(), current, true),
+                Decision::Switch { to: id("a2") },
+                "current {current:?}"
+            );
+        }
+        assert_eq!(ov_pick(accounts, Some("a2"), true), Decision::Stay);
+    }
+
+    #[test]
+    fn excluded_promoted_accounts_and_codex_overlap_are_explained_and_kept_last() {
+        // a2 (resets sooner) serves; a1 is promoted too but withheld, and says so.
+        let mut accounts = stagger(167, 5);
+        accounts[0].id = id("a1");
+        let mut a2 = tiered("a2", Some(2), 0.10, 0.50, 2);
+        a2.limits.seven_day_max = Some(0.95);
+        accounts.push(a2);
+        let snap = pool(accounts, Some("a2"));
+        let why = tier_withheld(&snap, &ov_params(true), &snap.accounts[0], now());
+        assert_eq!(
+            why.as_deref(),
+            Some("tier 2: a2 promoted (peer rolled, expiring 7d)")
+        );
+        // Two overlapping codex accounts never jump the Claude account.
+        let mut codex1 = codex_account("c1");
+        let mut codex2 = codex_account("c2");
+        codex1.seven_day = Some(window(0.1, 60 * HOUR));
+        codex2.seven_day = Some(window(0.1, 150 * HOUR));
+        let mut claude = tiered("claude", Some(1), 0.10, 0.10, 100);
+        claude.limits.seven_day_max = Some(0.95);
+        let snap = pool(vec![codex1, codex2, claude], None);
+        assert!(snap.accounts.iter().all(|a| a.overlap_start.is_none()));
+        let mut ceiling_probe = snap.accounts[0].clone();
+        ceiling_probe.limits.seven_day_max = Some(0.90);
+        assert!((effective_limits(&ceiling_probe, &ov_params(true), now()).1 - 0.90).abs() < 1e-9);
+        assert_eq!(
+            pick(&snap, &ov_params(true), None, now()),
+            Decision::Switch { to: id("claude") }
+        );
+    }
+
+    #[test]
+    fn promotion_composes_with_spill_on_five_hour() {
+        // tech@ 5h-gated + strict: outside the overlap that is a hold...
+        let mut accounts = after();
+        accounts[1].five_hour = Some(window(0.95, 12 * HOUR));
+        assert!(matches!(
+            ov_pick(accounts, None, false),
+            Decision::Exhausted { .. }
+        ));
+        // ...but a promoted andrew@ (no 5h window at all) serves ahead of it.
+        let mut accounts = during();
+        accounts[1].five_hour = Some(window(0.95, 12 * HOUR));
+        assert_eq!(
+            ov_pick(accounts, None, false),
+            Decision::Switch { to: id("andrew") }
+        );
+    }
+
+    #[test]
+    fn promotion_shows_in_the_blocked_text() {
+        let snap = pool(during(), Some("tech"));
+        assert_eq!(
+            tier_withheld(&snap, &ov_params(true), &snap.accounts[1], now()).as_deref(),
+            Some("tier 1: andrew promoted (peer rolled, expiring 7d)")
+        );
+        assert_eq!(
+            tier_withheld(&snap, &ov_params(true), &snap.accounts[0], now()),
+            None
+        );
+    }
+
+    #[test]
+    fn full_weekly_ceiling_of_one_gates_strictly_above_and_429_still_parks() {
+        let mut tech = acct7("tech", 0.10, 1.0, 150);
+        tech.limits.seven_day_max = Some(1.0);
+        assert_eq!(eligibility(&tech, &params(), now(), false), None, "at 1.0");
+        tech.seven_day = Some(window(1.01, 150 * HOUR));
+        assert_eq!(
+            eligibility(&tech, &params(), now(), false),
+            Some(IneligibleReason::SevenDayOverThreshold)
+        );
+        // A real upstream 429 at 100% parks through the existing cooldown path.
+        tech.seven_day = Some(window(1.0, 150 * HOUR));
+        tech.cooldown_until = Some(at(NOW_SECS + 600));
+        tech.cooldown_source = Some(CooldownSource::RetryAfter);
+        assert_eq!(
+            eligibility(&tech, &params(), now(), false),
+            Some(IneligibleReason::CoolingDown)
+        );
     }
 }

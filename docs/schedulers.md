@@ -57,13 +57,24 @@ Example: drain a Max 5x account before a Max 20x one, never letting automation t
 
 ```json
 {
-  "scheduler": { "mode": "priority-drain", "spill_on_five_hour": true },
+  "scheduler": { "mode": "priority-drain", "spill_on_five_hour": true, "overlap_promote": true },
   "account_limits": {
-    "claude:tech@bethelchurchak.org": { "priority": 1, "seven_day_max": 1.0 },
+    "claude:tech@bethelchurchak.org": { "priority": 1, "seven_day_max": 0.999 },
     "claude:andrew@alaskaautorental.com": { "priority": 2, "seven_day_max": 0.95 }
   }
 }
 ```
+
+### Overlap promotion (`scheduler.overlap_promote`, `priority-drain` only)
+
+Accounts' weekly windows roll at different times (tech@ Sat 15:59, andrew@ Sat 22:00). Between a peer's rollover and an account's own, that account holds an *expiring* remainder while the peer has a fresh week, so burning the stale one first loses nothing. With `overlap_promote: true` this is derived from the pool's own data, with no hour constants:
+
+- `window_start(X) = X.seven_day.resets_at - 7d`. Account A is in **overlap** when a same-backend-group peer has a newer `window_start` (rolled by more than 60s, start not in the future) while A's window is still open. The **overlap start** is the newest such peer start. The freshest-rolled account has no newer peer and is never in overlap. A missing or already-expired `resets_at` on A or the peer means no overlap (normal order). Codex accounts are never promoted (they stay the last-resort overflow pool).
+- An eligible account in overlap is **promoted ahead of every tier**; among several, the earliest `resets_at` first. The usual gates still apply: `seven_day_max` (incl. the ramp), `five_hour_max`, paused, stale, cooldown. A promoted account that is gated falls through to the normal tier order (it never starts a strict 5h hold); a promotion is picked up on the next evaluation with no 25% switch margin, and traffic returns to the normal order the same way when the overlap ends.
+- **Ceiling ramp.** Across `[overlap start, own resets_at]` the account's effective weekly ceiling (its `account_limits.<name>.seven_day_max`, else `scheduler.seven_day_max`) rises linearly to `seven_day_max_end` (`scheduler.seven_day_max_end`, default `0.99`; per-account `account_limits.<name>.seven_day_max_end` overrides; capped at 1.0). Outside overlap the base ceiling applies; the gate, score and status text all use the ramped value. An end not above the base is inert, so tech@'s `0.999` never ramps.
+- **Consequence for tiers.** With the switch on, accounts drain **soonest-reset-first** (every account except the freshest is promoted, earliest reset first); `priority` is the tiebreak and the overflow order once the promoted accounts are out. With two accounts the older-window one (tech@, most of the week) is promoted too, which matches tier order; andrew@ is promoted only in the Sat 15:59-22:00 window. Off (default) = exactly the behaviour above. The switch only acts in `priority-drain`.
+
+A ceiling of `1.0` is allowed (`utilization <= 1.0` stays eligible); a real upstream 429 at 100% parks the account through the normal cooldown path.
 
 Hand edits to the config file take effect on `llmux restart`; the `S` toggle and TUI/endpoint limit edits apply live. Editing ceilings from the TUI (`L`) keeps an existing `priority`; the tier itself is set in the config file.
 

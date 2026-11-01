@@ -336,6 +336,12 @@ pub struct AccountLimits {
     /// first; unset = last tier). Ignored by every other mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority: Option<u32>,
+    /// Weekly ceiling reached at this account's own 7d reset. With
+    /// `scheduler.overlap_promote` on, `seven_day_max` ramps linearly to this
+    /// across the account's overlap with a fresher peer. Unset (or not above
+    /// `seven_day_max`) = no ramp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seven_day_max_end: Option<f64>,
 }
 
 impl AccountLimits {
@@ -345,6 +351,7 @@ impl AccountLimits {
             && self.seven_day_max.is_none()
             && self.fable_weekly_max.is_none()
             && self.priority.is_none()
+            && self.seven_day_max_end.is_none()
     }
 }
 
@@ -895,6 +902,24 @@ pub struct SchedulerConfig {
     /// unhealthy, stale or cooling down). Additive.
     #[serde(default = "default_true")]
     pub spill_on_five_hour: bool,
+    /// `priority-drain` only: use-it-or-lose-it across staggered weekly
+    /// windows. While a peer in the same backend group has already rolled into
+    /// a fresher 7d window and this account's older window is still open (the
+    /// OVERLAP, derived from each account's own `resets_at`), the account is
+    /// served ahead of the tier order and its `seven_day_max` ramps toward
+    /// `account_limits.<name>.seven_day_max_end`. Off (default) = unchanged.
+    #[serde(default)]
+    pub overlap_promote: bool,
+    /// Weekly ceiling an overlapped account ramps up to by its own reset
+    /// (default 0.99), unless `account_limits.<name>.seven_day_max_end` says
+    /// otherwise. The ramp starts at that account's effective `seven_day_max`
+    /// and is inert when this is not above it. Needs `overlap_promote`.
+    #[serde(default = "default_seven_day_max_end")]
+    pub seven_day_max_end: f64,
+}
+
+pub fn default_seven_day_max_end() -> f64 {
+    0.99
 }
 
 /// Selection algorithm (config `scheduler.mode`).
@@ -955,6 +980,8 @@ impl Default for SchedulerConfig {
             fable_weekly_max: default_fable_weekly_max(),
             mode: SchedulerMode::default(),
             spill_on_five_hour: true,
+            overlap_promote: false,
+            seven_day_max_end: default_seven_day_max_end(),
         }
     }
 }

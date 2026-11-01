@@ -106,9 +106,11 @@ Each account tracks 5-hour and 7-day quota windows. The scheduler chooses among 
 | `usage_max_age_secs` | `600` | Usage older than this is stale; stale accounts are skipped unless all are stale. |
 | `refresh_ahead_secs` | `25200` | Background refresh threshold; default 7 hours before token expiry. |
 | `mode` | `default` | `default`, `round-robin` or `priority-drain` ([schedulers](schedulers.md)). |
+| `overlap_promote` | `false` | `priority-drain` only: serve (and ramp the weekly ceiling of) an account whose weekly window still runs while a peer has already rolled into a fresh one ([schedulers](schedulers.md)). |
+| `seven_day_max_end` | `0.99` | Weekly ceiling an overlapped account ramps up to by its own reset (needs `overlap_promote`; inert if not above its `seven_day_max`). |
 | `spill_on_five_hour` | `true` | `priority-drain` only: let the next tier serve while a lower tier is blocked only by its 5h ceiling; `false` = strict drain with a `429` until it clears. |
 
-Per-account overrides live in the top-level `account_limits` map: `five_hour_max`, `seven_day_max`, `fable_weekly_max` and, for `priority-drain`, `priority` (integer drain tier, lower first, unset = last).
+Per-account overrides live in the top-level `account_limits` map: `five_hour_max`, `seven_day_max`, `fable_weekly_max` and, for `priority-drain`, `priority` (integer drain tier, lower first, unset = last), and `seven_day_max_end` (per-account override of `scheduler.seven_day_max_end`, the ceiling reached at the account's reset during an overlap — see [schedulers](schedulers.md)).
 
 See [the scheduler perishability design](../.prd/09-scheduler-perishability.md) for the derivation and edge cases.
 
