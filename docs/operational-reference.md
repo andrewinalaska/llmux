@@ -319,6 +319,7 @@ Stable is v0.2.26 (2026-10-26). Preview is rolling and carries whatever landed o
 | Recomposed dashboard layout ([Dashboard layout](#dashboard-layout-main): scheduler + detail band, packed models strip, `+N more` accounts title, header tail on the tab row) | no | no | yes |
 | `z` fold of 7d-spent accounts on the dashboard ([Dashboard layout](#dashboard-layout-main), off by default) | no | no | yes |
 | Subscription plan per account: `plan` / `rate_limit_tier` / `plan_type` in `/llmux/status`, `llmux status` lines (`max20 · 7d 66% left`), TUI detail pane ([Usage controls](#usage-controls-refresh--resets)) | no | yes | yes |
+| Explicit Haiku 4.5 ids served by Haiku 5.5 on Claude Code / Agent SDK–shaped requests with default sampling and the bare `quota` probe (bare, custom-system or non-default-sampling requests still reach Haiku 4.5; row retired), Claude Code system block on the bare `quota` probe ([models](models.md#alias-semantics)) | no | no | yes |
 
 Note on 0.2.24 local control (an older stable, before the columns above): the 0.2.24 Islands app sends loopback requests without a key, while the daemon requires an admin credential on `/llmux/*`, so that app cannot read a daemon locally. This is confirmed from source (`LlmuxClient.swift`, `server.rs`), not reproduced in a running GUI. `llmux update` moves a 0.2.24 install to 0.2.25.
 
