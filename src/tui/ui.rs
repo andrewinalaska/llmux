@@ -242,6 +242,7 @@ pub(crate) fn draw(
     // automatic. The rect is computed HERE (not per-overlay) so every overlay
     // shares the same top edge: right under the tab bar, banner-aware.
     let overlay_area = overlay_rect(frame.area(), event_banner_line(&view.events, now).is_some());
+    let mut usage_scope = None;
     match chrome.overlay {
         Overlay::None => {}
         // The overlay draws the SAME accounts table as MAIN over the top of
@@ -254,7 +255,7 @@ pub(crate) fn draw(
             }
         }
         Overlay::Stats => draw_stats_overlay(frame, overlay_area, view, &ctx, chrome),
-        Overlay::Usage => draw_usage_overlay(frame, overlay_area, view, chrome),
+        Overlay::Usage => usage_scope = draw_usage_overlay(frame, overlay_area, view, chrome),
         Overlay::Logs => draw_logs_overlay(frame, overlay_area, view),
         Overlay::Sessions => draw_sessions_overlay(frame, overlay_area, view, &ctx, chrome, hits),
         Overlay::Misc => draw_misc_overlay(frame, overlay_area, view),
@@ -305,6 +306,23 @@ pub(crate) fn draw(
     };
     frame.render_widget(Clear, footer_area);
     draw_footer(frame, footer_area, chrome, ctx.mask);
+    // Usage context uses only the spare status row; flashes and modal chrome win.
+    if chrome.status_line.as_deref().is_none_or(str::is_empty)
+        && matches!(chrome.mode, Mode::Normal)
+        && chrome.input_modal.is_none()
+        && chrome.raw_modal.is_none()
+        && chrome.account_modal.is_none()
+    {
+        if let Some(scope) = usage_scope {
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(format!(" {scope}"), dim()))),
+                Rect {
+                    height: 1,
+                    ..footer_area
+                },
+            );
+        }
+    }
 }
 
 /// MAIN — the always-rendered wall-clock view (issue #5): header banner ·
@@ -370,32 +388,53 @@ fn draw_main(
     // (unparseable, before `from`, or past `to`).
     let event_line = event_banner_line(&view.events, now);
     let banner_height = u16::from(event_line.is_some());
+    let area = frame.area();
     // Drag-set overrides (UI-3 U7/U8) replace the automatic heights; the
     // clamp keeps a dragged pane from collapsing below border+header.
+    let middle_drag = chrome
+        .pane_heights
+        .middle
+        .map(|h| h.clamp(PANE_MIN_HEIGHT, PANE_MAX_HEIGHT));
+    // Middle row (owner decision 2026-10-22, rule 3): the 7-row scheduler +
+    // detail band when it fits this frame, else today's 8-row pair.
+    let band_rows = middle_drag.map_or(BAND_ROWS, |h| h - 1);
+    let middle = MiddlePlan::new(view, ctx, chrome, area.width, usize::from(band_rows));
+    let middle_height = middle_drag.unwrap_or(if middle.band.is_some() {
+        BAND_ROWS + 1
+    } else {
+        MIDDLE_HEIGHT
+    });
+    // Compact model strip (req12): only when model data exists. 0 height (no
+    // pane) otherwise, so the idle layout is unchanged. Packed (rule 4) when
+    // two or more entries fit a line, today's table otherwise. A drag
+    // override only applies while the strip exists at all.
+    let strip = strip_plan(view, area.width, chrome.pane_heights.strip);
+    let strip_height = strip.height;
+    // Accounts (rule 1): every row (n + 2) while activity keeps its floor;
+    // on a terminal too short for both, the accounts pane shrinks first —
+    // never below PANE_MIN_HEIGHT — and its title counts the hidden rows.
+    // With the `z` fold, the rows the fold leaves plus its block's lines.
+    // One column-set decision for the table and its fold.
+    let layout = table_layout(view, ctx, area.width);
+    let fold = fold_plan(view, ctx, chrome, &layout, area.width);
+    let accounts_full = match fold.plan() {
+        Some(fold) => (snapshot.accounts.len() - fold.members.len() + fold.lines() + 2) as u16,
+        None => (snapshot.accounts.len().max(1) as u16).saturating_add(2),
+    };
     let table_height = chrome
         .pane_heights
         .accounts
         .map(|h| h.clamp(PANE_MIN_HEIGHT, PANE_MAX_HEIGHT))
-        .unwrap_or_else(|| (snapshot.accounts.len().max(1) as u16).saturating_add(2));
-    let middle_height = chrome
-        .pane_heights
-        .middle
-        .map(|h| h.clamp(PANE_MIN_HEIGHT, PANE_MAX_HEIGHT))
-        .unwrap_or(8);
-    // Compact model strip (req12): only when model data exists. 0 height (no
-    // pane) otherwise, so the idle layout is unchanged.
-    let strip_rows = view.model_usage.len().min(MODEL_STRIP_ROWS);
-    // +2 for the table's top border (title) and header row.
-    let auto_strip_height = if strip_rows > 0 {
-        strip_rows as u16 + 2
-    } else {
-        0
-    };
-    let strip_height = match chrome.pane_heights.strip {
-        // A drag override only applies while the strip exists at all.
-        Some(h) if auto_strip_height > 0 => h.clamp(PANE_MIN_HEIGHT, PANE_MAX_HEIGHT),
-        _ => auto_strip_height,
-    };
+        .unwrap_or_else(|| {
+            // banner + header + tabs + groups line + footer (2).
+            let fixed = banner_height + 5;
+            let room = area
+                .height
+                .saturating_sub(fixed + middle_height + strip_height);
+            room.saturating_sub(ACTIVITY_FLOOR)
+                .max(PANE_MIN_HEIGHT)
+                .min(accounts_full)
+        });
     let [banner_area, header_area, tabs_area, table_area, middle_area, strip_area, activity_area, groups_area, footer_area] =
         Layout::vertical([
             Constraint::Length(banner_height),
@@ -408,17 +447,25 @@ fn draw_main(
             Constraint::Length(1),
             Constraint::Length(2),
         ])
-        .areas(frame.area());
+        .areas(area);
 
     if let Some(line) = event_line {
         frame.render_widget(Paragraph::new(line), banner_area);
     }
-    draw_header(frame, header_area, view, chrome);
     let tabs = draw_tabs(frame, tabs_area, chrome.overlay);
-    let account_rows = draw_accounts(frame, table_area, view, ctx, chrome);
-    draw_middle(frame, middle_area, view, ctx, chrome);
+    let header_tail = draw_header(
+        frame,
+        header_area,
+        view,
+        chrome,
+        now,
+        tabs_room(tabs_area, &tabs),
+    );
+    draw_tabs_tail(frame, tabs_area, header_tail);
+    let account_rows = draw_accounts_with(frame, table_area, view, ctx, chrome, &fold, &layout);
+    draw_middle(frame, middle_area, view, &middle);
     if strip_height > 0 {
-        draw_models_strip(frame, strip_area, view, ctx, now);
+        draw_models_strip(frame, strip_area, view, ctx, now, strip);
     }
     let activity = draw_activity(frame, activity_area, view, chrome, now);
     // Drag separators (UI-3 U7/U8): each pane's TOP border row resizes the
@@ -614,8 +661,25 @@ fn draw_tabs(frame: &mut Frame, area: Rect, active: Overlay) -> Vec<TabHit> {
         } else {
             Style::new().fg(Color::Cyan)
         };
+        let label = if area.width >= 140 && (active == Overlay::None || *overlay == Overlay::None) {
+            let key = match overlay {
+                Overlay::None => "Esc",
+                Overlay::Accounts => "a",
+                Overlay::Stats => "g",
+                Overlay::Usage => "U",
+                Overlay::Keys => "K",
+                Overlay::Perf => "p",
+                Overlay::Logs => "l",
+                Overlay::Sessions => "s",
+                Overlay::Misc => "?",
+                Overlay::Config => "c",
+            };
+            format!("[{key}] {label}")
+        } else {
+            (*label).to_string()
+        };
         let width = label.chars().count() as u16;
-        spans.push(Span::styled(*label, style));
+        spans.push(Span::styled(label, style));
         tabs.push(TabHit {
             area: Rect {
                 x,
@@ -925,9 +989,21 @@ fn heatmap_panel_height(
 /// renderer only filters by the selected granularity, groups consecutive
 /// rows by bucket, and draws a bold per-bucket total row above the per-model
 /// rows (cost desc). `usage_scroll` skips whole buckets, newest first.
-fn draw_usage_overlay(frame: &mut Frame, area: Rect, view: &DashboardView, chrome: &Chrome) {
+fn draw_usage_overlay(
+    frame: &mut Frame,
+    area: Rect,
+    view: &DashboardView,
+    chrome: &Chrome,
+) -> Option<String> {
     frame.render_widget(Clear, area);
     let gran = chrome.usage_gran;
+    // Keep the daemon's cost wording verbatim on wide screens. The compact
+    // summary stays ahead of long ALL sums so narrow screens retain the warning.
+    let cost_warning = if area.width >= 160 {
+        format!("≈ {} · NOT ACTUAL BILL", view.data_quality.cost)
+    } else {
+        "≈ API est. · NOT BILL".to_string()
+    };
     let rows: Vec<&crate::dashboard::UsageStatDoc> = view
         .usage_stats
         .iter()
@@ -948,13 +1024,12 @@ fn draw_usage_overlay(frame: &mut Frame, area: Rect, view: &DashboardView, chrom
             hint,
             Style::new().fg(Color::Yellow),
         )))
-        .block(
-            Block::new()
-                .borders(Borders::TOP)
-                .title(format!(" usage — {} ", gran.label())),
-        );
+        .block(Block::new().borders(Borders::TOP).title(format!(
+            " usage — {} · {cost_warning} · ALL 0 buckets ",
+            gran.label()
+        )));
         frame.render_widget(empty, area);
-        return;
+        return None;
     }
 
     // Group consecutive rows by bucket — the document orders each granularity
@@ -988,14 +1063,26 @@ fn draw_usage_overlay(frame: &mut Frame, area: Rect, view: &DashboardView, chrom
         .map(usage_row_tokens)
         .fold(0, u64::saturating_add);
     let scroll = chrome.usage_scroll.min(buckets.len().saturating_sub(1));
-    let title = format!(
-        " usage — {} · {} buckets · Σ {} tok · Σ {}{} ",
-        gran.label(),
-        buckets.len(),
-        format::human_count(total_tokens),
-        format_cost(total_cost),
-        if any_unpriced { " (+unpriced)" } else { "" },
+    let (label, n) = (gran.label(), buckets.len());
+    let (tok, cost) = (format::human_count(total_tokens), format_cost(total_cost));
+    let unpriced = if any_unpriced { " (+unpriced)" } else { "" };
+    // Widest first. The last form is exactly as wide as the pre-scope title,
+    // so any width that fit it still shows the warning, ALL and qualifier.
+    let full = format!(
+        " usage — {label} · {cost_warning} · ALL {n} buckets · Σ {tok} tok · Σ {cost}{unpriced} "
     );
+    let short = format!(
+        " usage {label} · ≈API est/NOT BILL · ALL {n} buckets · {tok} tok · {cost}{unpriced} "
+    );
+    let tight = format!(" ≈API est/NOT BILL · ALL {n} {label} · {tok} tok {cost}{unpriced} ");
+    let fits = |t: &str| cell_width(t) <= usize::from(area.width);
+    let title = if fits(&full) {
+        full
+    } else if fits(&short) {
+        short
+    } else {
+        tight
+    };
 
     let mut trows: Vec<Row> = Vec::new();
     for (_, label, group) in buckets.iter().skip(scroll) {
@@ -1089,6 +1176,12 @@ fn draw_usage_overlay(frame: &mut Frame, area: Rect, view: &DashboardView, chrom
         .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)))
         .block(Block::new().borders(Borders::TOP).title(title));
     frame.render_widget(table, area);
+    buckets.get(scroll).map(|(_, label, _)| {
+        format!(
+            "SCOPE: top/displayed bucket {label} · ALL = all {} buckets",
+            gran.label()
+        )
+    })
 }
 
 /// Total tokens of one usage row: all four classes, same reasoning as
@@ -2614,6 +2707,7 @@ fn draw_misc_overlay(frame: &mut Frame, area: Rect, view: &DashboardView) {
         key("wheel", "activity history · overlay cursors"),
         key("f m e", "codex fast / model / effort"),
         key("u t S R", "gauge fill / reset display / scheduler / reload"),
+        key("z", "dashboard: fold the 7d-spent accounts into text"),
         key("o d", "sessions sort · perf/stats span"),
         key("h l", "perf day drill-down (←/→)"),
         key("j k ⏎ y/n", "config editor: cursor · activate · confirm"),
@@ -3744,6 +3838,16 @@ fn account_modal_lines(
         ),
     ));
 
+    let history = view
+        .auth_history
+        .get(&account.id.0)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    if !history.is_empty() {
+        lines.push(modal_section("authentication / usage history"));
+        lines.extend(auth_history_lines(history, ctx.tz_offset));
+    }
+
     // --- 5h / 7d windows ---------------------------------------------------
     let consecutive_failures = view
         .poll_health
@@ -4019,6 +4123,60 @@ fn account_modal_lines(
                         .unwrap_or_else(|| dash.clone()),
                 ),
             ));
+        }
+    }
+    if history.is_empty() {
+        lines.push(modal_section("authentication / usage history"));
+        lines.extend(auth_history_lines(history, ctx.tz_offset));
+    }
+    lines
+}
+
+fn auth_history_lines(
+    history: &[crate::account_history::AccountEvent],
+    offset: i64,
+) -> Vec<Line<'static>> {
+    if history.is_empty() {
+        return vec![Line::from(
+            " No recorded history yet; events before this upgrade are unknown.",
+        )];
+    }
+    let mut lines = vec![Line::from(format!(
+        " Newest first · {} retained (up to 64/account) · local time · bodies/tokens omitted",
+        history.len()
+    ))];
+    for event in history {
+        let stamp = format::month_day_hm(UNIX_EPOCH + Duration::from_millis(event.at_ms), offset);
+        let http = event.http_status.map_or_else(
+            || "HTTP unavailable".into(),
+            |status| format!("HTTP {status}"),
+        );
+        let count = if event.count > 1 {
+            format!(
+                " ×{} since {}",
+                event.count,
+                format::month_day_hm(
+                    UNIX_EPOCH + Duration::from_millis(event.first_at_ms),
+                    offset
+                )
+            )
+        } else {
+            String::new()
+        };
+        lines.push(Line::from(format!(
+            " {stamp} · {} · {} · {http}{count}",
+            event.source, event.outcome
+        )));
+        lines.push(Line::from(format!(
+            "   {} → {}",
+            event.reason, event.effect
+        )));
+        if let Some(retry) = event.retry_at_ms {
+            lines.push(Line::from(format!(
+                "   next poll {} · failures {}",
+                format::month_day_hm(UNIX_EPOCH + Duration::from_millis(retry), offset),
+                event.consecutive_failures
+            )));
         }
     }
     lines
@@ -4832,12 +4990,116 @@ fn attach_spans(chrome: &Chrome) -> Vec<Span<'static>> {
     }
 }
 
-fn draw_header(frame: &mut Frame, area: Rect, view: &DashboardView, chrome: &Chrome) {
+/// `path` with the home directory contracted to `~` (`/Users/me/.config/x`
+/// → `~/.config/x`); verbatim when it is not under `home` — e.g. a remote
+/// daemon's path seen from an attached client.
+fn contract_home(path: &str, home: Option<&std::path::Path>) -> String {
+    let Some(home) = home
+        .and_then(|h| h.to_str())
+        .map(|h| h.trim_end_matches('/'))
+    else {
+        return path.to_string();
+    };
+    if home.is_empty() {
+        return path.to_string();
+    }
+    match path.strip_prefix(home) {
+        Some("") => "~".to_string(),
+        Some(rest) if rest.starts_with('/') => format!("~{rest}"),
+        _ => path.to_string(),
+    }
+}
+
+/// The header's tail in its tabs-row form (owner mockup 2026-10-22, rule
+/// 5): ` cfg {path} ` with the home contracted, then the attach marker —
+/// just ` attached ` when it would repeat the pid the header already shows,
+/// verbatim otherwise (`→ pid N` for another pid, `pid ?`, reconnecting).
+fn header_tail_spans(
+    view: &DashboardView,
+    chrome: &Chrome,
+    home: Option<&std::path::Path>,
+) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    if let Some(path) = &view.config_path {
+        spans.push(Span::styled(
+            format!(" cfg {} ", contract_home(path, home)),
+            dim(),
+        ));
+    }
+    match chrome.attach {
+        Some(attach) if attach.connected && attach.pid == Some(view.pid) => {
+            spans.push(Span::styled(
+                " attached ",
+                Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+            ));
+        }
+        _ => spans.extend(attach_spans(chrome)),
+    }
+    spans
+}
+
+/// Paint the header row, deciding ONCE where its tail goes (owner rule 5,
+/// review 2026-10-22), knowing the room the tab labels leave (`tabs_room`):
+/// the whole header fits → today's header; else the tabs-row form of the
+/// tail ([`header_tail_spans`]) fits that room → the header drops its tail
+/// and the tail is returned for [`draw_tabs_tail`]; else today's whole
+/// header, clipped by its row as before (cfg is never lost to a tail that
+/// had nowhere to go).
+fn draw_header(
+    frame: &mut Frame,
+    area: Rect,
+    view: &DashboardView,
+    chrome: &Chrome,
+    now: SystemTime,
+    tabs_room: usize,
+) -> Vec<Span<'static>> {
+    let lead = header_lead_spans(view, now);
+    let mut full = lead.clone();
+    if let Some(path) = &view.config_path {
+        full.push(Span::styled(format!(" cfg {path} "), dim()));
+    }
+    full.extend(attach_spans(chrome));
+    if Line::from(full.clone()).width() > usize::from(area.width) {
+        let tail = header_tail_spans(view, chrome, dirs::home_dir().as_deref());
+        if !tail.is_empty() && Line::from(tail.clone()).width() <= tabs_room {
+            frame.render_widget(Paragraph::new(Line::from(lead)), area);
+            return tail;
+        }
+    }
+    frame.render_widget(Paragraph::new(Line::from(full)), area);
+    Vec::new()
+}
+
+/// Cells the tab labels leave free at the right end of the tabs row.
+fn tabs_room(area: Rect, tabs: &[TabHit]) -> usize {
+    let used = tabs
+        .last()
+        .map_or(0, |t| t.area.right().saturating_sub(area.x));
+    usize::from(area.width.saturating_sub(used))
+}
+
+/// Right-align the header tail at the end of the tabs row ([`draw_header`]
+/// already checked it fits there).
+fn draw_tabs_tail(frame: &mut Frame, area: Rect, tail: Vec<Span<'static>>) {
+    if tail.is_empty() || area.height == 0 {
+        return;
+    }
+    let tail_w = Line::from(tail.clone())
+        .width()
+        .min(usize::from(area.width)) as u16;
+    frame.render_widget(
+        Paragraph::new(Line::from(tail)),
+        Rect::new(area.right() - tail_w, area.y, tail_w, 1),
+    );
+}
+
+/// The header up to (and including) the upstream: health verdict, identity,
+/// upstream — everything but the movable tail.
+fn header_lead_spans(view: &DashboardView, now: SystemTime) -> Vec<Span<'static>> {
     // glance-triage atom 1: the header row IS the health verdict — always
     // present (green included: a positive signal, never health-by-absence),
     // zero added height, [OK]/[WARN]/[FAIL] text first so the state survives
     // a no-truecolor panel. Identity (version/port/pid/up) compresses right.
-    let now = SystemTime::now();
     let verdict = triage::health_verdict(view, now);
     let (tag, color) = match verdict.level() {
         VerdictLevel::Ok => ("[OK]", Color::Green),
@@ -4891,35 +5153,65 @@ fn draw_header(frame: &mut Frame, area: Rect, view: &DashboardView, chrome: &Chr
     if let Some(upstream) = &view.upstream {
         spans.push(Span::styled(format!(" → {upstream} "), dim()));
     }
-    if let Some(path) = &view.config_path {
-        spans.push(Span::styled(format!(" cfg {path} "), dim()));
-    }
-    spans.extend(attach_spans(chrome));
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    spans
 }
 
-fn draw_accounts(
-    frame: &mut Frame,
-    area: Rect,
+/// ` accounts · sort name · 21 (claude 14 · codex 4 · grok 3) `,
+/// groups in table order, then MAIN's fold note (`fold`, [`Fold::note`];
+/// empty elsewhere), plus ` · +N more` when the pane cannot show `hidden`
+/// (> 0) of the `order.len()` accounts.
+fn accounts_title(
+    sort: &str,
     view: &DashboardView,
-    ctx: &FrameCtx,
-    chrome: &Chrome,
-) -> Vec<AccountRowHit> {
-    let snapshot = &view.snapshot;
-    // The title carries the active within-group order (`o` toggles it), so the
-    // operator never has to guess why two rows swapped.
-    let block = Block::new()
-        .borders(Borders::TOP)
-        .title(format!(" accounts · sort {} ", chrome.account_sort.label()));
-    if snapshot.accounts.is_empty() {
-        let empty = Paragraph::new(Line::from(Span::styled(
-            "no accounts — run `llmux login` or `llmux import`, then press R",
-            Style::new().fg(Color::Yellow),
-        )))
-        .block(block);
-        frame.render_widget(empty, area);
-        return Vec::new();
+    order: &[usize],
+    fold: &str,
+    hidden: usize,
+) -> String {
+    let mut groups: Vec<(BackendGroup, usize)> = Vec::new();
+    for &idx in order {
+        let group = view.snapshot.accounts[idx].group;
+        match groups.iter_mut().find(|(g, _)| *g == group) {
+            Some((_, count)) => *count += 1,
+            None => groups.push((group, 1)),
+        }
     }
+    let counts = groups
+        .iter()
+        .map(|(g, count)| format!("{} {count}", g.as_str()))
+        .collect::<Vec<_>>()
+        .join(" · ");
+    let more = if hidden > 0 {
+        format!(" · +{hidden} more")
+    } else {
+        String::new()
+    };
+    format!(
+        " accounts · sort {sort} · {} ({counts}){fold}{more} ",
+        order.len()
+    )
+}
+
+/// The accounts table's column decisions for one pane width (.prd/18),
+/// made once so the table and MAIN's fold block ([`FoldPlan`]) never
+/// disagree about which columns exist.
+struct TableLayout {
+    /// The `7d Fbl` gauge column (config `show_fable_weekly`).
+    show_fable: bool,
+    /// The reset-inventory column (the daemon reports usage controls).
+    show_resets: bool,
+    /// The wide column set (`req` / `tok`).
+    wide: bool,
+    /// The `5h` stub.
+    show_five_h: bool,
+    name_width: u16,
+    status_width: u16,
+    /// Each stretchy gauge's bar width, and its whole cell's width.
+    bar_width: usize,
+    gauge_cell: u16,
+}
+
+fn table_layout(view: &DashboardView, ctx: &FrameCtx, width: u16) -> TableLayout {
+    let snapshot = &view.snapshot;
     let show_fable = view.show_fable_weekly;
     // Reset-inventory column (.prd/16): shown only when the daemon reports
     // usage-control metadata at all, so an older daemon's table is
@@ -4983,7 +5275,7 @@ fn draw_accounts(
         let ncols = base_cols + n_gauges + with_five_h as usize + show_resets as usize;
         width + (ncols - 1)
     };
-    let avail = area.width as usize;
+    let avail = width as usize;
     // The wide column set is used whenever it actually FITS (Z 2026-07-13:
     // the fixed 150 threshold predated the NAME_COL_MAX cap — at ~149 cols it
     // hid req/tok and poured the width into fat bars instead). "Fits" is judged
@@ -5029,13 +5321,27 @@ fn draw_accounts(
         (QUOTA_BAR_WIDTH + leftover / n_gauges).min(GAUGE_BAR_MAX)
     };
     let gauge_cell = (bar_width + 1 + QUOTA_LABEL_WIDTH) as u16;
+    TableLayout {
+        show_fable,
+        show_resets,
+        wide,
+        show_five_h,
+        name_width,
+        status_width,
+        bar_width,
+        gauge_cell,
+    }
+}
 
-    let selected = match chrome.mode {
+/// The display position the account cursor is on, in the modes that have
+/// one; `None` otherwise.
+fn cursor_pos(chrome: &Chrome, len: usize) -> Option<usize> {
+    match chrome.mode {
         Mode::Select { idx }
         | Mode::ConfirmRemove { idx }
         | Mode::ConfirmReset { idx }
         | Mode::EditLimits { idx }
-        | Mode::ContextMenu { idx, .. } => Some(idx.min(ctx.order.len().saturating_sub(1))),
+        | Mode::ContextMenu { idx, .. } => Some(idx.min(len.saturating_sub(1))),
         // NewLogin is a provider picker, not an account-row cursor; the
         // config-editor modes live in the Config overlay.
         Mode::Normal
@@ -5043,20 +5349,77 @@ fn draw_accounts(
         | Mode::NewLogin { .. }
         | Mode::ConfigEdit { .. }
         | Mode::ConfigConfirm { .. } => None,
+    }
+}
+
+fn draw_accounts(
+    frame: &mut Frame,
+    area: Rect,
+    view: &DashboardView,
+    ctx: &FrameCtx,
+    chrome: &Chrome,
+) -> Vec<AccountRowHit> {
+    let layout = table_layout(view, ctx, area.width);
+    draw_accounts_with(frame, area, view, ctx, chrome, &Fold::Off, &layout)
+}
+
+/// [`draw_accounts`] with MAIN's fold (`z`): when it applies, the table
+/// keeps the accounts the fold does not hold — in display order, each with
+/// its own `#` and click target — and the block sits directly under its
+/// rows; either way the title says what the fold did this frame. `layout`
+/// is the one [`table_layout`] the fold was planned with, so the table and
+/// the fold never see different column sets.
+#[allow(clippy::too_many_arguments)]
+fn draw_accounts_with(
+    frame: &mut Frame,
+    area: Rect,
+    view: &DashboardView,
+    ctx: &FrameCtx,
+    chrome: &Chrome,
+    fold_state: &Fold,
+    layout: &TableLayout,
+) -> Vec<AccountRowHit> {
+    let snapshot = &view.snapshot;
+    let fold = fold_state.plan();
+    let table: Vec<usize> = (0..ctx.order.len())
+        .filter(|pos| fold.is_none_or(|f| !f.members.contains(pos)))
+        .collect();
+    // The title carries the active within-group order (`o` toggles it), so the
+    // operator never has to guess why two rows swapped — plus the per-group
+    // account counts and, when the pane is shorter than the table, how many
+    // accounts it cannot show (never a silent cut): hidden table rows, then
+    // the folded accounts on the fold lines below the pane's edge.
+    let title = if snapshot.accounts.is_empty() {
+        format!(" accounts · sort {} ", chrome.account_sort.label())
+    } else {
+        let lines = usize::from(area.height.saturating_sub(2));
+        let hidden = table.len().saturating_sub(lines)
+            + fold.map_or(0, |f| f.hidden(lines.saturating_sub(table.len())));
+        accounts_title(
+            chrome.account_sort.label(),
+            view,
+            &ctx.order,
+            &fold_state.note(),
+            hidden,
+        )
     };
-    let rows = ctx.order.iter().enumerate().map(|(pos, &account_idx)| {
-        let account = &snapshot.accounts[account_idx];
+    let block = Block::new().borders(Borders::TOP).title(title);
+    if snapshot.accounts.is_empty() {
+        let empty = Paragraph::new(Line::from(Span::styled(
+            "no accounts — run `llmux login` or `llmux import`, then press R",
+            Style::new().fg(Color::Yellow),
+        )))
+        .block(block);
+        frame.render_widget(empty, area);
+        return Vec::new();
+    }
+    let selected = cursor_pos(chrome, ctx.order.len());
+    let rows = table.iter().map(|&pos| {
+        let account = &snapshot.accounts[ctx.order[pos]];
         let cursor = selected == Some(pos);
         let row = account_row(
-            account,
-            view,
-            ctx,
-            pos,
-            wide,
-            cursor,
-            bar_width,
-            show_fable,
-            show_five_h,
+            account_row_parts(account, view, ctx, pos, cursor, layout),
+            layout.bar_width,
         );
         if cursor {
             row.style(Style::new().add_modifier(Modifier::REVERSED))
@@ -5078,78 +5441,118 @@ fn draw_accounts(
     // column, no width taken. It is a FULL gauge column in both sets (.prd/18
     // rule 3). The `5h` stub (.prd/18 rules 1–2) is a fixed 8-wide column that
     // never stretches and is the first column to drop when the row overflows.
-    let (header, constraints): (Vec<&'static str>, Vec<Constraint>) = {
-        let mut header = vec!["", "group", "#", "account", "status"];
+    let quota_label = match ctx.quota_display {
+        crate::config::QuotaDisplay::Remaining => "LEFT",
+        crate::config::QuotaDisplay::Used => "USED",
+    };
+    let n_gauges = 1 + layout.show_fable as usize;
+    let (header, constraints): (Vec<Cell<'static>>, Vec<Constraint>) = {
+        let mut header: Vec<Cell<'static>> = ["", "group", "#", "account", "status"]
+            .into_iter()
+            .map(Cell::from)
+            .collect();
         let mut constraints = vec![
             Constraint::Length(2),
             Constraint::Length(7),
             Constraint::Length(2),
-            Constraint::Length(name_width),
-            Constraint::Length(status_width),
+            Constraint::Length(layout.name_width),
+            Constraint::Length(layout.status_width),
         ];
-        if show_five_h {
-            header.push("5h");
+        if layout.show_five_h {
+            header.push(Cell::from(format!("5h {quota_label}")));
             constraints.push(Constraint::Length(FIVE_H_COL_WIDTH));
         }
-        header.push("7d");
-        constraints.push(Constraint::Length(gauge_cell));
-        if show_fable {
-            header.push("7d Fbl");
-            constraints.push(Constraint::Length(gauge_cell));
+        for title in ["7d RESET", "7d Fbl RESET"].into_iter().take(n_gauges) {
+            header.push(Cell::from(format!(
+                "{title:<width$}{quota_label}",
+                width = (layout.gauge_cell as usize - quota_label.len() - 1).max(title.len() + 1),
+            )));
+            constraints.push(Constraint::Length(layout.gauge_cell));
         }
-        if show_resets {
-            header.push("rst");
+        if layout.show_resets {
+            header.push(Cell::from("rst"));
             constraints.push(Constraint::Length(RESET_COL_WIDTH));
         }
-        header.push("if");
+        header.push(Cell::from("if"));
         constraints.push(Constraint::Length(3));
-        if wide {
-            header.extend(["req", "tok"]);
+        if layout.wide {
+            header.extend(["req", "tok"].into_iter().map(Cell::from));
             constraints.extend([Constraint::Length(6), Constraint::Length(7)]);
         }
         (header, constraints)
     };
 
-    let table = Table::new(rows, constraints)
+    let table_widget = Table::new(rows, constraints)
         .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)))
         .block(block);
-    frame.render_widget(table, area);
-    // Row hit map (UI-3 U11): row `pos` renders at area.y + 2 + pos (top
-    // border/title + header row), one line high, full table width. Rows
-    // clipped by the pane height are not clickable.
-    ctx.order
+    // With the fold, the table stops at its own rows so the block can take
+    // the lines below them.
+    let table_area = match fold {
+        Some(_) => Rect {
+            height: area.height.min((table.len() as u16).saturating_add(2)),
+            ..area
+        },
+        None => area,
+    };
+    frame.render_widget(table_widget, table_area);
+    // Row hit map (UI-3 U11): table row `i` renders at area.y + 2 + i (top
+    // border/title + header row), one line high, full table width, and maps
+    // to its account's display position. Rows clipped by the pane height are
+    // not clickable.
+    let mut hits: Vec<AccountRowHit> = table
         .iter()
         .enumerate()
-        .filter(|(pos, _)| area.y as usize + 2 + pos < area.bottom() as usize)
-        .map(|(pos, _)| AccountRowHit {
+        .filter(|(row, _)| area.y as usize + 2 + row < area.bottom() as usize)
+        .map(|(row, &pos)| AccountRowHit {
             area: Rect {
                 x: area.x,
-                y: area.y + 2 + pos as u16,
+                y: area.y + 2 + row as u16,
                 width: area.width,
                 height: 1,
             },
             display_idx: pos,
         })
-        .collect()
+        .collect();
+    if let Some(fold) = fold {
+        let top = area.y.saturating_add(2).saturating_add(table.len() as u16);
+        hits.extend(draw_fold(frame, area, top, fold));
+    }
+    hits
 }
 
-#[allow(clippy::too_many_arguments)]
-fn account_row<'a>(
-    account: &'a AccountSnapshot,
-    view: &'a DashboardView,
+/// One account's table cells as parts: the table turns them into a row
+/// ([`account_row`]), MAIN's fold block into text fields ([`fold_fields`]),
+/// so both show the same strings in the same styles.
+struct RowParts {
+    marker: Span<'static>,
+    group: Span<'static>,
+    number: Span<'static>,
+    name: Span<'static>,
+    status: Span<'static>,
+    /// Present when the layout keeps the `5h` stub.
+    five_h: Option<Span<'static>>,
+    seven: GaugeParts,
+    /// Present when the `7d Fbl` column is on.
+    fable: Option<GaugeParts>,
+    /// Present when the reset-inventory column is shown.
+    resets: Option<Span<'static>>,
+    in_flight: Span<'static>,
+    /// `req` / `tok`, in the wide column set.
+    totals: Option<(String, String)>,
+}
+
+/// Build one account's [`RowParts`] for the columns `layout` keeps (the
+/// effective `5h` / Fbl / `rst` / wide decisions from [`table_layout`] —
+/// reading the view/config here would push a cell into a column the
+/// header/constraints did not reserve).
+fn account_row_parts(
+    account: &AccountSnapshot,
+    view: &DashboardView,
     ctx: &FrameCtx,
     pos: usize,
-    wide: bool,
     cursor: bool,
-    bar_width: usize,
-    // The Fable-column toggle, and the EFFECTIVE `5h` flag from
-    // [`draw_accounts`] (the column drops whole at a width where even a
-    // floor-width status cannot make the row fit) — reading the view/config
-    // here would push a cell into a column the header/constraints did not
-    // reserve.
-    show_fable: bool,
-    show_five_h: bool,
-) -> Row<'a> {
+    layout: &TableLayout,
+) -> RowParts {
     let snapshot = &view.snapshot;
     let params = &view.select_params;
     let now = ctx.now;
@@ -5208,7 +5611,7 @@ fn account_row<'a>(
         .get(&account.id.0)
         .map_or(0, |h| h.consecutive_failures);
     let max_age = params.usage_max_age;
-    let seven_gauge = window_gauge_cell(
+    let seven = window_gauge_parts(
         &account.seven_day,
         params.seven_day_max,
         parked,
@@ -5217,28 +5620,14 @@ fn account_row<'a>(
         consecutive_failures,
         ctx.quota_display,
         ctx.reset_absolute,
-        bar_width,
     );
     let totals = view.totals_for(&account.id.0);
-
     let group_label = account.group.as_str();
-    let mut cells = vec![
-        Cell::from(marker),
-        Cell::from(Span::styled(
-            group_label.to_uppercase(),
-            group_color(Some(group_label)).add_modifier(Modifier::BOLD),
-        )),
-        Cell::from(Span::styled(format!("{}", pos + 1), dim())),
-        Cell::from(name),
-    ];
-    cells.push(Cell::from(status_span(
-        account, gate, is_current, params, now, ctx.frame,
-    )));
     // The `5h` stub (.prd/18): Claude-only, fixed 8 cells, dropped whole at a
     // width where the row cannot hold it — the header/constraints make the same
-    // call above, so the cells stay column-aligned.
-    if show_five_h {
-        cells.push(five_hour_cell(
+    // call, so the cells stay column-aligned.
+    let five_h = layout.show_five_h.then(|| {
+        let (text, style) = five_hour_text(
             account.group,
             &account.five_hour,
             params.five_hour_max,
@@ -5247,16 +5636,15 @@ fn account_row<'a>(
             max_age,
             consecutive_failures,
             ctx.quota_display,
-        ));
-    }
-    cells.push(seven_gauge);
-    // Fbl gauge (fable-usage U9a): rendered only when the toggle is on, in the
-    // same slot (after 7d) as the header/constraints reserve above, so the
-    // cells stay column-aligned. Claude-only, like the 5h stub: a non-Claude
-    // row reads `-`, a Claude row with an absent window keeps the cold state
-    // 7d uses.
-    if show_fable {
-        cells.push(fable_gauge_cell(
+        );
+        Span::styled(text, style)
+    });
+    // Fbl gauge (fable-usage U9a): only when the toggle is on, in the same
+    // slot (after 7d) as the header/constraints reserve, so the cells stay
+    // column-aligned. Claude-only, like the 5h stub: a non-Claude row reads
+    // `-`, a Claude row with an absent window keeps the cold state 7d uses.
+    let fable = layout.show_fable.then(|| {
+        fable_gauge_parts(
             account.group,
             account.fable_weekly(),
             now,
@@ -5265,14 +5653,13 @@ fn account_row<'a>(
             ctx.quota_display,
             ctx.reset_absolute,
             select::effective_limits(account, params, now).2,
-            bar_width,
-        ));
-    }
+        )
+    });
     // Reset inventory (.prd/16), in the same slot the header/constraints
     // reserve: `?` unknown, `N` owned, `N*` owned-but-none-applicable, `—` for
-    // a provider with no resets at all. Rendered only when the daemon reports
+    // a provider with no resets at all. Shown only when the daemon reports
     // control metadata, so an older daemon's table is unchanged.
-    if !view.usage_controls.is_empty() {
+    let resets = layout.show_resets.then(|| {
         let label =
             super::view::reset_cell(view.usage_control(&account.id.0), account.credential_kind);
         // Unknown and "owned but not applicable now" are dimmed rather than
@@ -5282,14 +5669,541 @@ fn account_row<'a>(
         } else {
             Style::new()
         };
-        cells.push(Cell::from(Span::styled(label, style)));
+        Span::styled(label, style)
+    });
+    RowParts {
+        marker,
+        group: Span::styled(
+            group_label.to_uppercase(),
+            group_color(Some(group_label)).add_modifier(Modifier::BOLD),
+        ),
+        number: Span::styled(format!("{}", pos + 1), dim()),
+        name,
+        status: status_span(account, gate, is_current, params, now, ctx.frame),
+        five_h,
+        seven,
+        fable,
+        resets,
+        in_flight: in_flight_span(account.in_flight),
+        totals: layout.wide.then(|| {
+            (
+                format::human_count(totals.requests),
+                format::human_count(totals.tokens()),
+            )
+        }),
     }
-    cells.push(Cell::from(in_flight_span(account.in_flight)));
-    if wide {
-        cells.push(Cell::from(format::human_count(totals.requests)));
-        cells.push(Cell::from(format::human_count(totals.tokens())));
+}
+
+/// One accounts-table row from its [`RowParts`], cells in column order;
+/// the gauges are drawn as `bar_width`-column bars.
+fn account_row(parts: RowParts, bar_width: usize) -> Row<'static> {
+    let mut cells = vec![
+        Cell::from(parts.marker),
+        Cell::from(parts.group),
+        Cell::from(parts.number),
+        Cell::from(parts.name),
+        Cell::from(parts.status),
+    ];
+    cells.extend(parts.five_h.map(Cell::from));
+    cells.push(parts.seven.cell(bar_width));
+    cells.extend(parts.fable.map(|fable| fable.cell(bar_width)));
+    cells.extend(parts.resets.map(Cell::from));
+    cells.push(Cell::from(parts.in_flight));
+    if let Some((requests, tokens)) = parts.totals {
+        cells.push(Cell::from(requests));
+        cells.push(Cell::from(tokens));
     }
     Row::new(cells)
+}
+
+/// Blank cells between two fold entries on one line.
+const FOLD_ENTRY_GAP: usize = 3;
+
+/// What MAIN's fold (`z`) does this frame — decided in [`draw_main`] and
+/// stated in the accounts title, so the toggle never claims a fold that did
+/// not happen.
+enum Fold {
+    /// The toggle is off.
+    Off,
+    /// On, but no account is 7d-spent.
+    Nothing,
+    /// On, but no entry form fits: its title (`+N more` at its widest) or
+    /// not even one entry per line is wider than the pane.
+    TooNarrow,
+    /// On, but the block would not take fewer rows than its accounts' table
+    /// rows (rule A).
+    SavesNoRow,
+    Applied(FoldPlan),
+}
+
+impl Fold {
+    fn plan(&self) -> Option<&FoldPlan> {
+        match self {
+            Fold::Applied(plan) => Some(plan),
+            Fold::Off | Fold::Nothing | Fold::TooNarrow | Fold::SavesNoRow => None,
+        }
+    }
+
+    /// The accounts-title segment: the fold label when it applies
+    /// ([`spent_note`]), why not when it is on but does not apply, nothing
+    /// when it is off.
+    fn note(&self) -> String {
+        match self {
+            Fold::Off => String::new(),
+            Fold::Nothing => " · fold: nothing to fold".to_string(),
+            Fold::TooNarrow => " · fold: too narrow".to_string(),
+            Fold::SavesNoRow => " · fold: saves no row".to_string(),
+            Fold::Applied(plan) => spent_note(plan.members.len(), plan.shared_status.as_deref()),
+        }
+    }
+}
+
+/// The fold label in the accounts title: ` · 7d spent 9 folded: 7d 100.0% >
+/// 99%` with the status every member shares, ` · 7d spent 9 folded` when
+/// each entry carries its own.
+fn spent_note(count: usize, shared_status: Option<&str>) -> String {
+    match shared_status {
+        Some(status) => format!(" · 7d spent {count} folded: {status}"),
+        None => format!(" · 7d spent {count} folded"),
+    }
+}
+
+/// MAIN's fold of the 7d-spent accounts (`z`, owner decision 2026-10-22,
+/// "넣기, 기본 꺼짐") for one frame, decided in [`draw_main`] before the
+/// layout because the accounts pane's height depends on it. Members are the
+/// accounts the scheduler holds back for `SevenDayOverThreshold` — the ones
+/// whose status reads `7d N% > N%` — and only those: a `!` for any other
+/// reason (5h, Fable, auth) keeps its table row. Membership is recomputed
+/// every frame. Every value the member's table row shows stays on screen,
+/// as text (owner contract 2026-09: 기존에 보였던 모든 정보는 그대로).
+struct FoldPlan {
+    /// Display positions (`ctx.order` indices) of the folded accounts, in
+    /// table order.
+    members: Vec<usize>,
+    /// One entry per member, in table order: its table cells as fields.
+    entries: Vec<Vec<FoldField>>,
+    /// Index into `members` of the account under the cursor, if folded.
+    cursor: Option<usize>,
+    /// The status text every member shares, shown once in the accounts
+    /// title; `None` = the statuses differ, each entry has its own field.
+    shared_status: Option<String>,
+    /// Entries per line, and each entry column's field widths.
+    per_line: usize,
+    columns: Vec<Vec<usize>>,
+}
+
+impl FoldPlan {
+    /// Lines the block takes: the field header, then one line per
+    /// `per_line` entries.
+    fn lines(&self) -> usize {
+        1 + self.members.len().div_ceil(self.per_line)
+    }
+
+    /// Members the block cannot show when only its first `lines` lines fit
+    /// the pane.
+    fn hidden(&self, lines: usize) -> usize {
+        let shown = lines.saturating_sub(1).saturating_mul(self.per_line);
+        self.members.len().saturating_sub(shown)
+    }
+}
+
+/// One field of a fold entry: the header word over it, its alignment and
+/// the table cell's text.
+struct FoldField {
+    header: &'static str,
+    right: bool,
+    spans: Vec<Span<'static>>,
+    /// The widest form a clock tick can give this field ([`FoldBounds`]);
+    /// 0 for a field only a poll or an event can change.
+    min: usize,
+}
+
+impl FoldField {
+    /// Cells the field's column must hold for this entry: the live text,
+    /// or its widest clock-driven form when that is wider — so a value
+    /// past that form (a 100-day countdown) widens the column, never cut.
+    fn width(&self) -> usize {
+        self.spans
+            .iter()
+            .map(Span::width)
+            .sum::<usize>()
+            .max(self.min)
+    }
+}
+
+/// The widest form of each fold field the clock alone can change (rule B:
+/// a tick never moves the fold), formatted by the same code as the live
+/// text — PR-A's [`BOUND_SPANS`] idea:
+///
+/// - a gauge's reset text: the widest countdown below 100 days (or the
+///   absolute stamp under `t`) plus the display-state glyph a window gains
+///   when it goes stale or expires (`23h 59m ◑`);
+/// - the `5h` stub on a Claude row: its widest state `◑ 100%!` — the window
+///   expiring (`○ 100%`) or going stale (`◑ 70%`) needs no poll;
+/// - the Fbl percent: `100%!` — its window can expire without ending the
+///   account's 7d membership (the 7d percent cannot: expiry ends it).
+struct FoldBounds {
+    reset: usize,
+    five_h: usize,
+    percent: usize,
+}
+
+impl FoldBounds {
+    fn new(reset_absolute: bool, max_age: Duration) -> Self {
+        let now = bound_now();
+        let glyphs = [
+            WindowDisplayState::Cold,
+            WindowDisplayState::Stale,
+            WindowDisplayState::PollDegraded,
+        ];
+        let bar = |text: String, marker: Option<char>| GaugeParts::Bar {
+            fill: 1.0,
+            color: Color::Reset,
+            text,
+            bold_chars: 0,
+            over: true,
+            marker,
+        };
+        let cells = |spans: Vec<Span<'static>>| spans.iter().map(Span::width).sum::<usize>();
+        let reset = BOUND_SPANS
+            .into_iter()
+            .flat_map(|span| {
+                let window = QuotaWindow {
+                    utilization: 1.0,
+                    resets_at: now + span,
+                    fetched_at: now,
+                    source: crate::scheduler::window::WindowSource::Headers,
+                };
+                glyphs.map(|state| {
+                    let (text, _, _) = quota_bar_text(&window, now, state, reset_absolute);
+                    cells(bar(text, Some(state.glyph())).text_fields().0)
+                })
+            })
+            .max()
+            .unwrap_or(0);
+        let stale = QuotaWindow {
+            utilization: 1.0,
+            resets_at: now + BOUND_SPANS[0],
+            fetched_at: now - max_age - Duration::from_secs(1),
+            source: crate::scheduler::window::WindowSource::Headers,
+        };
+        let (five, _) = five_hour_text(
+            BackendGroup::Claude,
+            &Some(stale),
+            0.0,
+            false,
+            now,
+            max_age,
+            0,
+            crate::config::QuotaDisplay::Used,
+        );
+        Self {
+            reset,
+            five_h: Line::from(five).width(),
+            percent: cells(bar(String::new(), None).text_fields().1),
+        }
+    }
+}
+
+/// An account's fold entry: its table cells as fields, in column order —
+/// each gauge becomes its reset text and its percent label (marks and
+/// colors kept, only the fill bar goes), and the status field is left out
+/// when the label column shows the status every member shares.
+fn fold_fields(
+    parts: RowParts,
+    with_status: bool,
+    claude: bool,
+    bounds: &FoldBounds,
+) -> Vec<FoldField> {
+    let field = |header: &'static str, right: bool, spans: Vec<Span<'static>>| FoldField {
+        header,
+        right,
+        spans,
+        min: 0,
+    };
+    let bounded = |mut field: FoldField, min: usize| {
+        field.min = min;
+        field
+    };
+    // Only a drawn gauge has a countdown that ticks; a bare state (`○ cold`,
+    // `-`) changes on a poll.
+    let gauge = |gauge: &GaugeParts, reset: usize| match gauge {
+        GaugeParts::Bar { .. } => reset,
+        GaugeParts::Bare(_) => 0,
+    };
+    let mut fields = vec![
+        field("", false, vec![parts.marker]),
+        field("group", false, vec![parts.group]),
+        field("#", true, vec![parts.number]),
+        field("account", false, vec![parts.name]),
+    ];
+    if with_status {
+        fields.push(field("status", false, vec![parts.status]));
+    }
+    let five_h_min = if claude { bounds.five_h } else { 0 };
+    fields.extend(
+        parts
+            .five_h
+            .map(|five| bounded(field("5h", false, vec![five]), five_h_min)),
+    );
+    let (reset, percent) = parts.seven.text_fields();
+    let reset_min = gauge(&parts.seven, bounds.reset);
+    fields.push(bounded(field("7d RESET", false, reset), reset_min));
+    fields.push(field("7d", true, percent));
+    if let Some(fable) = parts.fable {
+        let (reset, percent) = fable.text_fields();
+        let (reset_min, percent_min) = (gauge(&fable, bounds.reset), gauge(&fable, bounds.percent));
+        fields.push(bounded(field("Fbl RESET", false, reset), reset_min));
+        fields.push(bounded(field("Fbl", true, percent), percent_min));
+    }
+    fields.extend(parts.resets.map(|resets| field("rst", false, vec![resets])));
+    fields.push(field("if", false, vec![parts.in_flight]));
+    if let Some((requests, tokens)) = parts.totals {
+        fields.push(field("req", false, vec![Span::raw(requests)]));
+        fields.push(field("tok", false, vec![Span::raw(tokens)]));
+    }
+    fields
+}
+
+/// Field widths per entry column when `per_line` entries share a line:
+/// column `c` holds entries `c`, `c + per_line`, …, and each of its fields
+/// is as wide as its widest entry or its header.
+fn fold_columns(widths: &[Vec<usize>], headers: &[usize], per_line: usize) -> Vec<Vec<usize>> {
+    (0..per_line)
+        .map(|c| {
+            headers
+                .iter()
+                .enumerate()
+                .map(|(f, &header)| {
+                    widths
+                        .iter()
+                        .skip(c)
+                        .step_by(per_line)
+                        .map(|w| w[f])
+                        .max()
+                        .unwrap_or(0)
+                        .max(header)
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Width of one entry: its fields and the one-cell gap between each pair.
+fn fold_entry_width(column: &[usize]) -> usize {
+    column.iter().sum::<usize>() + column.len().saturating_sub(1)
+}
+
+/// Width of a full fold line: the entries and the gaps between them.
+fn fold_line_width(columns: &[Vec<usize>]) -> usize {
+    columns.iter().map(|c| fold_entry_width(c)).sum::<usize>()
+        + FOLD_ENTRY_GAP * columns.len().saturating_sub(1)
+}
+
+/// The fold for this frame ([`Fold`]), planned with the table's own
+/// `layout` at the pane `width`:
+///
+/// 1. the shared form — the status every member shares shown once, in the
+///    accounts title — applies only if that whole title fits `width` in
+///    cells, with `+N more` at its widest (every account hidden), so the
+///    choice never depends on the pane height;
+/// 2. otherwise each entry carries its own status field, and that title
+///    must fit by the same measure — else the fold is too narrow;
+/// 3. entries per line = the most whose aligned line fits `width` (none →
+///    too narrow), every clock-driven field at its widest form
+///    ([`FoldBounds`], rule B), and the block must save a row (rule A —
+///    with one or two members it never does).
+fn fold_plan(
+    view: &DashboardView,
+    ctx: &FrameCtx,
+    chrome: &Chrome,
+    layout: &TableLayout,
+    width: u16,
+) -> Fold {
+    if !chrome.fold_exhausted {
+        return Fold::Off;
+    }
+    let snapshot = &view.snapshot;
+    let params = &view.select_params;
+    let spent = |pos: usize| {
+        let account = &snapshot.accounts[ctx.order[pos]];
+        (select::eligibility(account, params, ctx.now, ctx.headers_only)
+            == Some(IneligibleReason::SevenDayOverThreshold))
+        .then(|| {
+            select::blocking_reason(
+                account,
+                IneligibleReason::SevenDayOverThreshold,
+                params,
+                ctx.now,
+            )
+        })
+    };
+    let (members, reasons): (Vec<usize>, Vec<String>) = (0..ctx.order.len())
+        .filter_map(|pos| spent(pos).map(|reason| (pos, reason)))
+        .unzip();
+    let Some(first) = reasons.first() else {
+        return Fold::Nothing;
+    };
+    let title_fits = |status: Option<&str>| {
+        let title = accounts_title(
+            chrome.account_sort.label(),
+            view,
+            &ctx.order,
+            &spent_note(members.len(), status),
+            ctx.order.len(),
+        );
+        Line::from(title).width() <= usize::from(width)
+    };
+    // The status text as the scheduler words it — the table's animated
+    // glyph stays in the table.
+    let shared_status = reasons
+        .iter()
+        .all(|r| r == first)
+        .then(|| first.clone())
+        .filter(|status| title_fits(Some(status)));
+    if shared_status.is_none() && !title_fits(None) {
+        return Fold::TooNarrow;
+    }
+    let selected = cursor_pos(chrome, ctx.order.len());
+    let bounds = FoldBounds::new(ctx.reset_absolute, params.usage_max_age);
+    let entries: Vec<Vec<FoldField>> = members
+        .iter()
+        .map(|&pos| {
+            let account = &snapshot.accounts[ctx.order[pos]];
+            let parts = account_row_parts(account, view, ctx, pos, selected == Some(pos), layout);
+            let claude = account.group == BackendGroup::Claude;
+            fold_fields(parts, shared_status.is_none(), claude, &bounds)
+        })
+        .collect();
+    let widths: Vec<Vec<usize>> = entries
+        .iter()
+        .map(|entry| entry.iter().map(FoldField::width).collect())
+        .collect();
+    let headers: Vec<usize> = entries[0]
+        .iter()
+        .map(|f| Line::from(f.header).width())
+        .collect();
+    let Some((per_line, columns)) = (1..=members.len()).rev().find_map(|per_line| {
+        let columns = fold_columns(&widths, &headers, per_line);
+        (fold_line_width(&columns) <= usize::from(width)).then_some((per_line, columns))
+    }) else {
+        return Fold::TooNarrow;
+    };
+    // The fold never makes the pane taller (rule A): its header line plus
+    // its entry lines must take fewer rows than the members' table rows.
+    if 1 + members.len().div_ceil(per_line) >= members.len() {
+        return Fold::SavesNoRow;
+    }
+    Fold::Applied(FoldPlan {
+        cursor: members.iter().position(|&pos| selected == Some(pos)),
+        members,
+        entries,
+        shared_status,
+        per_line,
+        columns,
+    })
+}
+
+/// Lay one entry's (or the header's) fields out at the column widths, a
+/// one-cell gap between fields; `reversed` paints the whole entry the way
+/// the table paints the row under the cursor.
+fn fold_cells(
+    fields: impl Iterator<Item = (Vec<Span<'static>>, bool)>,
+    widths: &[usize],
+    reversed: bool,
+) -> Vec<Span<'static>> {
+    let paint = |style: Style| {
+        if reversed {
+            style.add_modifier(Modifier::REVERSED)
+        } else {
+            style
+        }
+    };
+    let blank = |n: usize| Span::styled(" ".repeat(n), paint(Style::new()));
+    let mut out = Vec::new();
+    for (f, ((spans, right), &width)) in fields.zip(widths).enumerate() {
+        if f > 0 {
+            out.push(blank(1));
+        }
+        let fill = width.saturating_sub(spans.iter().map(Span::width).sum());
+        if right && fill > 0 {
+            out.push(blank(fill));
+        }
+        out.extend(
+            spans
+                .into_iter()
+                .map(|span| Span::styled(span.content, paint(span.style))),
+        );
+        if !right && fill > 0 {
+            out.push(blank(fill));
+        }
+    }
+    out
+}
+
+/// Draw the fold block from row `top` down, from the table's left column
+/// (lines past the pane's bottom are cut, and counted in its title), and
+/// return a click target per visible entry, mapped to its account's display
+/// position.
+fn draw_fold(frame: &mut Frame, area: Rect, top: u16, fold: &FoldPlan) -> Vec<AccountRowHit> {
+    let gap = || Span::raw(" ".repeat(FOLD_ENTRY_GAP));
+    // Line 0: the dim field header over every entry column.
+    let mut header = Vec::new();
+    for (c, widths) in fold.columns.iter().enumerate() {
+        if c > 0 {
+            header.push(gap());
+        }
+        let fields = fold.entries[0]
+            .iter()
+            .map(|f| (vec![Span::styled(f.header, dim())], f.right));
+        header.extend(fold_cells(fields, widths, false));
+    }
+    let mut lines = vec![(Line::from(header), Vec::new())];
+    for (i, chunk) in fold.entries.chunks(fold.per_line).enumerate() {
+        let mut spans = Vec::new();
+        let mut x = 0;
+        let mut targets = Vec::new();
+        for (c, entry) in chunk.iter().enumerate() {
+            if c > 0 {
+                spans.push(gap());
+                x += FOLD_ENTRY_GAP;
+            }
+            let member = i * fold.per_line + c;
+            let fields = entry.iter().map(|f| (f.spans.clone(), f.right));
+            spans.extend(fold_cells(
+                fields,
+                &fold.columns[c],
+                fold.cursor == Some(member),
+            ));
+            let width = fold_entry_width(&fold.columns[c]);
+            targets.push((x, width, fold.members[member]));
+            x += width;
+        }
+        lines.push((Line::from(spans), targets));
+    }
+    let mut hits = Vec::new();
+    for (i, (line, targets)) in lines.into_iter().enumerate() {
+        let y = top.saturating_add(i as u16);
+        if y >= area.bottom() {
+            break;
+        }
+        let row = Rect {
+            y,
+            height: 1,
+            ..area
+        };
+        frame.render_widget(Paragraph::new(line), row);
+        hits.extend(targets.into_iter().map(|(x, width, pos)| AccountRowHit {
+            area: Rect {
+                x: area.x.saturating_add(x as u16),
+                y,
+                width: width as u16,
+                height: 1,
+            },
+            display_idx: pos,
+        }));
+    }
+    hits
 }
 
 /// Status column: active (green) / ready (default) / the concrete blocking
@@ -5385,9 +6299,10 @@ fn in_flight_span(in_flight: u32) -> Span<'static> {
 /// `text` overlaid centered on top. The first `bold_chars` characters of
 /// `text` (the larger countdown unit) are emboldened. Spans are split at the
 /// fill boundary so the fill shows behind the text — a single-style span
-/// could not paint a partial background. Only spaces + the caller's text are
-/// emitted (no bar glyphs), so the CJK narrow-width invariant guarded in
-/// `anim.rs` is untouched.
+/// could not paint a partial background. When four leading cells are available,
+/// `rst ` labels the reset without moving `text` or changing its styles. Only
+/// spaces + that label + the caller's text are emitted (no bar glyphs), so the
+/// CJK narrow-width invariant guarded in `anim.rs` is untouched.
 ///
 /// `marker` (issue #33 display-state glyph — ○ cold / ◑ stale / …) renders in
 /// the FIXED last bar column, independent of the centered `text`, so the
@@ -5414,6 +6329,8 @@ fn quota_bar_line(
             marker.unwrap_or(' ')
         } else if col >= start && col < start + text_len {
             chars[col - start]
+        } else if text_len > 0 && start >= 4 && col >= start - 4 && col < start {
+            ['r', 's', 't', ' '][col - (start - 4)]
         } else {
             ' '
         };
@@ -5535,8 +6452,11 @@ fn quota_cell_line(
 /// Issue #33: the cell still carries the [`WindowDisplayState`] so a
 /// never-used (`cold`), stale, or poll-degraded window is visibly distinct
 /// from an honest fresh value — render-only, derived from recorded state.
+///
+/// Returned as [`GaugeParts`]: the table draws them as the bar, MAIN's fold
+/// block writes the same values as text.
 #[allow(clippy::too_many_arguments)]
-fn window_gauge_cell(
+fn window_gauge_parts(
     window: &Option<QuotaWindow>,
     threshold: f64,
     parked: bool,
@@ -5545,13 +6465,12 @@ fn window_gauge_cell(
     consecutive_failures: u32,
     mode: crate::config::QuotaDisplay,
     reset_absolute: bool,
-    bar_width: usize,
-) -> Cell<'static> {
+) -> GaugeParts {
     let display = classify_window_display(window, now, max_age, consecutive_failures);
     let Some(window) = window else {
         // Cold (or poll-degraded with no window yet): show the state, not a bare
         // — that reads the same as "0% used".
-        return Cell::from(Span::styled(
+        return GaugeParts::Bare(Span::styled(
             format!("{} {}", display.glyph(), display.label()),
             dim(),
         ));
@@ -5566,9 +6485,80 @@ fn window_gauge_cell(
         crate::config::QuotaDisplay::Remaining => 1.0 - utilization,
     };
     let (text, bold_chars, marker) = quota_bar_text(window, now, display, reset_absolute);
-    Cell::from(quota_cell_line(
-        fill, color, &text, bold_chars, over, bar_width, marker,
-    ))
+    GaugeParts::Bar {
+        fill,
+        color,
+        text,
+        bold_chars,
+        over,
+        marker,
+    }
+}
+
+/// A quota gauge's content before it is drawn: a bare state text
+/// (`○ cold`, `-`), or a fill with its reset text, display-state marker and
+/// `!`-marked percent label.
+enum GaugeParts {
+    Bare(Span<'static>),
+    Bar {
+        fill: f64,
+        color: Color,
+        text: String,
+        bold_chars: usize,
+        over: bool,
+        marker: Option<char>,
+    },
+}
+
+impl GaugeParts {
+    /// The accounts-table cell: the in-bar gauge ([`quota_cell_line`]).
+    fn cell(self, bar_width: usize) -> Cell<'static> {
+        match self {
+            GaugeParts::Bare(span) => Cell::from(span),
+            GaugeParts::Bar {
+                fill,
+                color,
+                text,
+                bold_chars,
+                over,
+                marker,
+            } => Cell::from(quota_cell_line(
+                fill, color, &text, bold_chars, over, bar_width, marker,
+            )),
+        }
+    }
+
+    /// The same values as text, for MAIN's fold block: the reset field (the
+    /// bar's text with its bold first unit and its marker after it) and the
+    /// percent field — only the fill bar is gone. A bare state is the
+    /// reset field alone.
+    fn text_fields(&self) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
+        match self {
+            GaugeParts::Bare(span) => (vec![span.clone()], Vec::new()),
+            GaugeParts::Bar {
+                fill,
+                color,
+                text,
+                bold_chars,
+                over,
+                marker,
+            } => {
+                let style = Style::new().fg(*color);
+                let head: String = text.chars().take(*bold_chars).collect();
+                let tail: String = text.chars().skip(*bold_chars).collect();
+                let mut reset = vec![Span::styled(head, style.add_modifier(Modifier::BOLD))];
+                if !tail.is_empty() {
+                    reset.push(Span::styled(tail, style));
+                }
+                reset.extend(marker.map(|m| Span::styled(format!(" {m}"), style)));
+                let mut label = format::percent(*fill);
+                if *over {
+                    label.push('!');
+                }
+                (reset, vec![Span::styled(label, style)])
+            }
+        }
+    }
 }
 
 /// The `5h` cell (.prd/18, owner 2026-09-18): a Claude-only compact stub that
@@ -5623,31 +6613,6 @@ fn five_hour_text(
     (text, Style::new().fg(color))
 }
 
-/// [`five_hour_text`] as a table cell.
-#[allow(clippy::too_many_arguments)]
-fn five_hour_cell(
-    group: crate::routing::BackendGroup,
-    window: &Option<QuotaWindow>,
-    threshold: f64,
-    parked: bool,
-    now: SystemTime,
-    max_age: Duration,
-    consecutive_failures: u32,
-    mode: crate::config::QuotaDisplay,
-) -> Cell<'static> {
-    let (text, style) = five_hour_text(
-        group,
-        window,
-        threshold,
-        parked,
-        now,
-        max_age,
-        consecutive_failures,
-        mode,
-    );
-    Cell::from(Span::styled(text, style))
-}
-
 /// The model-scoped "Fable" weekly gauge cell (fable-usage U9a, W0 Q3),
 /// following the same pattern as [`window_cells`] but as a single cell (no
 /// paired reset column — W0 keeps the Fbl slot light) and with scope-aware
@@ -5681,7 +6646,7 @@ fn five_hour_cell(
 ///   7d gauge shows for an absent window, via [`classify_window_display`] —
 ///   never a crash or blank.
 #[allow(clippy::too_many_arguments)]
-fn fable_gauge_cell(
+fn fable_gauge_parts(
     group: crate::routing::BackendGroup,
     scoped: Option<&ScopedQuotaWindow>,
     now: SystemTime,
@@ -5690,12 +6655,11 @@ fn fable_gauge_cell(
     mode: crate::config::QuotaDisplay,
     reset_absolute: bool,
     fable_max: f64,
-    bar_width: usize,
-) -> Cell<'static> {
+) -> GaugeParts {
     // Claude-only, decided before any classification: a non-Claude row has no
     // Fable scope to ever populate, so it reads n/a rather than a cold gauge.
     if group != crate::routing::BackendGroup::Claude {
-        return Cell::from(Span::styled("-", dim()));
+        return GaugeParts::Bare(Span::styled("-", dim()));
     }
     let window = scoped.map(|s| s.window);
     let display = classify_window_display(&window, now, max_age, consecutive_failures);
@@ -5703,7 +6667,7 @@ fn fable_gauge_cell(
         // Cold / absent: mirror the `window_cells` absent branch — the glyph +
         // label — so a never-seen Fable window reads distinctly from an honest
         // 0%.
-        return Cell::from(Span::styled(
+        return GaugeParts::Bare(Span::styled(
             format!("{} {}", display.glyph(), display.label()),
             dim(),
         ));
@@ -5732,9 +6696,14 @@ fn fable_gauge_cell(
         crate::config::QuotaDisplay::Remaining => 1.0 - utilization,
     };
     let (text, bold_chars, marker) = quota_bar_text(&scoped.window, now, display, reset_absolute);
-    Cell::from(quota_cell_line(
-        fill, color, &text, bold_chars, over, bar_width, marker,
-    ))
+    GaugeParts::Bar {
+        fill,
+        color,
+        text,
+        bold_chars,
+        over,
+        marker,
+    }
 }
 
 /// Reset text for the detail pane: compact countdown plus the absolute local
@@ -5752,81 +6721,846 @@ fn reset_label(window: &QuotaWindow, now: SystemTime, tz_offset: i64) -> Option<
     ))
 }
 
+/// Height of today's middle row (top border + 7 content rows) — the fallback
+/// whenever the scheduler + detail band does not fit the frame.
+const MIDDLE_HEIGHT: u16 = 8;
+/// Rows the activity pane keeps (title + 3 entries) before the accounts pane
+/// gives way on a short terminal (owner mockup 2026-10-22, rule 1).
+const ACTIVITY_FLOOR: u16 = 4;
+/// Content rows of the scheduler + detail band (owner decision 2026-10-22):
+/// current · switch note · current · next · next · mode on the left, name ·
+/// token · 5h · 7d · life · poll on the right, one title row above them —
+/// 7 rows in all, whether or not a switch note is showing.
+const BAND_ROWS: u16 = 6;
+/// Cells between the band's left column and its detail column: a space and
+/// the `│` separator (the detail lines keep their own leading space).
+const BAND_SEP_W: usize = 2;
+/// Minimum `─` fill between two titles that share one border row.
+const TITLE_GAP: usize = 2;
+
+/// The middle row's plan for one frame, decided ONCE in [`draw_main`]
+/// (before the vertical layout, which needs its height): the summary and
+/// the selected-account detail as parts, plus the band geometry when the
+/// band fits. The fit is judged on [`band_width_bounds`] — cursor-driven and
+/// ticking fields at their widest form, event fields live — so the band
+/// does not come and go as ages tick or the cursor moves.
+struct MiddlePlan {
+    summary: SummaryParts,
+    detail: Option<DetailParts>,
+    band: Option<BandGeometry>,
+}
+
+impl MiddlePlan {
+    /// `rows` = content rows the band would get (its height minus the title
+    /// row): [`BAND_ROWS`] for the automatic height, the drag height minus
+    /// one under a drag override.
+    fn new(view: &DashboardView, ctx: &FrameCtx, chrome: &Chrome, width: u16, rows: usize) -> Self {
+        let summary = summary_parts(view, ctx);
+        let detail = detail_parts(view, ctx, chrome);
+        let band = detail.as_ref().and_then(|_| {
+            let selectable: Vec<DetailParts> = (0..ctx.order.len())
+                .filter_map(|pos| detail_parts_at(view, ctx, pos))
+                .collect();
+            let mut widths = band_width_bounds(view, rows);
+            widths.cover_live(&summary, &selectable, rows);
+            band_geometry(width, rows, &widths)
+        });
+        Self {
+            summary,
+            detail,
+            band,
+        }
+    }
+}
+
+/// Display widths the band must hold, for the fit decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BandWidths {
+    /// ` scheduler · poller … · totals … ` (the band's left title).
+    title: usize,
+    /// The same title without ` · totals …` (which then rides the mode row).
+    title_bare: usize,
+    /// Each left-column row, in row order (current · switch note · current ·
+    /// next · next · mode, then load · codex).
+    left: Vec<usize>,
+    /// Index of the `mode` row in `left`, and the width the
+    /// [`band_totals_segment`] adds to it when totals leave the title.
+    mode_row: usize,
+    totals_w: usize,
+    /// Detail lines 1–6 (name · token · 5h · 7d · life · poll), row-paired
+    /// with `left`.
+    right: Vec<usize>,
+}
+
+impl BandWidths {
+    /// Never under-estimate: raise every width to this frame's live text
+    /// when that is wider than its bound form — an age of 100 days or more,
+    /// a utilization past 999.9%, req/min past the floor. The layout then
+    /// changes once, when the value outgrows its bound, and nothing is cut.
+    /// The detail lines are raised over EVERY selectable account
+    /// (`details`), not just the selected one, so a cursor move never
+    /// changes the geometry.
+    fn cover_live(&mut self, summary: &SummaryParts, details: &[DetailParts], rows: usize) {
+        let raise = |widths: &mut Vec<usize>, lines: Vec<Line<'static>>| {
+            for (i, line) in lines.iter().enumerate() {
+                match widths.get_mut(i) {
+                    Some(w) => *w = (*w).max(line.width()),
+                    None => widths.push(line.width()),
+                }
+            }
+        };
+        raise(&mut self.left, band_left_lines(summary, rows));
+        for detail in details {
+            raise(&mut self.right, band_right_lines(detail));
+        }
+        let width = |spans: Vec<Span<'static>>| Line::from(spans).width();
+        self.title = self.title.max(width(band_title_spans_from(
+            &summary.poller,
+            Some(&summary.totals),
+        )));
+        self.title_bare = self
+            .title_bare
+            .max(width(band_title_spans_from(&summary.poller, None)));
+        self.totals_w = self
+            .totals_w
+            .max(width(band_totals_segment(&summary.totals)));
+    }
+}
+
+/// The band's right title (the poll text rides the detail column's sixth
+/// line).
+const BAND_DETAIL_TITLE: &str = " detail ";
+
+/// Where the band's pieces sit, relative to the band's left edge
+/// ("row-paired detail", owner decision 2026-10-22): row i shows left row i,
+/// then detail line i. Detail lines start at the block column `detail_x`
+/// (the widest of detail lines 2–6 flush with the right edge); a row whose
+/// left text reaches past `detail_x − 2` starts its detail line right after
+/// that text instead, with its own `│`. Every position comes from
+/// [`band_width_bounds`] (raised to live text where that is wider), so
+/// nothing moves while the cursor moves or ages tick inside their bounds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BandGeometry {
+    /// The detail block's column.
+    detail_x: usize,
+    /// Per detail row: the column its line starts at (`│` one cell before).
+    starts: Vec<usize>,
+    /// Bounded width of each left row (totals included when they moved).
+    left: Vec<usize>,
+    /// Column of the ` detail ` title on the border row: over the detail
+    /// block, or right after the left title when that runs longer.
+    detail_title_x: usize,
+    /// ` · totals …` left the title for the mode row (the title would not
+    /// fit with it).
+    totals_on_mode_row: bool,
+}
+
+impl BandGeometry {
+    /// Where a detail line `line_w` wide starts on a row whose left text is
+    /// at most `left_w`: at the block column when the left text clears it,
+    /// else right after the left text; never past the point where the line
+    /// would be cut (a line wider than the block starts left of it).
+    fn start(&self, left_w: usize, line_w: usize, width: usize) -> usize {
+        (left_w + BAND_SEP_W).max(self.detail_x.min(width.saturating_sub(line_w)))
+    }
+}
+
+/// The band fit decision (owner mockup 2026-10-22, rule 3; row-paired
+/// geometry), pure: the band applies only when every row holds its left
+/// text, the gap and its detail line without cutting, the detail lines fit
+/// the band's `rows`, and the title row holds both titles. When only the
+/// title is too long, ` · totals …` moves to the mode row and everything is
+/// checked again. `None` = render today's middle instead.
+fn band_geometry(width: u16, rows: usize, widths: &BandWidths) -> Option<BandGeometry> {
+    let width = usize::from(width);
+    let lines = widths.right.len();
+    if lines == 0 || lines > rows {
+        return None;
+    }
+    let block = widths.right[1..]
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(widths.right[0]);
+    let detail_x = width.checked_sub(block)?;
+    let attempt = |totals_on_mode_row: bool| -> Option<BandGeometry> {
+        let mut left = widths.left.clone();
+        if totals_on_mode_row {
+            *left.get_mut(widths.mode_row)? += widths.totals_w;
+        }
+        let mut geometry = BandGeometry {
+            detail_x,
+            starts: Vec::with_capacity(lines),
+            left,
+            detail_title_x: 0,
+            totals_on_mode_row,
+        };
+        for (i, &line) in widths.right.iter().enumerate() {
+            let left_w = geometry.left.get(i).copied().unwrap_or(0);
+            let start = geometry.start(left_w, line, width);
+            if start + line > width {
+                return None;
+            }
+            geometry.starts.push(start);
+        }
+        let title = if totals_on_mode_row {
+            widths.title_bare
+        } else {
+            widths.title
+        };
+        geometry.detail_title_x = detail_x.max(title + TITLE_GAP);
+        let detail_title = Line::from(BAND_DETAIL_TITLE).width();
+        (geometry.detail_title_x + detail_title <= width).then_some(geometry)
+    };
+    attempt(false).or_else(|| attempt(true))
+}
+
+/// Reference instant for [`band_width_bounds`]: every time field is
+/// formatted at an offset from it, so the bounds never read the clock. Any
+/// instant works — only the offsets matter, and `MM-DD` / `HH:MM` are
+/// zero-padded.
+fn bound_now() -> SystemTime {
+    UNIX_EPOCH + Duration::from_secs(1_700_000_000)
+}
+
+/// The spans [`band_width_bounds`] formats every countdown and age at: the
+/// widest value of each unit class `select::compact_duration` and
+/// `format::countdown` print below 100 days (`59m59s`, `23h59m`, `99d23h` —
+/// 6 cells; `countdown` adds a space). A span of 100 days or more gains a
+/// digit — the one assumption the bounds make about time.
+const BOUND_SPANS: [Duration; 3] = [
+    Duration::from_secs(59 * 60 + 59),
+    Duration::from_secs(23 * 3_600 + 59 * 60 + 59),
+    Duration::from_secs(99 * 86_400 + 23 * 3_600 + 59 * 60 + 59),
+];
+
+/// The statuses the detail line can show: eligible, or one of the reasons
+/// `select::eligibility` returns (select.rs `gate`, 147-193 at 7fddcc2 —
+/// the Fable reasons are scope-gated out of it).
+const DETAIL_GATES: [Option<IneligibleReason>; 7] = [
+    None,
+    Some(IneligibleReason::AuthUnhealthy),
+    Some(IneligibleReason::Paused),
+    Some(IneligibleReason::CoolingDown),
+    Some(IneligibleReason::FiveHourOverThreshold),
+    Some(IneligibleReason::SevenDayOverThreshold),
+    Some(IneligibleReason::UsageStale),
+];
+
+/// `select::compact_duration` of every span, widest first.
+fn widest_compact(spans: impl IntoIterator<Item = Duration>) -> String {
+    widest(spans.into_iter().map(select::compact_duration))
+}
+
+/// The widest (display cells) of `texts`; empty when there are none.
+fn widest(texts: impl IntoIterator<Item = String>) -> String {
+    texts
+        .into_iter()
+        .max_by_key(|t| Line::from(t.as_str()).width())
+        .unwrap_or_default()
+}
+
+/// No formatter bounds the `load` row's req/min: 9999.9 (6 cells) is assumed,
+/// and a busier proxy widens the bound by itself (max with the live value),
+/// so the row is never cut.
+const LOAD_RPM_FLOOR: f64 = 9_999.9;
+
+/// The widths the band must hold (owner policy 2026-10-22: no jump on a
+/// cursor move or a clock tick; a layout change on an event is fine, the
+/// visible content changes at that moment anyway). So the layout changes
+/// only on a width change, an account-set change, a scheduler event, or a
+/// count gaining a digit (err 999 → 1.0k) — plus once when a value
+/// outgrows its bound form ([`BandWidths::cover_live`]: a 100-day age):
+///
+/// - Bounded at their widest form — the frequent changers: everything the
+///   cursor moves through (the detail lines at their maximum over every
+///   account) and every ticking duration or clock stamp (ages, countdowns,
+///   expiry and refresh stamps, poller `last ok` / `next`, `eval in`,
+///   poll), formatted at [`BOUND_SPANS`] from [`bound_now`]. There is no
+///   `now` parameter, so no clock reading can reach the decision.
+/// - Live values — the event fields: the current and previous (`from`)
+///   ids, the switch reason and which group's row carries the switch note,
+///   the poller back-off list, the request/err/token counts, the account
+///   set. `next` (a scheduler pick) is bounded at its group's widest name.
+fn band_width_bounds(view: &DashboardView, rows: usize) -> BandWidths {
+    let now = bound_now();
+    let mask = view.email_anonymous;
+    let accounts = &view.snapshot.accounts;
+    let width = |line: Line<'static>| line.width();
+    let names = |group: Option<BackendGroup>| {
+        widest(
+            accounts
+                .iter()
+                .filter(|a| group.is_none_or(|g| a.group == g))
+                .map(|a| masked_name(&a.id.0, mask)),
+        )
+    };
+
+    // Left column: current · next per scheduler group, mode, load, codex.
+    let ago = widest_compact(BOUND_SPANS);
+    let tick = view.evaluate_tick.max(Duration::from_secs(1));
+    let eval_in = widest_compact(
+        BOUND_SPANS
+            .into_iter()
+            .chain([Duration::from_secs(59), tick])
+            .filter(|d| *d <= tick),
+    );
+    let groups = summary_groups(view);
+    // Current rows (live ids), then the switch-note row under the current
+    // row the last switch landed on — live from/reason, bounded age — or a
+    // blank row under the first current row before any switch, exactly as
+    // `summary_parts` lays out `band_head`.
+    let mut left: Vec<usize> = Vec::new();
+    let mut note: Option<(usize, usize)> = None;
+    if groups.is_empty() {
+        left.push(width(Line::from(vec![
+            summary_label("current"),
+            Span::raw("(none)"),
+        ])));
+    }
+    for (i, g) in groups.iter().enumerate() {
+        let current = view.snapshot.current_for_group(*g);
+        left.push(width(summary_current_line(
+            i == 0,
+            *g,
+            current.map(|c| masked_name(&c.0, mask)),
+            None,
+        )));
+        let switch =
+            current.and_then(|current| view.last_switch.as_ref().filter(|s| s.to == current.0));
+        if let Some(switch) = switch {
+            let from = switch.from.as_deref().map(|f| masked_name(f, mask));
+            let why = switch.reason.clone().unwrap_or_else(|| "switch".into());
+            note = Some((
+                left.len(),
+                width(summary_note_line(*g, from, why, ago.clone())),
+            ));
+        }
+    }
+    let (note_at, note_w) = note.unwrap_or((left.len().min(1), 0));
+    left.insert(note_at, note_w);
+    if groups.is_empty() {
+        left.push(width(Line::from(vec![
+            summary_label("next"),
+            Span::raw("—"),
+        ])));
+    }
+    for (i, g) in groups.iter().enumerate() {
+        left.push(width(summary_next_line(
+            i == 0,
+            *g,
+            Some(names(Some(*g))),
+            (i == 0).then(|| eval_in.clone()),
+        )));
+    }
+    let mode_row = left.len();
+    left.push(
+        [
+            crate::config::SchedulerMode::Default,
+            crate::config::SchedulerMode::RoundRobin,
+        ]
+        .into_iter()
+        .map(|m| width(summary_mode_line(m)))
+        .max()
+        .unwrap_or(0),
+    );
+    // The in-flight sum is a u32 (summary_parts), so u32::MAX is its widest.
+    left.push(width(summary_load_line(
+        view.rpm_5m.max(LOAD_RPM_FLOOR),
+        u64::from(u32::MAX),
+    )));
+    if view.codex.available {
+        let models = widest(
+            super::CODEX_MODELS
+                .iter()
+                .map(|m| m.to_string())
+                .chain([view.codex.model.clone()]),
+        );
+        let effort = widest(
+            super::CODEX_EFFORTS
+                .iter()
+                .map(|e| if e.is_empty() { "default" } else { e }.to_string())
+                .chain(view.codex.effort.clone()),
+        );
+        left.push(width(summary_codex_line(&models, false, &effort)));
+    }
+    left.truncate(rows);
+
+    // Detail column, over every account the cursor can select.
+    let Some(sample) = accounts.first() else {
+        return BandWidths {
+            title: 0,
+            title_bare: 0,
+            left,
+            mode_row,
+            totals_w: 0,
+            right: Vec::new(),
+        };
+    };
+    let params = &view.select_params;
+    let status = BOUND_SPANS
+        .into_iter()
+        .flat_map(|span| {
+            // Widest inputs: a 3-digit HTTP status, pause + auth together,
+            // a cooldown `span` out, a stale age of `span`, and an over-limit
+            // utilization of 999.9% (`effective_utilization` is unclamped;
+            // three integer digits are assumed) against a 100% ceiling.
+            let window = QuotaWindow {
+                utilization: 9.999,
+                resets_at: now + BOUND_SPANS[2],
+                fetched_at: now - span,
+                source: crate::scheduler::window::WindowSource::Headers,
+            };
+            let synthetic = AccountSnapshot {
+                auth_failure_status: Some(599),
+                paused: true,
+                cooldown_until: Some(now + span),
+                five_hour: Some(window),
+                seven_day: Some(window),
+                limits: crate::config::AccountLimits {
+                    five_hour_max: Some(1.0),
+                    seven_day_max: Some(1.0),
+                    fable_weekly_max: None,
+                    ..Default::default()
+                },
+                ..sample.clone()
+            };
+            DETAIL_GATES.into_iter().flat_map(move |gate| {
+                [true, false]
+                    .map(|current| status_span(&synthetic, gate, current, params, now, 0).width())
+            })
+        })
+        .max()
+        .unwrap_or(0);
+    // ` {id} · {kind} · order #{N} · {status}` — N at most the account count.
+    let order = format!(" · order #{} · ", accounts.len());
+    let first = accounts
+        .iter()
+        .map(|a| {
+            let mut spans = detail_name_spans(
+                masked_name(&a.id.0, mask),
+                a.credential_kind,
+                view.plans.get(&a.id.0).map(String::as_str),
+            );
+            spans.push(Span::raw(order.clone()));
+            Line::from(spans).width() + status
+        })
+        .max()
+        .unwrap_or(0);
+    // Accounts that can carry an access token: anthropic oauth, codex and
+    // gemini (scheduler/mod.rs `AccountSnapshot::token_expires_at_ms`).
+    let any_token = accounts.iter().any(|a| {
+        matches!(a.credential_kind, "oauth" | "codex" | "gemini") || a.token_expires_at_ms.is_some()
+    });
+    let ms = |t: SystemTime| {
+        t.duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64)
+    };
+    let mut token = width(detail_token_line(
+        &AccountSnapshot {
+            token_expires_at_ms: None,
+            ..sample.clone()
+        },
+        view.refresh_ahead,
+        now,
+        0,
+    ));
+    if any_token {
+        let expiries = BOUND_SPANS
+            .into_iter()
+            .map(|s| now + s)
+            .chain([now - Duration::from_secs(1)]);
+        for expires in expiries {
+            let refreshes = BOUND_SPANS
+                .into_iter()
+                .map(|s| Some(ms(now - s)))
+                .chain([None]);
+            for refreshed in refreshes {
+                let synthetic = AccountSnapshot {
+                    token_expires_at_ms: Some(ms(expires)),
+                    last_refresh_ms: refreshed,
+                    ..sample.clone()
+                };
+                token = token.max(width(detail_token_line(
+                    &synthetic,
+                    view.refresh_ahead,
+                    now,
+                    0,
+                )));
+            }
+        }
+    }
+    let windows = |name: &'static str| {
+        let mut observed: Vec<Option<QuotaWindow>> = vec![None];
+        for resets in BOUND_SPANS {
+            for age in BOUND_SPANS {
+                for source in [
+                    crate::scheduler::window::WindowSource::Headers,
+                    crate::scheduler::window::WindowSource::UsagePoll,
+                ] {
+                    observed.push(Some(QuotaWindow {
+                        utilization: 1.0,
+                        resets_at: now + resets,
+                        fetched_at: now - age,
+                        source,
+                    }));
+                }
+            }
+        }
+        observed
+            .iter()
+            .flat_map(|w| {
+                [0, 1].map(|failures| {
+                    width(window_detail_line_at(
+                        name,
+                        w,
+                        now,
+                        0,
+                        params.usage_max_age,
+                        failures,
+                    ))
+                })
+            })
+            .max()
+            .unwrap_or(0)
+    };
+    let life = accounts
+        .iter()
+        .map(|a| width(detail_life_line(view.totals_for(&a.id.0))))
+        .max()
+        .unwrap_or(0);
+    let mut right = vec![first, token, windows("5h"), windows("7d"), life];
+
+    // Title row: the poller text at its widest ages (live back-off entries),
+    // the live totals; the widest `poll` text over every account.
+    let polled = accounts
+        .iter()
+        .filter(|a| matches!(a.credential_kind, "oauth" | "grok"))
+        .count();
+    let poller = if polled == 0 {
+        "no polled accounts (header-driven only)".to_string()
+    } else {
+        let backoff = poller_backoff(view);
+        let mut texts = Vec::new();
+        for span in BOUND_SPANS {
+            let oks = [
+                None,
+                Some((span, span)),
+                Some((span - Duration::from_secs(1), span)),
+            ];
+            for ok in oks {
+                for next in [None, Some(span)] {
+                    texts.push(poller_text(polled, ok, next, &backoff));
+                }
+            }
+        }
+        widest(texts)
+    };
+    let totals = summary_totals_spans(view.global_totals);
+    let title = Line::from(band_title_spans_from(&poller, Some(&totals))).width();
+    let title_bare = Line::from(band_title_spans_from(&poller, None)).width();
+    let totals_w = Line::from(band_totals_segment(&totals)).width();
+    let poll = widest(accounts.iter().flat_map(|a| {
+        let failures = view
+            .poll_health(&a.id.0)
+            .map_or(0, |h| h.consecutive_failures);
+        let mut texts = vec![poll_text(None, a.credential_kind, now)];
+        for span in BOUND_SPANS {
+            for last_ok in [None, Some(now - span)] {
+                for next_at in [now + span, now - Duration::from_secs(1)] {
+                    texts.push(poll_text(
+                        Some(super::PollHealth {
+                            last_ok,
+                            consecutive_failures: failures,
+                            next_at,
+                        }),
+                        a.credential_kind,
+                        now,
+                    ));
+                }
+            }
+        }
+        texts
+    }));
+    right.push(width(detail_poll_line(&poll)));
+    BandWidths {
+        title,
+        title_bare,
+        left,
+        mode_row,
+        totals_w,
+        right,
+    }
+}
+
+/// The band's left title: today's `poller` and `totals` lines, word for
+/// word and style for style, joined with ` · `; `totals = None` leaves
+/// ` · totals …` for the mode row.
+fn band_title_spans_from(poller: &str, totals: Option<&[Span<'static>]>) -> Vec<Span<'static>> {
+    let mut spans = vec![
+        Span::raw(" scheduler · "),
+        Span::styled("poller ", dim()),
+        Span::raw(poller.to_string()),
+    ];
+    if let Some(totals) = totals {
+        spans.push(Span::raw(" · "));
+        spans.push(Span::styled("totals ", dim()));
+        spans.extend(totals.iter().cloned());
+    }
+    spans.push(Span::raw(" "));
+    spans
+}
+
+/// `   totals …` — the totals text as it rides the end of the mode row when
+/// the title has no room for it (same words and styles as in the title).
+fn band_totals_segment(totals: &[Span<'static>]) -> Vec<Span<'static>> {
+    let mut spans = vec![Span::raw("   "), Span::styled("totals ", dim())];
+    spans.extend(totals.iter().cloned());
+    spans
+}
+
+/// The band's left column: every summary line except poller/totals (those
+/// ride the title), in today's order, as many as the band has rows.
+fn band_left_lines(summary: &SummaryParts, rows: usize) -> Vec<Line<'static>> {
+    summary
+        .band_head
+        .iter()
+        .chain(&summary.tail)
+        .take(rows)
+        .cloned()
+        .collect()
+}
+
+/// The band's detail column: today's seven detail-pane lines in six rows —
+/// name · kind · order · status merged on the first, then token, 5h, 7d,
+/// life and poll.
+fn band_right_lines(detail: &DetailParts) -> Vec<Line<'static>> {
+    let mut first = detail.name.clone();
+    first.push(Span::raw(" · "));
+    first.extend(detail.order_spans());
+    vec![
+        Line::from(first),
+        detail.token.clone(),
+        detail.five.clone(),
+        detail.seven.clone(),
+        detail.life.clone(),
+        detail_poll_line(&detail.poll),
+    ]
+}
+
+/// ` poll  {text}` — the detail pane's poll row.
+fn detail_poll_line(poll: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(" poll  ", dim()),
+        Span::raw(poll.to_string()),
+    ])
+}
+
 /// Middle row: scheduler/poller/totals summary, with the selected-account
 /// detail pane beside it when there is room. The old `d` toggle is gone (issue
 /// #5): on MAIN the detail rides alongside the summary whenever the width
 /// allows, and the Accounts overlay (`a`) gives detail the full-width slot.
-fn draw_middle(
-    frame: &mut Frame,
-    area: Rect,
-    view: &DashboardView,
-    ctx: &FrameCtx,
-    chrome: &Chrome,
-) {
+/// When the plan carries a band geometry, the two panes recompose into the
+/// scheduler + detail band instead ([`draw_band`]).
+fn draw_middle(frame: &mut Frame, area: Rect, view: &DashboardView, plan: &MiddlePlan) {
+    if let (Some(geometry), Some(detail)) = (plan.band.as_ref(), plan.detail.as_ref()) {
+        draw_band(frame, area, &plan.summary, detail, geometry);
+        return;
+    }
     let has_accounts = !view.snapshot.accounts.is_empty();
     if has_accounts && area.width >= SIDE_BY_SIDE_AT {
         let [summary_area, detail_area] =
             Layout::horizontal([Constraint::Fill(1), Constraint::Length(48)]).areas(area);
-        draw_summary(frame, summary_area, view, ctx);
-        draw_detail(frame, detail_area, view, ctx, chrome);
+        draw_summary(frame, summary_area, &plan.summary);
+        if let Some(detail) = &plan.detail {
+            draw_detail_parts(frame, detail_area, detail);
+        }
     } else {
         // Too narrow for both (or no accounts): MAIN shows the summary; the
         // full detail is one keystroke away in the Accounts overlay.
-        draw_summary(frame, area, view, ctx);
+        draw_summary(frame, area, &plan.summary);
     }
 }
 
+/// The scheduler + detail band: one border row carrying both titles, then
+/// [`BAND_ROWS`] rows, each its left text, `│` and its detail line at the
+/// columns the geometry fixed. A band dragged taller than that also shows
+/// the detail `reset` line (clipped by today's 7-row pane) in its seventh
+/// row, when that line fits this frame — it never moves the layout.
+fn draw_band(
+    frame: &mut Frame,
+    area: Rect,
+    summary: &SummaryParts,
+    detail: &DetailParts,
+    geometry: &BandGeometry,
+) {
+    if area.height == 0 {
+        return;
+    }
+    let rows = usize::from(area.height - 1);
+    let width = usize::from(area.width);
+    let mut title = band_title_spans_from(
+        &summary.poller,
+        (!geometry.totals_on_mode_row).then_some(summary.totals.as_slice()),
+    );
+    let title_w = Line::from(title.clone()).width();
+    title.push(Span::raw(
+        "─".repeat(geometry.detail_title_x.saturating_sub(title_w)),
+    ));
+    let detail_title_w = Line::from(BAND_DETAIL_TITLE).width();
+    title.push(Span::raw(BAND_DETAIL_TITLE));
+    title.push(Span::raw("─".repeat(
+        width.saturating_sub(geometry.detail_title_x + detail_title_w),
+    )));
+    frame.render_widget(
+        Paragraph::new(Line::from(title)),
+        Rect { height: 1, ..area },
+    );
+    let mut left = band_left_lines(summary, rows);
+    if geometry.totals_on_mode_row {
+        if let Some(mode) = left.get_mut(summary.band_head.len().saturating_sub(1)) {
+            mode.spans.extend(band_totals_segment(&summary.totals));
+        }
+    }
+    let mut right: Vec<(usize, Line<'static>)> = band_right_lines(detail)
+        .into_iter()
+        .zip(geometry.starts.iter().copied())
+        .map(|(line, start)| (start, line))
+        .collect();
+    for extra in detail.auth.iter().chain(detail.reset.iter()) {
+        if rows <= right.len() {
+            break;
+        }
+        let left_w = geometry.left.get(right.len()).copied().unwrap_or(0);
+        let start = geometry.start(left_w, extra.width(), width);
+        if start + extra.width() <= width {
+            right.push((start, extra.clone()));
+        }
+    }
+    for row in 0..rows {
+        let y = area.y + 1 + row as u16;
+        let paired = right.get(row).map(|(start, _)| *start);
+        // A row with no detail line keeps the block's `│` when it clears it.
+        let bar = paired.or_else(|| {
+            let left_w = geometry.left.get(row).copied().unwrap_or(0);
+            (left_w + BAND_SEP_W <= geometry.detail_x).then_some(geometry.detail_x)
+        });
+        let left_w = bar.map_or(width, |start| start - 1);
+        if let Some(line) = left.get(row) {
+            frame.render_widget(
+                Paragraph::new(line.clone()),
+                Rect::new(area.x, y, left_w as u16, 1),
+            );
+        }
+        if let Some(start) = bar {
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled("│", dim()))),
+                Rect::new(area.x + start as u16 - 1, y, 1, 1),
+            );
+        }
+        if let Some((start, line)) = right.get(row) {
+            frame.render_widget(
+                Paragraph::new(line.clone()),
+                Rect::new(area.x + *start as u16, y, (width - start) as u16, 1),
+            );
+        }
+    }
+}
+
+/// " current  " — the summary's dim, 9-wide row label.
+fn summary_label(text: &'static str) -> Span<'static> {
+    Span::styled(format!(" {text:<9}"), dim())
+}
+
+/// The scheduler summary's content, split by where MAIN may put it: the
+/// `poller` and `totals` values ride the band's title row; `head` and
+/// `tail` fill a column. Today's pane prints them in the order head ·
+/// poller · totals · tail ([`draw_summary`]).
+struct SummaryParts {
+    /// current (per group) · next (per group) · mode.
+    head: Vec<Line<'static>>,
+    /// The band's form of `head`: the switch note on its own row right under
+    /// the current row it belongs to (a blank row under the first current
+    /// row before any switch), so the band keeps one height.
+    band_head: Vec<Line<'static>>,
+    /// The `poller` row's value text.
+    poller: String,
+    /// The `totals` row's value spans.
+    totals: Vec<Span<'static>>,
+    /// load · codex settings (when a codex account exists).
+    tail: Vec<Line<'static>>,
+}
+
 /// Scheduler / poller / totals summary pane.
-fn draw_summary(frame: &mut Frame, area: Rect, view: &DashboardView, ctx: &FrameCtx) {
+fn draw_summary(frame: &mut Frame, area: Rect, parts: &SummaryParts) {
+    let mut lines: Vec<Line> = parts.head.clone();
+    lines.push(Line::from(vec![
+        summary_label("poller"),
+        Span::raw(parts.poller.clone()),
+    ]));
+    let mut totals = vec![summary_label("totals")];
+    totals.extend(parts.totals.iter().cloned());
+    lines.push(Line::from(totals));
+    lines.extend(parts.tail.iter().cloned());
+    let block = Block::new().borders(Borders::TOP).title(" scheduler ");
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// Build the scheduler summary's parts (see [`SummaryParts`]).
+fn summary_parts(view: &DashboardView, ctx: &FrameCtx) -> SummaryParts {
     let snapshot = &view.snapshot;
     let now = ctx.now;
-    let label = |text: &'static str| Span::styled(format!(" {text:<9}"), dim());
-    let mut lines: Vec<Line> = Vec::with_capacity(6);
+    let label = summary_label;
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(6);
 
     // Per-group current subscription (req1): claude and codex pick their
     // current account INDEPENDENTLY, so show one line per group present.
-    let groups_present: Vec<BackendGroup> = [BackendGroup::Claude, BackendGroup::Codex]
-        .into_iter()
-        .filter(|g| snapshot.accounts.iter().any(|a| a.group == *g))
-        .collect();
+    let groups_present = summary_groups(view);
+    let mut band_head: Vec<Line<'static>> = Vec::with_capacity(7);
+    let mut note_row: Option<(usize, Line<'static>)> = None;
     if groups_present.is_empty() {
         lines.push(Line::from(vec![
             label("current"),
             Span::styled("(none)", Style::new().fg(Color::Red)),
         ]));
+        band_head.extend(lines.iter().cloned());
     }
     for (i, g) in groups_present.iter().enumerate() {
-        let mut spans = vec![
-            label(if i == 0 { "current" } else { "" }),
-            Span::styled(
-                format!("{:<7}", g.as_str()),
-                group_color(Some(g.as_str())).add_modifier(Modifier::BOLD),
-            ),
-        ];
-        match snapshot.current_for_group(*g) {
-            Some(current) => {
-                spans.push(Span::styled(
-                    masked_name(&current.0, ctx.mask),
-                    Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
-                ));
-                if let Some(switch) = view.last_switch.as_ref().filter(|s| s.to == current.0) {
+        let current = snapshot.current_for_group(*g);
+        let switch = current.and_then(|current| {
+            view.last_switch
+                .as_ref()
+                .filter(|s| s.to == current.0)
+                .map(|switch| {
                     let ago = now
                         .duration_since(switch.at)
                         .map(select::compact_duration)
                         .unwrap_or_else(|_| "0s".into());
-                    let why = switch.reason.as_deref().unwrap_or("switch");
-                    let from = switch
-                        .from
-                        .as_deref()
-                        .map(|f| format!("{} → ", masked_name(f, ctx.mask)))
-                        .unwrap_or_default();
-                    spans.push(Span::styled(format!("  {from}{why}, {ago} ago"), dim()));
-                }
-            }
-            None => spans.push(Span::styled("(none)", Style::new().fg(Color::Red))),
+                    let why = switch.reason.clone().unwrap_or_else(|| "switch".into());
+                    let from = switch.from.as_deref().map(|f| masked_name(f, ctx.mask));
+                    (from, why, ago)
+                })
+        });
+        let current = current.map(|c| masked_name(&c.0, ctx.mask));
+        lines.push(summary_current_line(
+            i == 0,
+            *g,
+            current.clone(),
+            switch.clone(),
+        ));
+        band_head.push(summary_current_line(i == 0, *g, current, None));
+        if let Some((from, why, ago)) = switch {
+            note_row = Some((band_head.len(), summary_note_line(*g, from, why, ago)));
         }
-        lines.push(Line::from(spans));
     }
+    let note_at = note_row
+        .as_ref()
+        .map_or(band_head.len().min(1), |(at, _)| *at);
+    band_head.insert(
+        note_at,
+        note_row.map_or_else(Line::default, |(_, line)| line),
+    );
+    let current_rows = lines.len();
 
     // Per-group next-in-line (req1 symmetry with the current block) + the
     // shared eval-tick countdown. One tick re-evaluates every group, so the
@@ -5838,53 +7572,48 @@ fn draw_summary(frame: &mut Frame, area: Rect, view: &DashboardView, ctx: &Frame
     }
     for (i, g) in groups_present.iter().enumerate() {
         let next = select::next_in_line(snapshot, &view.select_params, now, Some(*g));
-        let mut spans = vec![
-            label(if i == 0 { "next" } else { "" }),
-            Span::styled(
-                format!("{:<7}", g.as_str()),
-                group_color(Some(g.as_str())).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(
-                next.map(|n| masked_name(&n.0, ctx.mask))
-                    .unwrap_or_else(|| "—".into()),
-            ),
-        ];
-        if i == 0 {
-            spans.push(Span::styled(
-                format!(
-                    "  eval in ~{}",
-                    select::compact_duration(Duration::from_secs(to_next_eval))
-                ),
-                dim(),
-            ));
-        }
-        lines.push(Line::from(spans));
+        lines.push(summary_next_line(
+            i == 0,
+            *g,
+            next.map(|n| masked_name(&n.0, ctx.mask)),
+            (i == 0).then(|| select::compact_duration(Duration::from_secs(to_next_eval))),
+        ));
     }
 
-    // Scheduler mode line (S toggles): round-robin reads emphasized — it is
-    // the "you asked for minimal switching" state worth noticing at a glance.
-    let mode = view.select_params.mode;
-    lines.push(Line::from(vec![
-        label("mode"),
-        Span::styled(
-            mode.label().to_string(),
-            if mode == crate::config::SchedulerMode::RoundRobin {
-                Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
-            } else {
-                Style::new()
-            },
-        ),
-        Span::styled("   [S switch]", dim()),
-    ]));
+    lines.push(summary_mode_line(view.select_params.mode));
+    band_head.extend(lines[current_rows..].iter().cloned());
+    let head = std::mem::take(&mut lines);
 
-    lines.push(Line::from(vec![
-        label("poller"),
-        Span::raw(poller_summary(view, now)),
-    ]));
+    let poller = poller_summary(view, now);
 
-    let totals = view.global_totals;
-    lines.push(Line::from(vec![
-        label("totals"),
+    let totals = summary_totals_spans(view.global_totals);
+
+    let in_flight: u32 = snapshot.accounts.iter().map(|a| a.in_flight).sum();
+    lines.push(summary_load_line(view.rpm_5m, u64::from(in_flight)));
+
+    // Codex group settings (req8.1): model / fast tier / reasoning effort, with
+    // the keys that change them. Only when a codex account exists.
+    if view.codex.available {
+        let c = &view.codex;
+        lines.push(summary_codex_line(
+            &c.model,
+            c.fast,
+            c.effort.as_deref().unwrap_or("default"),
+        ));
+    }
+
+    SummaryParts {
+        head,
+        band_head,
+        poller,
+        totals,
+        tail: lines,
+    }
+}
+
+/// The `totals` row's value spans.
+fn summary_totals_spans(totals: super::activity::Totals) -> Vec<Span<'static>> {
+    vec![
         Span::raw(format!("{} req · ", format::human_count(totals.requests))),
         Span::styled(
             format!("{} ok", format::human_count(totals.ok)),
@@ -5904,42 +7633,132 @@ fn draw_summary(frame: &mut Frame, area: Rect, view: &DashboardView, ctx: &Frame
             format::human_count(totals.tokens_in),
             format::human_count(totals.tokens_out)
         )),
-    ]));
+    ]
+}
 
-    let in_flight: u32 = snapshot.accounts.iter().map(|a| a.in_flight).sum();
-    lines.push(Line::from(vec![
-        label("load"),
-        Span::raw(format!(
-            "{:.1} req/min (5m) · {in_flight} in flight",
-            view.rpm_5m
-        )),
-    ]));
+/// The scheduler groups with a `current`/`next` row: claude and codex, when
+/// the pool has accounts in them.
+fn summary_groups(view: &DashboardView) -> Vec<BackendGroup> {
+    [BackendGroup::Claude, BackendGroup::Codex]
+        .into_iter()
+        .filter(|g| view.snapshot.accounts.iter().any(|a| a.group == *g))
+        .collect()
+}
 
-    // Codex group settings (req8.1): model / fast tier / reasoning effort, with
-    // the keys that change them. Only when a codex account exists.
-    if view.codex.available {
-        let c = &view.codex;
-        let fast_style = if c.fast {
-            Style::new().fg(Color::Green).add_modifier(Modifier::BOLD)
-        } else {
-            dim()
-        };
-        lines.push(Line::from(vec![
-            label("codex"),
-            Span::styled(
-                c.model.clone(),
-                group_color(Some("codex")).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" · fast "),
-            Span::styled(if c.fast { "on" } else { "off" }, fast_style),
-            Span::raw(" · effort "),
-            Span::raw(c.effort.clone().unwrap_or_else(|| "default".into())),
-            Span::styled("   [f fast · m model · e effort]", dim()),
-        ]));
+/// The bold group-colored `{group:<7}` cell of a current/next row.
+fn summary_group_span(group: BackendGroup) -> Span<'static> {
+    Span::styled(
+        format!("{:<7}", group.as_str()),
+        group_color(Some(group.as_str())).add_modifier(Modifier::BOLD),
+    )
+}
+
+/// One `current` row: the group's current account (`(none)` in red) and,
+/// when the last switch landed on it, `  {from} → {why}, {ago} ago`.
+fn summary_current_line(
+    first: bool,
+    group: BackendGroup,
+    current: Option<String>,
+    switch: Option<(Option<String>, String, String)>,
+) -> Line<'static> {
+    let mut spans = vec![
+        summary_label(if first { "current" } else { "" }),
+        summary_group_span(group),
+    ];
+    match current {
+        Some(current) => {
+            spans.push(Span::styled(
+                current,
+                Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
+            ));
+            if let Some((from, why, ago)) = switch {
+                let from = from.map(|f| format!("{f} → ")).unwrap_or_default();
+                spans.push(Span::styled(format!("  {from}{why}, {ago} ago"), dim()));
+            }
+        }
+        None => spans.push(Span::styled("(none)", Style::new().fg(Color::Red))),
     }
+    Line::from(spans)
+}
 
-    let block = Block::new().borders(Borders::TOP).title(" scheduler ");
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+/// The band's switch-note row: `{from} → {why}, {ago} ago` (dim, the text
+/// `summary_current_line` appends inline) starting in the id column of the
+/// current row above it.
+fn summary_note_line(
+    group: BackendGroup,
+    from: Option<String>,
+    why: String,
+    ago: String,
+) -> Line<'static> {
+    let indent = Line::from(vec![summary_label(""), summary_group_span(group)]).width();
+    let from = from.map(|f| format!("{f} → ")).unwrap_or_default();
+    Line::from(vec![
+        Span::raw(" ".repeat(indent)),
+        Span::styled(format!("{from}{why}, {ago} ago"), dim()),
+    ])
+}
+
+/// One `next` row: the group's next-in-line account (`—` when none) and, on
+/// the first row only, the shared `  eval in ~{eta}` countdown.
+fn summary_next_line(
+    first: bool,
+    group: BackendGroup,
+    next: Option<String>,
+    eval_in: Option<String>,
+) -> Line<'static> {
+    let mut spans = vec![
+        summary_label(if first { "next" } else { "" }),
+        summary_group_span(group),
+        Span::raw(next.unwrap_or_else(|| "—".into())),
+    ];
+    if let Some(eta) = eval_in {
+        spans.push(Span::styled(format!("  eval in ~{eta}"), dim()));
+    }
+    Line::from(spans)
+}
+
+/// Scheduler mode line (S toggles): round-robin reads emphasized — it is
+/// the "you asked for minimal switching" state worth noticing at a glance.
+fn summary_mode_line(mode: crate::config::SchedulerMode) -> Line<'static> {
+    Line::from(vec![
+        summary_label("mode"),
+        Span::styled(
+            mode.label().to_string(),
+            if mode == crate::config::SchedulerMode::RoundRobin {
+                Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+            } else {
+                Style::new()
+            },
+        ),
+        Span::styled("   [S switch]", dim()),
+    ])
+}
+
+fn summary_load_line(rpm_5m: f64, in_flight: u64) -> Line<'static> {
+    Line::from(vec![
+        summary_label("load"),
+        Span::raw(format!("{rpm_5m:.1} req/min (5m) · {in_flight} in flight")),
+    ])
+}
+
+fn summary_codex_line(model: &str, fast: bool, effort: &str) -> Line<'static> {
+    let fast_style = if fast {
+        Style::new().fg(Color::Green).add_modifier(Modifier::BOLD)
+    } else {
+        dim()
+    };
+    Line::from(vec![
+        summary_label("codex"),
+        Span::styled(
+            model.to_string(),
+            group_color(Some("codex")).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" · fast "),
+        Span::styled(if fast { "on" } else { "off" }, fast_style),
+        Span::raw(" · effort "),
+        Span::raw(effort.to_string()),
+        Span::styled("   [f fast · m model · e effort]", dim()),
+    ])
 }
 
 /// One-line usage-poller health: polled-account count (oauth's
@@ -5958,7 +7777,6 @@ fn poller_summary(view: &DashboardView, now: SystemTime) -> String {
     }
     let mut ok_ages: Vec<Duration> = Vec::new();
     let mut next_in: Option<Duration> = None;
-    let mut backoff: Vec<String> = Vec::new();
     for account in &polled {
         let Some(health) = view.poll_health(&account.id.0) else {
             continue;
@@ -5969,33 +7787,59 @@ fn poller_summary(view: &DashboardView, now: SystemTime) -> String {
         if let Ok(eta) = health.next_at.duration_since(now) {
             next_in = Some(next_in.map_or(eta, |cur| cur.min(eta)));
         }
-        if health.consecutive_failures > 0 {
-            backoff.push(format!(
-                "{}×{}",
-                masked_name(&account.id.0, view.email_anonymous),
-                health.consecutive_failures
-            ));
+    }
+    let ok = ok_ages
+        .iter()
+        .min()
+        .zip(ok_ages.iter().max())
+        .map(|(min, max)| (*min, *max));
+    poller_text(polled.len(), ok, next_in, &poller_backoff(view))
+}
+
+/// The `{name}×{failures}` entries of every polled (oauth/grok) account whose usage poll
+/// is currently failing.
+fn poller_backoff(view: &DashboardView) -> Vec<String> {
+    view.snapshot
+        .accounts
+        .iter()
+        .filter(|a| matches!(a.credential_kind, "oauth" | "grok"))
+        .filter_map(|account| {
+            let health = view.poll_health(&account.id.0)?;
+            (health.consecutive_failures > 0).then(|| {
+                format!(
+                    "{}×{}",
+                    masked_name(&account.id.0, view.email_anonymous),
+                    health.consecutive_failures
+                )
+            })
+        })
+        .collect()
+}
+
+/// [`poller_summary`]'s text from its inputs: `ok` = (youngest, oldest)
+/// last-success age, `next_in` = soonest next poll.
+fn poller_text(
+    polled: usize,
+    ok: Option<(Duration, Duration)>,
+    next_in: Option<Duration>,
+    backoff: &[String],
+) -> String {
+    if ok.is_none() && backoff.is_empty() {
+        return format!("{polled} accts · warming up");
+    }
+    let mut out = format!("{polled} accts");
+    match ok {
+        Some((min, max)) if min == max => {
+            out.push_str(&format!(" · last ok {} ago", select::compact_duration(min)));
         }
-    }
-    if ok_ages.is_empty() && backoff.is_empty() {
-        return format!("{} polled · warming up", polled.len());
-    }
-    let mut out = format!("{} polled", polled.len());
-    if let (Some(min), Some(max)) = (ok_ages.iter().min(), ok_ages.iter().max()) {
-        if min == max {
-            out.push_str(&format!(
-                " · last ok {} ago",
-                select::compact_duration(*min)
-            ));
-        } else {
+        Some((min, max)) => {
             out.push_str(&format!(
                 " · last ok {}–{} ago",
-                select::compact_duration(*min),
-                select::compact_duration(*max)
+                select::compact_duration(min),
+                select::compact_duration(max)
             ));
         }
-    } else {
-        out.push_str(" · no successful poll yet");
+        None => out.push_str(" · no successful poll yet"),
     }
     if let Some(eta) = next_in {
         out.push_str(&format!(" · next ~{}", select::compact_duration(eta)));
@@ -6015,6 +7859,67 @@ fn draw_detail(
     ctx: &FrameCtx,
     chrome: &Chrome,
 ) {
+    if let Some(parts) = detail_parts(view, ctx, chrome) {
+        draw_detail_parts(frame, area, &parts);
+    }
+}
+
+/// The detail pane's content as parts, so MAIN's band can re-wrap the same
+/// spans into six rows ([`band_right_lines`]) while the pane keeps today's
+/// eight ([`draw_detail_parts`]).
+struct DetailParts {
+    /// ` {id}` bold + ` · {kind}` dim.
+    name: Vec<Span<'static>>,
+    /// 1-based position in the display order.
+    order_no: usize,
+    /// The eligibility / activity status span.
+    status: Span<'static>,
+    token: Line<'static>,
+    five: Line<'static>,
+    seven: Line<'static>,
+    life: Line<'static>,
+    /// The `poll` row's value text.
+    poll: String,
+    /// The reset-inventory row, once the daemon reports usage controls.
+    reset: Option<Line<'static>>,
+    auth: Vec<Line<'static>>,
+}
+
+impl DetailParts {
+    /// `order #N · {status}` (no leading space).
+    fn order_spans(&self) -> Vec<Span<'static>> {
+        vec![
+            Span::styled(format!("order #{}", self.order_no), Style::new()),
+            Span::raw(" · "),
+            self.status.clone(),
+        ]
+    }
+}
+
+/// Today's detail pane, line for line.
+fn draw_detail_parts(frame: &mut Frame, area: Rect, parts: &DetailParts) {
+    let mut order = vec![Span::raw(" ")];
+    order.extend(parts.order_spans());
+    let mut lines: Vec<Line> = vec![
+        Line::from(parts.name.clone()),
+        Line::from(order),
+        parts.token.clone(),
+        parts.five.clone(),
+        parts.seven.clone(),
+        parts.life.clone(),
+        detail_poll_line(&parts.poll),
+    ];
+    lines.extend(parts.auth.clone());
+    lines.extend(parts.reset.clone());
+    let block = Block::new()
+        .borders(Borders::TOP)
+        .title(" detail · h / click account: full history ");
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// Build the selected account's [`DetailParts`]; `None` when the order is
+/// empty (no account to show).
+fn detail_parts(view: &DashboardView, ctx: &FrameCtx, chrome: &Chrome) -> Option<DetailParts> {
     let snapshot = &view.snapshot;
     let pos = match chrome.mode {
         Mode::Select { idx }
@@ -6036,56 +7941,126 @@ fn draw_detail(
             })
             .unwrap_or(0),
     };
-    let Some(account) = ctx.order.get(pos).map(|&i| &snapshot.accounts[i]) else {
-        return;
-    };
+    detail_parts_at(view, ctx, pos)
+}
+
+/// [`DetailParts`] of the account at display position `pos`; `None` past
+/// the end of the order.
+fn detail_parts_at(view: &DashboardView, ctx: &FrameCtx, pos: usize) -> Option<DetailParts> {
+    let snapshot = &view.snapshot;
+    let account = ctx.order.get(pos).map(|&i| &snapshot.accounts[i])?;
     let params = &view.select_params;
     let now = ctx.now;
     let gate = select::eligibility(account, params, now, ctx.headers_only);
     let is_current = snapshot.is_current(&account.id);
 
-    let mut lines: Vec<Line> = Vec::with_capacity(7);
-    lines.push(Line::from(vec![
-        Span::styled(
-            format!(" {}", masked_name(&account.id.0, ctx.mask)),
-            Style::new().add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(format!(" · {}", account.credential_kind), dim()),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled(format!(" order #{}", pos + 1), Style::new()),
-        Span::raw(" · "),
-        status_span(account, gate, is_current, params, now, ctx.frame),
-    ]));
-    let mut token_line = vec![Span::styled(" token ", dim())];
-    token_line.extend(token_detail_spans(
-        account,
-        view.refresh_ahead,
-        now,
-        ctx.tz_offset,
-    ));
-    lines.push(Line::from(token_line));
+    let name = detail_name_spans(
+        masked_name(&account.id.0, ctx.mask),
+        account.credential_kind,
+        view.plans.get(&account.id.0).map(String::as_str),
+    );
+    let status = status_span(account, gate, is_current, params, now, ctx.frame);
+    let token = detail_token_line(account, view.refresh_ahead, now, ctx.tz_offset);
     let consecutive_failures = view
         .poll_health
         .get(&account.id.0)
         .map_or(0, |h| h.consecutive_failures);
     let max_age = params.usage_max_age;
-    lines.push(window_detail_line(
-        "5h",
-        &account.five_hour,
-        ctx,
-        max_age,
-        consecutive_failures,
-    ));
-    lines.push(window_detail_line(
-        "7d",
-        &account.seven_day,
-        ctx,
-        max_age,
-        consecutive_failures,
-    ));
-    let totals = view.totals_for(&account.id.0);
-    lines.push(Line::from(vec![
+    let five = window_detail_line("5h", &account.five_hour, ctx, max_age, consecutive_failures);
+    let seven = window_detail_line("7d", &account.seven_day, ctx, max_age, consecutive_failures);
+    let life = detail_life_line(view.totals_for(&account.id.0));
+    let poll = poll_text(
+        view.poll_health(&account.id.0),
+        account.credential_kind,
+        now,
+    );
+    // Reset inventory (.prd/16) — only once the daemon reports usage-control
+    // metadata at all, so an older daemon's detail pane is unchanged.
+    let reset = (!view.usage_controls.is_empty()).then(|| {
+        Line::from(vec![
+            Span::styled(" reset ", dim()),
+            Span::raw(super::view::reset_detail(
+                view.usage_control(&account.id.0),
+                account.credential_kind,
+                now,
+            )),
+        ])
+    });
+    Some(DetailParts {
+        name,
+        order_no: pos + 1,
+        status,
+        token,
+        five,
+        seven,
+        life,
+        poll,
+        reset,
+        auth: view
+            .auth_history
+            .get(&account.id.0)
+            .and_then(|events| {
+                events.iter().find(|e| {
+                    matches!(
+                        e.outcome.as_str(),
+                        "permanent_failure" | "excluded" | "transient_failure" | "failed"
+                    )
+                })
+            })
+            .map(|event| {
+                vec![
+                    Line::from(format!(
+                        " last failure {} · {} · {}",
+                        format::month_day_hm(
+                            UNIX_EPOCH + Duration::from_millis(event.at_ms),
+                            ctx.tz_offset
+                        ),
+                        event.source,
+                        event
+                            .http_status
+                            .map_or_else(|| "HTTP unavailable".into(), |s| format!("HTTP {s}"))
+                    )),
+                    Line::from(format!("   {} → {}", event.reason, event.effect)),
+                ]
+            })
+            .unwrap_or_default(),
+    })
+}
+
+/// ` {id}` bold + ` · {kind}` dim, then ` · {plan}` when the daemon knows the
+/// account's subscription plan (`.prd/25`) — the detail pane's first line.
+fn detail_name_spans(name: String, kind: &str, plan: Option<&str>) -> Vec<Span<'static>> {
+    let mut spans = vec![
+        Span::styled(
+            format!(" {name}"),
+            Style::new().add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!(" · {kind}"), dim()),
+    ];
+    if let Some(plan) = plan {
+        spans.push(Span::styled(
+            format!(" · {plan}"),
+            Style::new().fg(Color::Cyan),
+        ));
+    }
+    spans
+}
+
+/// ` token {expiry · refreshed · refresh due}`.
+fn detail_token_line(
+    account: &AccountSnapshot,
+    refresh_ahead: Duration,
+    now: SystemTime,
+    tz_offset: i64,
+) -> Line<'static> {
+    let mut spans = vec![Span::styled(" token ", dim())];
+    spans.extend(token_detail_spans(account, refresh_ahead, now, tz_offset));
+    Line::from(spans)
+}
+
+/// ` life  {req} req ({ok} ok/{err} err) · in {in}/out {out}`.
+fn detail_life_line(totals: super::activity::Totals) -> Line<'static> {
+    Line::from(vec![
         Span::styled(" life  ", dim()),
         Span::raw(format!(
             "{} req ({} ok/{} err) · in {}/out {}",
@@ -6095,8 +8070,12 @@ fn draw_detail(
             format::human_count(totals.tokens_in),
             format::human_count(totals.tokens_out),
         )),
-    ]));
-    let poll = match view.poll_health(&account.id.0) {
+    ])
+}
+
+/// The detail `poll` row's text for one account's poller health.
+fn poll_text(health: Option<super::PollHealth>, kind: &str, now: SystemTime) -> String {
+    match health {
         Some(health) => {
             let last = health
                 .last_ok
@@ -6115,31 +8094,10 @@ fn draw_detail(
             };
             format!("{last}{next}{backoff}")
         }
-        None if account.credential_kind == "oauth" || account.credential_kind == "grok" => {
-            "not polled yet".into()
-        }
+        None if kind == "oauth" || kind == "grok" => "not polled yet".into(),
         // apikey/codex/openrouter accounts have no polled usage endpoint.
-        None => format!("n/a ({})", account.credential_kind),
-    };
-    lines.push(Line::from(vec![
-        Span::styled(" poll  ", dim()),
-        Span::raw(poll),
-    ]));
-    // Reset inventory (.prd/16) — only once the daemon reports usage-control
-    // metadata at all, so an older daemon's detail pane is unchanged.
-    if !view.usage_controls.is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled(" reset ", dim()),
-            Span::raw(super::view::reset_detail(
-                view.usage_control(&account.id.0),
-                account.credential_kind,
-                now,
-            )),
-        ]));
+        None => format!("n/a ({kind})"),
     }
-
-    let block = Block::new().borders(Borders::TOP).title(" detail ");
-    frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 /// Token line for the detail pane: countdown + absolute local expiry,
@@ -6207,8 +8165,26 @@ fn window_detail_line(
     max_age: Duration,
     consecutive_failures: u32,
 ) -> Line<'static> {
+    window_detail_line_at(
+        name,
+        window,
+        ctx.now,
+        ctx.tz_offset,
+        max_age,
+        consecutive_failures,
+    )
+}
+
+/// [`window_detail_line`] at an explicit instant and UTC offset.
+fn window_detail_line_at(
+    name: &'static str,
+    window: &Option<QuotaWindow>,
+    now: SystemTime,
+    tz_offset: i64,
+    max_age: Duration,
+    consecutive_failures: u32,
+) -> Line<'static> {
     let label = Span::styled(format!(" {name:<5} "), dim());
-    let now = ctx.now;
     // Issue #33: surface the distinct display state in the detail pane too.
     let display = classify_window_display(window, now, max_age, consecutive_failures);
     let Some(window) = window else {
@@ -6219,7 +8195,7 @@ fn window_detail_line(
     };
     let utilization = window.effective_utilization(now);
     let color = level_color(format::gauge_level(utilization));
-    let reset = reset_label(window, now, ctx.tz_offset).unwrap_or_else(|| "expired".into());
+    let reset = reset_label(window, now, tz_offset).unwrap_or_else(|| "expired".into());
     let source = match window.source {
         crate::scheduler::window::WindowSource::Headers => "headers",
         crate::scheduler::window::WindowSource::UsagePoll => "poll",
@@ -8105,39 +10081,327 @@ fn model_name_cells(
     effects_on: bool,
     g: GradientCfg,
 ) -> (Cell<'static>, Cell<'static>) {
-    let group = Cell::from(Span::styled(
+    let (group, name) = model_label_spans(m, active, frame, effects_on, g);
+    (Cell::from(group), Cell::from(Line::from(name)))
+}
+
+/// The spans behind [`model_name_cells`]: the bold group-colored `GROUP`
+/// word and the model name (gradient for headline models, bold when active).
+fn model_label_spans(
+    m: &ModelUsageDoc,
+    active: bool,
+    frame: usize,
+    effects_on: bool,
+    g: GradientCfg,
+) -> (Span<'static>, Vec<Span<'static>>) {
+    let group = Span::styled(
         m.group.to_uppercase(),
         group_color(Some(m.group.as_str())).add_modifier(Modifier::BOLD),
-    ));
-    let name_cell = if model_gradient_base(Some(m.group.as_str()), &m.model, g).is_some() {
-        Cell::from(Line::from(model_name_spans(
-            Some(m.group.as_str()),
-            &m.model,
-            frame,
-            effects_on,
-            g,
-        )))
+    );
+    let name = if model_gradient_base(Some(m.group.as_str()), &m.model, g).is_some() {
+        model_name_spans(Some(m.group.as_str()), &m.model, frame, effects_on, g)
     } else {
         let name_style = if active {
             Style::new().add_modifier(Modifier::BOLD)
         } else {
             Style::new()
         };
-        Cell::from(Span::styled(m.model.clone(), name_style))
+        vec![Span::styled(m.model.clone(), name_style)]
     };
-    (group, name_cell)
+    (group, name)
+}
+
+/// Fields of one packed models-strip entry: marker · group · model · share ·
+/// req · tok · $ · last.
+const STRIP_FIELDS: usize = 8;
+/// Spaces between two packed entries on one line.
+const STRIP_ENTRY_GAP: usize = 3;
+/// The dim column legend a packed strip carries in its border fill (the
+/// packed layout has no header row).
+const STRIP_LEGEND: &str = " group · model · share · req · tok · $ · last ";
+
+/// Display width of each [`STRIP_FIELDS`] field of one entry.
+type StripWidths = [usize; STRIP_FIELDS];
+
+/// The models strip's plan for one frame, decided once in [`draw_main`]:
+/// `per_line >= 2` packs that many entries per line under a one-row title
+/// (owner mockup 2026-10-22, rule 4); `per_line == 1` is today's table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StripPlan {
+    /// Entries the packed strip shows (unused by the table, which fills its
+    /// area as before).
+    shown: usize,
+    per_line: usize,
+    /// Pane height: 0 when there is no model data.
+    height: u16,
+}
+
+/// The `last` cell: `N in-flight` while requests run, else the compact age.
+fn strip_last(m: &ModelUsageDoc, now: SystemTime) -> String {
+    if m.in_flight > 0 {
+        format!("{} in-flight", m.in_flight)
+    } else {
+        model_age_compact(m.last_used_ms, now)
+    }
+}
+
+/// Widest `last` cell, for the packing decision: `N in-flight` with N at
+/// its type's widest (`ModelUsageDoc::in_flight` is a u32) — wider than any
+/// age (`compact_duration`, 6–7 cells), `now` or `—`. Rendering aligns on
+/// the live text; only the decision uses this, so the strip's height does
+/// not change when a model starts or stops running or its age ticks.
+fn strip_last_bound() -> usize {
+    format!("{} in-flight", u32::MAX).chars().count()
+}
+
+/// [`strip_entry_widths`] with the time-driven `last` cell at its bound —
+/// what [`strip_plan`] decides on.
+fn strip_entry_bound(m: &ModelUsageDoc) -> StripWidths {
+    let mut widths = strip_entry_widths(m, UNIX_EPOCH);
+    widths[STRIP_FIELDS - 1] = strip_last_bound();
+    widths
+}
+
+/// Display width (terminal cells) of each field exactly as the packed strip
+/// renders it — the uppercase group word, the model name (wide CJK names
+/// count two cells per character), the counts.
+fn strip_entry_widths(m: &ModelUsageDoc, now: SystemTime) -> StripWidths {
+    let cells = |text: String| Line::from(text).width();
+    [
+        2,
+        cells(m.group.to_uppercase()),
+        cells(m.model.clone()),
+        MODEL_BAR_WIDTH,
+        cells(format::human_count(m.requests)),
+        cells(format::human_count(model_total(m))),
+        cells(format_cost(model_cost(m))),
+        cells(strip_last(m, now)),
+    ]
+}
+
+/// Per-column field maxima for `entries` laid out row-major, `per_line` to a
+/// line — every field aligns down its entry column. Past the first column
+/// the marker drops its leading breathing space (the entry gap already
+/// separates it), so it is one cell there.
+fn strip_columns(entries: &[StripWidths], per_line: usize) -> Vec<StripWidths> {
+    let mut columns = vec![[0; STRIP_FIELDS]; per_line.min(entries.len())];
+    for (i, entry) in entries.iter().enumerate() {
+        let column = &mut columns[i % per_line];
+        for (have, want) in column.iter_mut().zip(entry) {
+            *have = (*have).max(*want);
+        }
+    }
+    for column in columns.iter_mut().skip(1) {
+        column[0] = column[0].min(1);
+    }
+    columns
+}
+
+/// Width of one packed line: fields 1 space apart, entries
+/// [`STRIP_ENTRY_GAP`] apart.
+fn strip_line_width(columns: &[StripWidths]) -> usize {
+    columns
+        .iter()
+        .map(|c| c.iter().sum::<usize>() + STRIP_FIELDS - 1)
+        .sum::<usize>()
+        + STRIP_ENTRY_GAP * columns.len().saturating_sub(1)
+}
+
+/// Whether `entries`, `per_line` to a line, fit `width` without clipping.
+fn strip_fits(entries: &[StripWidths], per_line: usize, width: u16) -> bool {
+    strip_line_width(&strip_columns(entries, per_line)) <= usize::from(width)
+}
+
+/// Rule 4, pure: the largest entries-per-line count (2..=entries) whose
+/// packed line fits `width`; 1 (= today's table) when not even two fit.
+fn strip_per_line(entries: &[StripWidths], width: u16) -> usize {
+    (2..=entries.len())
+        .rev()
+        .find(|&k| strip_fits(entries, k, width))
+        .unwrap_or(1)
+}
+
+/// The strip's plan: auto height = title + ceil(n/k) packed lines (n = the
+/// top [`MODEL_STRIP_ROWS`]), or today's table height when fewer than two
+/// entries fit a line. A drag override keeps its height; packing then
+/// shows as many entries as its lines hold.
+fn strip_plan(view: &DashboardView, width: u16, drag: Option<u16>) -> StripPlan {
+    let total = view.model_usage.len();
+    if total == 0 {
+        return StripPlan {
+            shown: 0,
+            per_line: 1,
+            height: 0,
+        };
+    }
+    let widths: Vec<StripWidths> = view.model_usage.iter().map(strip_entry_bound).collect();
+    match drag.map(|h| h.clamp(PANE_MIN_HEIGHT, PANE_MAX_HEIGHT)) {
+        None => {
+            let shown = total.min(MODEL_STRIP_ROWS);
+            let per_line = strip_per_line(&widths[..shown], width);
+            let height = if per_line >= 2 {
+                1 + shown.div_ceil(per_line) as u16
+            } else {
+                shown as u16 + 2
+            };
+            StripPlan {
+                shown,
+                per_line,
+                height,
+            }
+        }
+        Some(height) => {
+            let lines = usize::from(height - 1);
+            (2..=total)
+                .rev()
+                .map(|k| (k, total.min(lines * k)))
+                .find(|&(k, shown)| strip_fits(&widths[..shown], k, width))
+                .map_or(
+                    StripPlan {
+                        shown: total.min(usize::from(height - 2)),
+                        per_line: 1,
+                        height,
+                    },
+                    |(per_line, shown)| StripPlan {
+                        shown,
+                        per_line,
+                        height,
+                    },
+                )
+        }
+    }
+}
+
+/// Packed models strip: `plan.per_line` entries per line, row-major, every
+/// field aligned down its entry column; the title is today's, with the
+/// column legend in the border fill when it fits.
+fn draw_models_strip_packed(
+    frame: &mut Frame,
+    area: Rect,
+    view: &DashboardView,
+    ctx: &FrameCtx,
+    plan: StripPlan,
+) {
+    let now = ctx.now;
+    let per_line = plan.per_line.max(1);
+    let shown = plan
+        .shown
+        .min(usize::from(area.height.saturating_sub(1)) * per_line);
+    let entries = &view.model_usage[..shown.min(view.model_usage.len())];
+    let widths: Vec<StripWidths> = entries.iter().map(|m| strip_entry_widths(m, now)).collect();
+    let columns = strip_columns(&widths, per_line);
+    let max_total = view
+        .model_usage
+        .iter()
+        .map(model_total)
+        .max()
+        .unwrap_or(0)
+        .max(1);
+    let frame_n = ctx.frame;
+    let pad = |spans: &mut Vec<Span<'static>>, field: Vec<Span<'static>>, width: usize| {
+        let w = Line::from(field.clone()).width();
+        spans.extend(field);
+        if width > w {
+            spans.push(Span::raw(" ".repeat(width - w)));
+        }
+    };
+    let lines: Vec<Line> = entries
+        .chunks(per_line)
+        .map(|line| {
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            for (j, m) in line.iter().enumerate() {
+                if j > 0 {
+                    spans.push(Span::raw(" ".repeat(STRIP_ENTRY_GAP)));
+                }
+                let active = m.in_flight > 0 || model_is_recent(m.last_used_ms, now);
+                let (group, name) =
+                    model_label_spans(m, active, frame_n, view.tui_effects, view.gradient);
+                let share = model_total(m) as f64 / max_total as f64;
+                let marker = model_active_marker(m, now, frame_n);
+                let fields: [Vec<Span<'static>>; STRIP_FIELDS] = [
+                    vec![if j == 0 {
+                        marker
+                    } else {
+                        Span::styled(
+                            marker.content.chars().skip(1).collect::<String>(),
+                            marker.style,
+                        )
+                    }],
+                    vec![group],
+                    name,
+                    vec![Span::styled(
+                        format::gauge_bar(share, MODEL_BAR_WIDTH),
+                        group_color(Some(m.group.as_str())),
+                    )],
+                    vec![Span::raw(format::human_count(m.requests))],
+                    vec![Span::raw(format::human_count(model_total(m)))],
+                    vec![Span::styled(
+                        format_cost(model_cost(m)),
+                        Style::new().fg(Color::Green),
+                    )],
+                    vec![Span::styled(strip_last(m, now), dim())],
+                ];
+                for (f, field) in fields.into_iter().enumerate() {
+                    if f > 0 {
+                        spans.push(Span::raw(" "));
+                    }
+                    pad(&mut spans, field, columns[j][f]);
+                }
+            }
+            Line::from(spans)
+        })
+        .collect();
+    let title = strip_title(view, shown);
+    let title_w = Line::from(title.as_str()).width();
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::new().borders(Borders::TOP).title(title)),
+        area,
+    );
+    let legend_w = Line::from(STRIP_LEGEND).width();
+    if area.height > 0 && title_w + TITLE_GAP + legend_w <= usize::from(area.width) {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(STRIP_LEGEND, dim()))),
+            Rect::new(
+                area.x + (title_w + TITLE_GAP) as u16,
+                area.y,
+                legend_w as u16,
+                1,
+            ),
+        );
+    }
+}
+
+/// ` models — top N of M by tokens — {scope} (g: all) ` — shared by the
+/// table and the packed strip so the wording never forks.
+fn strip_title(view: &DashboardView, shown: usize) -> String {
+    // Scope qualifier (issue #62 S2, U22): wording comes from the document's
+    // `data_quality` field (server-owned; canonical serde default for old
+    // daemons) — same visible-qualifier contract as the heatmap's
+    // "(best-effort)" title.
+    format!(
+        " models — top {} of {} by tokens — {} (g: all) ",
+        shown,
+        view.model_usage.len(),
+        view.data_quality.model_usage
+    )
 }
 
 /// Always-visible compact strip: the top models by total tokens, each with a
 /// proportional mini-bar and req/tok/last-used (req12/28). Narrow terminals
-/// drop the bar so the column set stays readable (req29).
+/// drop the bar so the column set stays readable (req29). A plan that packs
+/// two or more entries per line renders [`draw_models_strip_packed`].
 fn draw_models_strip(
     frame: &mut Frame,
     area: Rect,
     view: &DashboardView,
     ctx: &FrameCtx,
     now: SystemTime,
+    plan: StripPlan,
 ) {
+    if plan.per_line >= 2 {
+        draw_models_strip_packed(frame, area, view, ctx, plan);
+        return;
+    }
     // Fill the pane: rows follow the AREA height (border + header take 2), so
     // a drag-resized strip (U8) shows more than the MODEL_STRIP_ROWS default
     // instead of 5 rows + dead space (UI-4 V2).
@@ -8216,16 +10480,7 @@ fn draw_models_strip(
             ],
         )
     };
-    // Scope qualifier (issue #62 S2, U22): wording comes from the document's
-    // `data_quality` field (server-owned; canonical serde default for old
-    // daemons) — same visible-qualifier contract as the heatmap's
-    // "(best-effort)" title.
-    let title = format!(
-        " models — top {} of {} by tokens — {} (g: all) ",
-        shown,
-        view.model_usage.len(),
-        view.data_quality.model_usage
-    );
+    let title = strip_title(view, shown);
     let table = Table::new(rows, constraints)
         .header(Row::new(header).style(dim().add_modifier(Modifier::BOLD)))
         .block(Block::new().borders(Borders::TOP).title(title));
@@ -8679,6 +10934,11 @@ fn draw_footer(frame: &mut Frame, area: Rect, chrome: &Chrome, mask: bool) {
                     key("↑↓"),
                     Span::raw(" scroll"),
                 ]);
+                // The fold (`z`) is advertised only while it is on: the
+                // bar that `z` turns off.
+                if chrome.fold_exhausted {
+                    spans.extend([Span::raw("  "), key("z"), Span::raw(" fold")]);
+                }
                 Line::from(spans)
             }
             // Accounts overlay: the issue #3/#4 affordances. a (add) and r
@@ -8945,6 +11205,8 @@ mod tests {
             config_facts: Default::default(),
             usage_stats: Vec::new(),
             usage_controls: Default::default(),
+            plans: Default::default(),
+            auth_history: Default::default(),
             health: Default::default(),
             session_labels: Default::default(),
             pid: 1,
@@ -9742,6 +12004,27 @@ mod tests {
         assert!(frame.contains("0 applicable now"), "{frame}");
     }
 
+    /// `.prd/25`: the detail pane's first line names the account's plan when
+    /// the daemon knows it, and says nothing when it does not.
+    #[test]
+    fn accounts_detail_pane_names_the_plan() {
+        let mut view = usage_control_view();
+        let codex_pos = view
+            .display_order(Default::default(), SystemTime::now())
+            .iter()
+            .position(|&i| view.snapshot.accounts[i].credential_kind == "codex")
+            .expect("codex row");
+        let codex_idx = view.display_order(Default::default(), SystemTime::now())[codex_pos];
+        let codex_name = view.snapshot.accounts[codex_idx].id.0.clone();
+        let mut chrome = chrome_overlay(Overlay::Accounts);
+        chrome.mode = Mode::Select { idx: codex_pos };
+        let before = render_rows(&view, &chrome, 160, 30).join("\n");
+        assert!(!before.contains("· promax"), "{before}");
+        view.plans.insert(codex_name, "promax".to_string());
+        let after = render_rows(&view, &chrome, 160, 30).join("\n");
+        assert!(after.contains("· codex · promax"), "{after}");
+    }
+
     /// The accounts keybar advertises the two new affordances — and keeps
     /// `r remove` distinct from `R reset`, which is the whole reason the
     /// redemption key is capitalized.
@@ -9894,6 +12177,175 @@ mod tests {
         assert_eq!(bold, "7d", "emphasis covers the larger unit only");
     }
 
+    #[test]
+    fn c1_quota_reset_label_preserves_countdown_columns_and_styles() {
+        for marker in [None, Some('○'), Some('◑')] {
+            let line = quota_bar_line(0.5, Color::Green, "7d 10h", 2, 32, marker);
+            let cells: Vec<_> = line
+                .spans
+                .iter()
+                .flat_map(|span| span.content.chars().map(move |ch| (ch, span.style)))
+                .collect();
+            let text: String = cells.iter().map(|(ch, _)| *ch).collect();
+            assert_eq!(cells.len(), 32, "the label must not grow the bar");
+            assert_eq!(text.find("7d 10h"), Some(13), "{text:?}");
+            assert_eq!(
+                cells[31].0,
+                marker.unwrap_or(' '),
+                "the freshness marker keeps the last column"
+            );
+            for (col, (_, style)) in cells.iter().enumerate() {
+                assert_eq!(style.fg, Some(Color::Green), "column {col} color");
+                assert_eq!(
+                    style.add_modifier.contains(Modifier::REVERSED),
+                    col < 16,
+                    "column {col} fill"
+                );
+            }
+            let bold: String = cells
+                .iter()
+                .filter(|(_, style)| style.add_modifier.contains(Modifier::BOLD))
+                .map(|(ch, _)| *ch)
+                .collect();
+            assert_eq!(bold, "7d", "only the original leading unit is bold");
+            assert_eq!(
+                text.find("rst 7d 10h"),
+                Some(9),
+                "the label occupies the four blank cells before the original time: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn c1_quota_reset_label_is_omitted_without_four_leading_cells() {
+        // Nine countdown characters leave only three leading cells at width 16.
+        for marker in [None, Some('○')] {
+            let line = quota_bar_line(0.5, Color::Green, "1234d 10h", 5, 16, marker);
+            let text: String = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect();
+            assert_eq!(text.chars().count(), 16, "{text:?}");
+            assert_eq!(text.find("1234d 10h"), Some(3), "{text:?}");
+            assert!(!text.contains("rst"), "no room for a reset label: {text:?}");
+            assert_eq!(text.chars().last(), Some(marker.unwrap_or(' ')));
+        }
+    }
+
+    #[test]
+    fn c1_quota_reset_label_respects_minimum_bar_width() {
+        for (time, bold_chars, marker, expected) in [
+            ("10/20 12:34", 5, None, "10/20 12:34"),
+            ("0s", 2, Some('○'), "rst 0s    ○"),
+        ] {
+            let line = quota_bar_line(0.5, Color::Green, time, bold_chars, 11, marker);
+            let text: String = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect();
+            assert_eq!(text.chars().count(), 11, "{text:?}");
+            assert_eq!(text, expected);
+        }
+    }
+
+    #[test]
+    fn c1_quota_headers_fit_minimum_gauge_cell() {
+        use crate::config::QuotaDisplay::{Remaining, Used};
+
+        let mut view = view_with(Vec::new());
+        view.snapshot.accounts = vec![fable_account()];
+        for (mode, expected) in [
+            (Remaining, "7d Fbl RESET LEFT"),
+            (Used, "7d Fbl RESET USED"),
+        ] {
+            view.quota_display = mode;
+            let rows = render_rows(&view, &chrome_overlay(Overlay::None), 80, 30);
+            let frame = rows.join("\n");
+            let header = rows
+                .iter()
+                .find(|row| row.contains("account") && row.contains("7d Fbl"))
+                .unwrap_or_else(|| panic!("accounts header missing:\n{frame}"));
+            let seven = header.find("7d").expect("weekly column");
+            let fable = header.find("7d Fbl").expect("Fable column");
+            let in_flight = header.find("if").expect("in-flight column");
+            assert_eq!(fable - seven, 18, "17-cell gauge plus its gap: {header}");
+            assert_eq!(in_flight - fable, 18, "{header}");
+            assert_eq!(
+                header.chars().skip(fable).take(17).collect::<String>(),
+                expected,
+                "the minimum Fable header keeps the reset hint and numeric meaning"
+            );
+        }
+    }
+
+    #[test]
+    fn c1_quota_headers_follow_display_mode_and_session_override() {
+        use crate::config::QuotaDisplay::{Remaining, Used};
+        use crate::scheduler::AccountId;
+
+        let mut account = fable_account();
+        account.seven_day = account.five_hour;
+        account
+            .seven_day
+            .as_mut()
+            .expect("weekly window")
+            .utilization = 0.25;
+        let mut view = view_with(Vec::new());
+        view.snapshot.accounts = (0..20)
+            .map(|idx| {
+                let mut account = account.clone();
+                account.id = AccountId(format!("claude:{idx:02}@example.com"));
+                account
+            })
+            .collect();
+
+        for (configured, override_mode, label, five, seven, fable) in [
+            (Remaining, None, "LEFT", "58%", "75%", "3%!"),
+            (Used, None, "USED", "42%", "25%", "97%!"),
+            (Remaining, Some(Used), "USED", "42%", "25%", "97%!"),
+            (Used, Some(Remaining), "LEFT", "58%", "75%", "3%!"),
+        ] {
+            view.quota_display = configured;
+            let mut chrome = chrome_overlay(Overlay::None);
+            chrome.quota_display_override = override_mode;
+            let rows = render_rows(&view, &chrome, 160, 50);
+            let frame = rows.join("\n");
+            let header_idx = rows
+                .iter()
+                .position(|row| row.contains("account") && row.contains("7d Fbl"))
+                .unwrap_or_else(|| panic!("accounts header missing:\n{frame}"));
+            let header = &rows[header_idx];
+            assert_eq!(header.find("5h"), Some(50), "{header}");
+            assert_eq!(header.find("7d"), Some(59), "{header}");
+            assert_eq!(header.find("7d Fbl"), Some(98), "{header}");
+            assert_eq!(header.find("if"), Some(137), "{header}");
+            let slice = |row: &str, start, width| -> String {
+                row.chars().skip(start).take(width).collect()
+            };
+            let account_rows = &rows[header_idx + 1..header_idx + 21];
+            for (idx, row) in account_rows.iter().enumerate() {
+                assert!(
+                    row.contains(&format!("{idx:02}@example.com")),
+                    "all 20 accounts keep their order:\n{frame}"
+                );
+                assert_eq!(slice(row, 50, 8).trim(), five, "{row}");
+                assert_eq!(slice(row, 92, 5).trim(), seven, "{row}");
+                assert_eq!(slice(row, 131, 5).trim(), fable, "{row}");
+            }
+            assert_eq!(slice(header, 50, 8).trim(), format!("5h {label}"));
+            for (start, title) in [(59, "7d RESET"), (98, "7d Fbl RESET")] {
+                let cell = slice(header, start, 38);
+                assert!(cell.starts_with(title), "{header}");
+                assert!(
+                    cell.trim_end().ends_with(label),
+                    "configured {configured:?}, override {override_mode:?}: {header}"
+                );
+            }
+        }
+    }
+
     /// Chrome with a given overlay active and `Mode::Normal` (issue #5). The
     /// old `chrome(show_models)` builder mapped `true`→Stats; tests now name the
     /// overlay explicitly.
@@ -9932,6 +12384,7 @@ mod tests {
             add_input_len: 0,
             quota_display_override: None,
             reset_absolute: false,
+            fold_exhausted: false,
             limits_input: String::new(),
             attach: None,
             keys: Default::default(),
@@ -10228,6 +12681,557 @@ mod tests {
         assert_eq!(dot_col("$1.25"), small, "detail amounts align");
         assert_eq!(dot_col("$1,234.50"), small, "comma amount aligns");
         assert_eq!(dot_col("$0.7500+?"), small, "marker doesn't shift the dot");
+    }
+
+    /// ALL totals cover the selected granularity, not the scrolled viewport;
+    /// scope labels must not consume a row of the existing usage ledger.
+    #[test]
+    fn c5_usage_daily_scroll_keeps_all_totals_and_ledger_rows() {
+        let mut view = view_with(vec![]);
+        view.usage_stats = vec![
+            usage_row(
+                "day",
+                20_000,
+                "2024-10-04",
+                "claude",
+                "opus-x",
+                100,
+                20,
+                1.25,
+            ),
+            usage_row(
+                "day",
+                20_000,
+                "2024-10-04",
+                "codex",
+                "gpt-5.5",
+                50,
+                10,
+                0.50,
+            ),
+            usage_row("day", 19_999, "2024-10-03", "claude", "opus-x", 90, 9, 0.75),
+            {
+                let mut row = usage_row("day", 19_999, "2024-10-03", "misc", "mystery", 11, 2, 0.0);
+                row.priced = false;
+                row
+            },
+            usage_row(
+                "hour",
+                480_000,
+                "10-04 09h",
+                "claude",
+                "hour-only",
+                7,
+                7,
+                99.0,
+            ),
+        ];
+        let mut chrome = chrome_overlay(Overlay::Usage);
+        for (scroll, top, ledger) in [
+            (
+                0,
+                "2024-10-04",
+                vec![
+                    "2024-10-04 2 models 6 150 30 80 8 $1.75",
+                    "claude/opus-x 3 100 20 40 4 $1.25",
+                    "codex/gpt-5.5 3 50 10 40 4 $0.5000",
+                    "2024-10-03 2 models 6 101 11 80 8 $0.7500+?",
+                    "claude/opus-x 3 90 9 40 4 $0.7500",
+                    "misc/mystery 3 11 2 40 4 —",
+                ],
+            ),
+            (
+                1,
+                "2024-10-03",
+                vec![
+                    "2024-10-03 2 models 6 101 11 80 8 $0.7500+?",
+                    "claude/opus-x 3 90 9 40 4 $0.7500",
+                    "misc/mystery 3 11 2 40 4 —",
+                ],
+            ),
+        ] {
+            chrome.usage_scroll = scroll;
+            let rows = render_rows(&view, &chrome, 160, 50);
+            assert_eq!(
+                rows[3].split_whitespace().collect::<Vec<_>>(),
+                ["bucket", "model", "req", "input", "output", "cache", "r", "cache", "w", "cost"],
+                "scope chrome must not move the table header"
+            );
+            for (offset, expected) in ledger.iter().enumerate() {
+                assert_eq!(
+                    rows[4 + offset].split_whitespace().collect::<Vec<_>>(),
+                    expected.split_whitespace().collect::<Vec<_>>(),
+                    "existing ledger row {} at scroll {scroll}",
+                    4 + offset
+                );
+            }
+            assert!(
+                rows[4 + ledger.len()..48]
+                    .iter()
+                    .all(|row| row.trim().is_empty()),
+                "no duplicate, hidden-granularity, or extra data rows"
+            );
+            assert!(
+                rows[2].contains("daily")
+                    && rows[2].contains("2 buckets")
+                    && rows[2].contains("Σ 468 tok")
+                    && rows[2].contains("$2.50")
+                    && rows[2].contains("(+unpriced)"),
+                "ALL totals and unpriced qualifier stay unchanged at scroll {scroll}: {}",
+                rows[2]
+            );
+            assert!(
+                rows[2].contains("ALL"),
+                "title must identify ALL returned daily buckets, not the top bucket: {}",
+                rows[2]
+            );
+            let chrome_rows = [rows[2].as_str(), rows[48].as_str()];
+            let scope = chrome_rows
+                .iter()
+                .find(|row| {
+                    let lower = row.to_ascii_lowercase();
+                    lower.contains("top") || lower.contains("displayed")
+                })
+                .expect("existing title/footer identifies the top/displayed bucket");
+            assert!(
+                scope.contains(top),
+                "scope follows the visible bucket: {scope}"
+            );
+            assert!(
+                rows[4].starts_with(top),
+                "top bucket remains the first ledger row"
+            );
+            let labels = chrome_rows.join("\n");
+            assert!(
+                labels.contains('≈')
+                    && labels.contains("API-equivalent")
+                    && labels.to_ascii_lowercase().contains("estimate")
+                    && labels.contains("NOT ACTUAL BILL"),
+                "cost is visibly qualified in existing title/footer chrome: {labels}"
+            );
+            assert!(
+                !labels.to_ascii_lowercase().contains("selected day"),
+                "scrolling is not a selected-date feature"
+            );
+        }
+    }
+
+    /// Granularity changes must neither mix repeated history into ALL totals
+    /// nor describe a scrolled hour/month as a user-selected date.
+    #[test]
+    fn c5_usage_hourly_monthly_scope_counts_only_its_own_buckets() {
+        use crate::tui::activity::UsageGran;
+
+        let mut view = view_with(vec![]);
+        view.usage_stats = vec![
+            usage_row(
+                "hour",
+                480_000,
+                "10-04 09h",
+                "claude",
+                "hour-new",
+                100,
+                20,
+                2.0,
+            ),
+            usage_row(
+                "hour",
+                480_000,
+                "10-04 09h",
+                "codex",
+                "hour-extra",
+                50,
+                10,
+                0.50,
+            ),
+            usage_row(
+                "hour",
+                479_999,
+                "10-04 08h",
+                "claude",
+                "hour-old",
+                90,
+                9,
+                0.75,
+            ),
+            usage_row(
+                "month",
+                650,
+                "2024-10",
+                "claude",
+                "month-new",
+                1_000,
+                100,
+                10.0,
+            ),
+            usage_row(
+                "month",
+                649,
+                "2024-09",
+                "claude",
+                "month-mid",
+                2_000,
+                200,
+                20.0,
+            ),
+            usage_row(
+                "month",
+                648,
+                "2024-08",
+                "claude",
+                "month-old",
+                3_000,
+                300,
+                30.0,
+            ),
+            usage_row(
+                "day",
+                20_000,
+                "2024-10-04",
+                "claude",
+                "daily-only",
+                10,
+                1,
+                1_234.0,
+            ),
+        ];
+        for (gran, label, count, tokens, cost, top, hidden) in [
+            (
+                UsageGran::Hour,
+                "hourly",
+                "2 buckets",
+                "Σ 411 tok",
+                "$3.25",
+                "10-04 08h",
+                "hour-new",
+            ),
+            (
+                UsageGran::Month,
+                "monthly",
+                "3 buckets",
+                "Σ 6.7k tok",
+                "$60.00",
+                "2024-09",
+                "month-new",
+            ),
+        ] {
+            let mut chrome = chrome_overlay(Overlay::Usage);
+            chrome.usage_gran = gran;
+            chrome.usage_scroll = 1;
+            let rows = render_rows(&view, &chrome, 160, 50);
+            assert!(
+                [label, count, tokens, cost]
+                    .iter()
+                    .all(|text| rows[2].contains(text)),
+                "title counts/sums all {label} buckets, including the skipped bucket: {}",
+                rows[2]
+            );
+            assert!(
+                rows[4].starts_with(top),
+                "first visible {label} bucket: {}",
+                rows[4]
+            );
+            assert!(
+                rows[4..48]
+                    .iter()
+                    .all(|row| !row.contains(hidden) && !row.contains("daily-only")),
+                "skipped and other-granularity models do not enter the viewport"
+            );
+            assert!(
+                rows[2].contains("ALL"),
+                "{label} title must identify ALL buckets: {}",
+                rows[2]
+            );
+            let scope = [rows[2].as_str(), rows[48].as_str()]
+                .into_iter()
+                .find(|row| {
+                    let lower = row.to_ascii_lowercase();
+                    lower.contains("top") || lower.contains("displayed")
+                })
+                .expect("existing title/footer identifies the top/displayed bucket");
+            assert!(
+                scope.contains(top),
+                "{label} scope follows the viewport: {scope}"
+            );
+            assert!(!scope.to_ascii_lowercase().contains("selected hour"));
+            assert!(!scope.to_ascii_lowercase().contains("selected month"));
+        }
+    }
+
+    /// 106 daily buckets with long totals and an unpriced row.
+    fn c5_long_totals_view() -> DashboardView {
+        let mut view = view_with(vec![]);
+        view.usage_stats = vec![
+            usage_row(
+                "day",
+                20_000,
+                "2024-10-04",
+                "claude",
+                "opus-x",
+                200_000_000_000,
+                10_000_000_000,
+                180_000.0,
+            ),
+            usage_row(
+                "day",
+                19_999,
+                "2024-10-03",
+                "codex",
+                "gpt-5.5",
+                50_000_000_000,
+                7_417_899_912,
+                8_871.31,
+            ),
+        ];
+        // Three-digit bucket counts plus long totals must not clip the
+        // missing-rate qualifier that fit before cost-warning chrome.
+        for offset in 0..104 {
+            let mut row = usage_row(
+                "day",
+                19_998 - offset,
+                &format!("older-{offset}"),
+                "misc",
+                "mystery",
+                0,
+                0,
+                0.0,
+            );
+            row.priced = false;
+            view.usage_stats.push(row);
+        }
+        view
+    }
+
+    /// A flash status must not replace the cost warning, even when long ALL
+    /// totals would clip a trailing disclaimer at 100 columns.
+    #[test]
+    fn c5_usage_cost_warning_survives_narrow_width_and_real_status() {
+        let view = c5_long_totals_view();
+        let mut chrome = chrome_overlay(Overlay::Usage);
+        for status in [Some("refresh failed: retry later"), None] {
+            chrome.status_line = status.map(str::to_string);
+            let rows = render_rows(&view, &chrome, 100, 50);
+            if let Some(status) = status {
+                assert!(
+                    rows[48].contains(status),
+                    "real status remains visible: {}",
+                    rows[48]
+                );
+            }
+            assert!(
+                ["ALL", "daily", "106 buckets", "267417.9M tok", "$188871.31"]
+                    .iter()
+                    .all(|text| rows[2].contains(text)),
+                "100-column title retains ALL scope and both totals: {}",
+                rows[2]
+            );
+            assert!(
+                rows[2].contains("(+unpriced)"),
+                "100-column title must retain the complete missing-rate qualifier: {}",
+                rows[2]
+            );
+            let labels = format!("{}\n{}", rows[2], rows[48]);
+            let lower = labels.to_ascii_lowercase();
+            assert!(
+                labels.contains('≈')
+                    && lower.contains("api")
+                    && (lower.contains("estimate") || lower.contains("est.") || lower.contains("api est") || lower.contains("api-est"))
+                    && (lower.contains("not actual bill") || lower.contains("not bill") || lower.contains("notbill")),
+                "100-column chrome must retain an API estimate / not-bill warning with status {status:?}: {labels}"
+            );
+        }
+    }
+
+    /// The tightest title is exactly as wide as the pre-scope title, so every
+    /// width that fit the old title keeps ALL, both totals, the complete
+    /// unpriced qualifier and the estimate warning.
+    #[test]
+    fn c5_usage_title_fits_legacy_width_with_long_totals() {
+        let view = c5_long_totals_view();
+        let mut chrome = chrome_overlay(Overlay::Usage);
+        chrome.status_line = Some("refresh failed: retry later".into());
+        for width in [80, 74] {
+            let rows = render_rows(&view, &chrome, width, 50);
+            assert!(
+                rows[48].contains("refresh failed: retry later"),
+                "real status keeps the footer at {width}: {}",
+                rows[48]
+            );
+            assert!(
+                [
+                    "ALL 106",
+                    "daily",
+                    "267417.9M tok",
+                    "$188871.31",
+                    "(+unpriced)"
+                ]
+                .iter()
+                .all(|text| rows[2].contains(text)),
+                "{width}-column title keeps ALL, totals and complete qualifier: {}",
+                rows[2]
+            );
+            assert!(
+                rows[2].contains('≈')
+                    && rows[2].contains("API est")
+                    && rows[2].contains("NOT BILL"),
+                "{width}-column title keeps the estimate warning: {}",
+                rows[2]
+            );
+        }
+    }
+
+    /// The scope row must end on a whole word at narrow widths, never `…by da`.
+    #[test]
+    fn c5_usage_scope_row_fits_80_columns() {
+        let view = c5_long_totals_view();
+        let chrome = chrome_overlay(Overlay::Usage);
+        for width in [80, 74] {
+            let rows = render_rows(&view, &chrome, width, 50);
+            let scope = rows[48].trim_end();
+            assert!(
+                scope.ends_with("ALL = all daily buckets"),
+                "{width}-column scope row is complete: {scope}"
+            );
+            assert!(scope.contains("top/displayed bucket 2024-10-04"), "{scope}");
+        }
+    }
+
+    #[test]
+    fn c5_usage_cost_warning_preserves_totals_and_unpriced_at_80_columns() {
+        let mut view = view_with(vec![]);
+        view.usage_stats = vec![
+            usage_row(
+                "day",
+                20_000,
+                "2024-10-04",
+                "claude",
+                "opus-x",
+                100,
+                20,
+                1.25,
+            ),
+            usage_row(
+                "day",
+                20_000,
+                "2024-10-04",
+                "codex",
+                "gpt-5.5",
+                50,
+                10,
+                0.50,
+            ),
+            usage_row("day", 19_999, "2024-10-03", "claude", "opus-x", 90, 9, 0.75),
+            {
+                let mut row = usage_row("day", 19_999, "2024-10-03", "misc", "mystery", 11, 2, 0.0);
+                row.priced = false;
+                row
+            },
+        ];
+        let mut chrome = chrome_overlay(Overlay::Usage);
+        chrome.status_line = Some("refresh failed: retry later".into());
+        let rows = render_rows(&view, &chrome, 80, 50);
+        assert!(rows[48].contains("refresh failed: retry later"));
+        assert!(
+            [
+                "ALL",
+                "daily",
+                "2 buckets",
+                "468 tok",
+                "$2.50",
+                "(+unpriced)"
+            ]
+            .iter()
+            .all(|text| rows[2].contains(text)),
+            "80-column title retains ALL scope, both totals, and complete qualifier: {}",
+            rows[2]
+        );
+        assert!(
+            rows[2].contains('≈')
+                && rows[2].contains("API")
+                && rows[2].to_ascii_lowercase().contains("est")
+                && rows[2].contains("NOT BILL"),
+            "80-column warning survives real flash status: {}",
+            rows[2]
+        );
+    }
+
+    /// The source label is daemon-owned; stale scroll offsets must describe
+    /// the same clamped bucket as the ledger, never invent an empty bucket.
+    #[test]
+    fn c5_usage_scope_uses_daemon_qualifier_and_clamped_bucket() {
+        let mut view = view_with(vec![]);
+        view.data_quality.cost = "daemon-owned API-equivalent estimate".into();
+        view.usage_stats = vec![
+            usage_row("day", 20_000, "2024-10-04", "claude", "new", 10, 2, 1.0),
+            usage_row("day", 19_999, "2024-10-03", "claude", "old", 10, 2, 1.0),
+        ];
+        let mut chrome = chrome_overlay(Overlay::Usage);
+        chrome.usage_scroll = usize::MAX;
+        let rows = render_rows(&view, &chrome, 160, 50);
+        assert!(rows[2].contains("daemon-owned API-equivalent estimate"));
+        assert!(rows[4].starts_with("2024-10-03"));
+        assert!(rows[48].contains("top/displayed bucket 2024-10-03"));
+
+        chrome.account_modal = Some(super::super::AccountModal {
+            account: "missing-account".into(),
+            scroll: 0,
+        });
+        let rows = render_rows(&view, &chrome, 160, 50);
+        assert!(
+            rows[48].trim().is_empty(),
+            "modal suppresses Usage footer context"
+        );
+        chrome.account_modal = None;
+
+        view.usage_stats.clear();
+        let rows = render_rows(&view, &chrome, 160, 50);
+        assert!(rows[2].contains("ALL 0 buckets"));
+        assert!(rows[2].contains("daemon-owned API-equivalent estimate"));
+        assert!(rows[3].contains("no usage history yet"));
+        assert!(
+            rows[48].trim().is_empty(),
+            "no invented top bucket for empty usage"
+        );
+    }
+
+    /// Usage scope is not a global footer default; MAIN and other overlays
+    /// retain both their blank/flash status line and their existing keybar.
+    #[test]
+    fn c5_usage_scope_does_not_change_other_footers() {
+        let mut view = view_with(vec![]);
+        view.usage_stats = vec![usage_row(
+            "day",
+            20_000,
+            "2024-10-04",
+            "claude",
+            "opus-x",
+            100,
+            20,
+            1.25,
+        )];
+        for (overlay, keybar) in [
+            (
+                Overlay::None,
+                " q quit  R reload  u used/left  t eta/utc  o sort  S sched  ↑↓ scroll",
+            ),
+            (
+                Overlay::Stats,
+                " stats — g/Esc back  ↑/k ↓/j model  PgUp/PgDn page  w window  q quit",
+            ),
+            (Overlay::Logs, " logs — l/Esc back  q quit"),
+        ] {
+            let mut chrome = chrome_overlay(overlay);
+            for status in [None, Some("switched to codex@example.com")] {
+                chrome.status_line = status.map(str::to_string);
+                let rows = render_rows(&view, &chrome, 160, 50);
+                assert_eq!(
+                    rows[48].trim_end(),
+                    status.map_or(String::new(), |status| format!(" {status}")),
+                    "non-Usage status line is unchanged"
+                );
+                assert_eq!(rows[49].trim_end(), keybar, "non-Usage keybar is unchanged");
+            }
+        }
     }
 
     /// Ledger number splitting (usage-cost polish): carry-safe rounding,
@@ -10756,10 +13760,16 @@ mod tests {
     }
 
     /// The rows that legitimately differ between local and attach: the header
-    /// (row 0, attach banner) and the two footer rows (keybar shows
-    /// `R disabled (attached)`). Everything else is the shared data render.
-    fn body_rows(rows: &[String], h: usize) -> &[String] {
-        &rows[1..h - 2]
+    /// (row 0, attach banner), the header tail at the right end of the tabs
+    /// row (where the attach marker moves when the header does not fit) and
+    /// the two footer rows (keybar shows `R disabled (attached)`). Everything
+    /// else is the shared data render.
+    fn body_rows(rows: &[String], h: usize) -> Vec<String> {
+        let mut body = rows[1..h - 2].to_vec();
+        if let Some(end) = body[0].find(" config") {
+            body[0].truncate(end + " config".len());
+        }
+        body
     }
 
     #[test]
@@ -11363,8 +14373,10 @@ mod tests {
         let view = view_with(docs);
         // Assertions pin the actual rendered rows (last visible + first
         // hidden model id), not just the title's self-reported count.
+        // Width 80 keeps today's TABLE (not even two packed entries fit a
+        // line); the packed strip's own fill is pinned below at 220.
         // Default auto height shows MODEL_STRIP_ROWS rows.
-        let text = render(&view, &chrome_overlay(Overlay::None), 220, 50);
+        let text = render(&view, &chrome_overlay(Overlay::None), 80, 50);
         assert!(
             text.contains(" models — top 5 of 7 by tokens"),
             "default strip shows 5 rows"
@@ -11374,7 +14386,7 @@ mod tests {
         // Drag-expanded pane (border + header + 7): every row fits.
         let mut chrome = chrome_overlay(Overlay::None);
         chrome.pane_heights.strip = Some(9);
-        let text = render(&view, &chrome, 220, 50);
+        let text = render(&view, &chrome, 80, 50);
         assert!(
             text.contains(" models — top 7 of 7 by tokens"),
             "a taller pane reveals more rows"
@@ -11383,10 +14395,27 @@ mod tests {
             text.contains("m-6"),
             "last row rendered when dragged taller"
         );
-        // Shrunk to the drag minimum (border + header + 1).
+        // Packed (owner mockup 2026-10-22, rule 4): the same default top 5,
+        // and every packed line holds several entries — so even the drag
+        // minimum (title + 2 lines) shows more than the table's one row.
+        let text = render(&view, &chrome_overlay(Overlay::None), 220, 50);
+        assert!(text.contains(" models — top 5 of 7 by tokens"), "{text}");
+        assert!(text.contains("m-4") && !text.contains("m-5"), "{text}");
+        let plan = strip_plan(&view, 220, Some(PANE_MIN_HEIGHT));
+        assert!(
+            plan.per_line >= 2 && plan.shown == 2 * plan.per_line,
+            "{plan:?}"
+        );
         let mut chrome = chrome_overlay(Overlay::None);
         chrome.pane_heights.strip = Some(PANE_MIN_HEIGHT);
         let text = render(&view, &chrome, 220, 50);
+        let title = format!(" models — top {} of 7 by tokens", plan.shown);
+        assert!(text.contains(&title), "{text}");
+        assert!(text.contains(&format!("m-{}", plan.shown - 1)), "{text}");
+        // Shrunk to the drag minimum (border + header + 1).
+        let mut chrome = chrome_overlay(Overlay::None);
+        chrome.pane_heights.strip = Some(PANE_MIN_HEIGHT);
+        let text = render(&view, &chrome, 80, 50);
         assert!(
             text.contains(" models — top 1 of 7 by tokens"),
             "the minimum pane still renders one row"
@@ -13098,11 +16127,144 @@ mod tests {
         assert_eq!(hit_test_activity(&chrome, 5, 0), None);
     }
 
+    fn assert_c2a_tab_strip(
+        width: u16,
+        active_overlays: &[Overlay],
+        expected_header: &str,
+        expected_tabs: &[(&str, u16, Overlay)],
+    ) {
+        let mut terminal = Terminal::new(TestBackend::new(width, 3)).expect("terminal");
+        for active in active_overlays {
+            let mut tabs = Vec::new();
+            terminal
+                .draw(|f| tabs = draw_tabs(f, Rect::new(0, 1, width, 1), *active))
+                .expect("draw");
+            let buffer = terminal.backend().buffer();
+            let header: String = (0..width).map(|x| buffer[(x, 1)].symbol()).collect();
+            assert_eq!(
+                header,
+                format!("{expected_header:<width$}", width = width as usize)
+            );
+            assert_eq!(tabs.len(), 10, "one hit target per tab");
+            for (hit, (label, x, overlay)) in tabs.iter().zip(expected_tabs) {
+                assert_eq!(hit.overlay, *overlay);
+                assert_eq!(hit.area, Rect::new(*x, 1, label.len() as u16, 1));
+                assert!(hit.area.right() <= width, "{label} must not be clipped");
+                for col in hit.area.x..hit.area.right() {
+                    assert_eq!(hit_test_tabs(&tabs, col, 1), Some(*overlay), "{label}");
+                    let cell = &buffer[(col, 1)];
+                    assert_eq!(cell.fg, Color::Cyan, "{label}");
+                    assert_eq!(
+                        cell.modifier.contains(Modifier::REVERSED | Modifier::BOLD),
+                        *overlay == *active,
+                        "{label} active style"
+                    );
+                }
+            }
+            for col in 0..width {
+                if !expected_tabs
+                    .iter()
+                    .any(|(label, x, _)| col >= *x && col < *x + label.len() as u16)
+                {
+                    assert_eq!(hit_test_tabs(&tabs, col, 1), None, "separator/padding");
+                }
+                for row in [0, 2] {
+                    assert_eq!(buffer[(col, row)].symbol(), " ", "one-row strip");
+                    assert_eq!(hit_test_tabs(&tabs, col, row), None);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn c2a_tabs_at_139_keep_original_labels_and_hit_targets() {
+        assert_c2a_tab_strip(
+            139,
+            &[
+                Overlay::None,
+                Overlay::Accounts,
+                Overlay::Stats,
+                Overlay::Usage,
+                Overlay::Keys,
+                Overlay::Perf,
+                Overlay::Logs,
+                Overlay::Sessions,
+                Overlay::Misc,
+                Overlay::Config,
+            ],
+            " dashboard │ accounts │ stats │ usage │ keys │ perf │ logs │ sessions │ misc │ config",
+            &[
+                ("dashboard", 1, Overlay::None),
+                ("accounts", 13, Overlay::Accounts),
+                ("stats", 24, Overlay::Stats),
+                ("usage", 32, Overlay::Usage),
+                ("keys", 40, Overlay::Keys),
+                ("perf", 47, Overlay::Perf),
+                ("logs", 54, Overlay::Logs),
+                ("sessions", 61, Overlay::Sessions),
+                ("misc", 72, Overlay::Misc),
+                ("config", 79, Overlay::Config),
+            ],
+        );
+    }
+
+    #[test]
+    fn c2a_tabs_at_140_show_shortcuts_with_full_hit_targets() {
+        assert_c2a_tab_strip(
+            140,
+            &[Overlay::None],
+            " [Esc] dashboard │ [a] accounts │ [g] stats │ [U] usage │ [K] keys │ [p] perf │ [l] logs │ [s] sessions │ [?] misc │ [c] config",
+            &[
+                ("[Esc] dashboard", 1, Overlay::None),
+                ("[a] accounts", 19, Overlay::Accounts),
+                ("[g] stats", 34, Overlay::Stats),
+                ("[U] usage", 46, Overlay::Usage),
+                ("[K] keys", 58, Overlay::Keys),
+                ("[p] perf", 69, Overlay::Perf),
+                ("[l] logs", 80, Overlay::Logs),
+                ("[s] sessions", 91, Overlay::Sessions),
+                ("[?] misc", 106, Overlay::Misc),
+                ("[c] config", 117, Overlay::Config),
+            ],
+        );
+    }
+
+    #[test]
+    fn c2a_tabs_in_usage_show_only_the_dashboard_return_hint() {
+        assert_c2a_tab_strip(
+            140,
+            &[
+                Overlay::Accounts,
+                Overlay::Stats,
+                Overlay::Usage,
+                Overlay::Keys,
+                Overlay::Perf,
+                Overlay::Logs,
+                Overlay::Sessions,
+                Overlay::Misc,
+                Overlay::Config,
+            ],
+            " [Esc] dashboard │ accounts │ stats │ usage │ keys │ perf │ logs │ sessions │ misc │ config",
+            &[
+                ("[Esc] dashboard", 1, Overlay::None),
+                ("accounts", 19, Overlay::Accounts),
+                ("stats", 30, Overlay::Stats),
+                ("usage", 38, Overlay::Usage),
+                ("keys", 46, Overlay::Keys),
+                ("perf", 53, Overlay::Perf),
+                ("logs", 60, Overlay::Logs),
+                ("sessions", 67, Overlay::Sessions),
+                ("misc", 78, Overlay::Misc),
+                ("config", 85, Overlay::Config),
+            ],
+        );
+    }
+
     #[test]
     fn tab_bar_records_seven_hit_targets_and_hit_test_maps_labels() {
         let view = view_with(Vec::new());
         let mut hits = None;
-        let mut terminal = Terminal::new(TestBackend::new(200, 40)).expect("terminal");
+        let mut terminal = Terminal::new(TestBackend::new(139, 40)).expect("terminal");
         let chrome = chrome_overlay(Overlay::None);
         terminal
             .draw(|f| draw(f, Some(&view), &chrome, &mut hits))
@@ -13226,7 +16388,11 @@ mod tests {
         for (_, overlay) in TABS {
             let text = render(&view, &chrome_overlay(*overlay), 200, 40);
             assert!(
-                text.contains("dashboard │ accounts"),
+                text.contains(if *overlay == Overlay::None {
+                    "[Esc] dashboard │ [a] accounts"
+                } else {
+                    "[Esc] dashboard │ accounts"
+                }),
                 "tab strip visible under {overlay:?}"
             );
         }
@@ -13344,7 +16510,7 @@ mod tests {
         ];
         let summary = poller_summary(&view, SystemTime::now());
         assert!(
-            summary.starts_with("2 polled"),
+            summary.starts_with("2 accts"),
             "oauth + grok counted, codex excluded (no polled endpoint): {summary}"
         );
     }
@@ -15155,5 +18321,2474 @@ mod tests {
             buffer[(159, 1)].bg,
             text.trim_end()
         );
+    }
+
+    // --- MAIN recomposition (owner-approved 179×43 mockup, 2026-10-22) -----
+
+    /// Fixture id of account `n` (1-based across the 21): user-shaped
+    /// lengths of 22–27 characters, four of them (n = 3, 9, 15, 21) exactly
+    /// 27, like the owner's measured ids.
+    fn rid(group: &str, n: usize) -> String {
+        let len = [22, 23, 24, 25, 26, 27][(n + 2) % 6];
+        let head = format!("{group}:user{n:02}");
+        let tail = "@ex.io";
+        format!("{head}{}{tail}", "x".repeat(len - head.len() - tail.len()))
+    }
+
+    /// A MAIN state shaped like the owner's 179×43 dashboard capture: 21
+    /// accounts (claude 14 · codex 4 · grok 3), a current claude
+    /// account carrying every detail datum, six models (the top one past
+    /// 100000M tokens, two in flight), two in-flight and six completed
+    /// requests, attach mode on the header's own pid. Fixture names only.
+    fn recompose_view() -> (DashboardView, Chrome) {
+        use crate::proxy::usage_controls::UsageControlDoc;
+        use crate::routing::BackendGroup;
+        use crate::scheduler::window::{QuotaWindow, WindowSource};
+        use crate::scheduler::{AccountId, AccountSnapshot};
+
+        let now = SystemTime::now();
+        let ms = |t: SystemTime| t.duration_since(UNIX_EPOCH).expect("epoch").as_millis() as u64;
+        let window = |utilization: f64, resets: u64, age: u64| {
+            Some(QuotaWindow {
+                utilization,
+                resets_at: now + Duration::from_secs(resets),
+                fetched_at: now - Duration::from_secs(age),
+                source: WindowSource::Headers,
+            })
+        };
+        let mut view = view_with(Vec::new());
+        let mut n = 0;
+        for (group, kind, count) in [
+            (BackendGroup::Claude, "oauth", 14),
+            (BackendGroup::Codex, "codex", 4),
+            (BackendGroup::Grok, "grok", 3),
+        ] {
+            for _ in 0..count {
+                n += 1;
+                let id = rid(group.as_str(), n);
+                view.snapshot.accounts.push(AccountSnapshot {
+                    overlap_start: None,
+                    id: AccountId(id.clone()),
+                    healthy: true,
+                    auth_failure_status: None,
+                    credential_kind: kind,
+                    group,
+                    // Instants sit 30 s inside their rendered unit (2h56m,
+                    // 2d3h) so the pinned text never depends on how many
+                    // milliseconds pass before the frame renders.
+                    five_hour: (group == BackendGroup::Claude)
+                        .then(|| window(0.30, 10_590, 2))
+                        .flatten(),
+                    seven_day: window(0.31, 187_170, 5),
+                    scoped_limits: Vec::new(),
+                    scoped_cooldowns: Vec::new(),
+                    cooldown_until: None,
+                    cooldown_source: None,
+                    in_flight: u32::from(n == 13) * 2,
+                    token_expires_at_ms: (kind != "grok")
+                        .then(|| ms(now + Duration::from_secs(23_130))),
+                    last_refresh_ms: Some(ms(now - Duration::from_secs(2_520))),
+                    paused: false,
+                    limits: Default::default(),
+                });
+                if matches!(kind, "oauth" | "grok") {
+                    view.poll_health.insert(
+                        id,
+                        super::super::PollHealth {
+                            last_ok: Some(now - Duration::from_secs(if n == 13 { 4 } else { 300 })),
+                            consecutive_failures: 0,
+                            // Half a second inside `5m19s` / `19s`.
+                            next_at: now
+                                + Duration::from_millis(if n == 13 { 319_500 } else { 19_500 }),
+                        },
+                    );
+                }
+            }
+        }
+        let current = rid("claude", 13);
+        view.snapshot
+            .current
+            .insert(BackendGroup::Claude, AccountId(current.clone()));
+        view.snapshot
+            .current
+            .insert(BackendGroup::Codex, AccountId(rid("codex", 18)));
+        view.last_switch = Some(super::super::LastSwitch {
+            from: Some(rid("claude", 12)),
+            to: current.clone(),
+            reason: Some("re-evaluation".into()),
+            at: now - Duration::from_secs(25_920),
+        });
+        view.session_totals.insert(
+            current.clone(),
+            super::super::activity::Totals {
+                requests: 149_700,
+                ok: 149_100,
+                errors: 606,
+                tokens_in: 79_700_000,
+                tokens_out: 12_300_000,
+            },
+        );
+        view.global_totals = super::super::activity::Totals {
+            requests: 1_300_000,
+            ok: 1_284_600,
+            errors: 15_400,
+            tokens_in: 5_036_900_000,
+            tokens_out: 847_600_000,
+        };
+        // Usage-control metadata exists (the capture shows the `rst` column),
+        // so `draw_detail` also emits its 8th `reset` line.
+        view.usage_controls.insert(
+            rid("codex", 15),
+            UsageControlDoc {
+                available_resets: Some(1),
+                ..Default::default()
+            },
+        );
+        let model = |group: &str, name: &str, total: u64, requests: u64, cost: f64, ago: u64| {
+            let mut row = model_row(group, name, total, 0);
+            row.cache_read = None;
+            row.requests = requests;
+            row.cost_usd = cost;
+            row.last_used_ms = ms(now - Duration::from_secs(ago));
+            row
+        };
+        view.model_usage = vec![
+            model(
+                "claude",
+                "claude-opus-5-5",
+                154_581_100_000,
+                452_200,
+                71_123.86,
+                3,
+            ),
+            model(
+                "claude",
+                "claude-opus-5",
+                40_837_800_000,
+                202_300,
+                32_655.48,
+                1_987_200,
+            ),
+            model(
+                "claude",
+                "claude-sonnet-5",
+                30_101_600_000,
+                290_000,
+                8_349.47,
+                34_680,
+            ),
+            model(
+                "codex",
+                "gpt-5.6-sol",
+                14_057_300_000,
+                75_800,
+                15_128.97,
+                74_880,
+            ),
+            model(
+                "claude",
+                "claude-fable-5",
+                13_190_700_000,
+                49_700,
+                24_598.36,
+                144_000,
+            ),
+            model("claude", "claude-haiku-5", 1_000_000, 10, 1.0, 172_800),
+        ];
+        view.model_usage[0].in_flight = 2;
+        let in_flight = |id: u64, age: u64| super::super::activity::InFlight {
+            session_name: None,
+            id,
+            method: "POST".into(),
+            path: "/v1/messages".into(),
+            endpoint: crate::tui::Endpoint::Anthropic,
+            account: Some(current.clone()),
+            group: Some("claude".into()),
+            model: Some("claude-opus-5-5".into()),
+            effort: Some("xhigh".into()),
+            fast: false,
+            kind: Some("subagent".into()),
+            user_id: None,
+            tenant: None,
+            excerpt: None,
+            client_name: None,
+            started_at: now - Duration::from_secs(age),
+        };
+        view.in_flight = vec![in_flight(1, 8), in_flight(2, 6)];
+        // Distinct consecutive models so no run folds — six visible entries.
+        view.completed = [
+            "claude-opus-5-5",
+            "claude-sonnet-5",
+            "claude-opus-5",
+            "claude-fable-5",
+            "gpt-5.6-sol",
+            "claude-haiku-5",
+        ]
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let at = ms(now - Duration::from_secs(10 + i as u64));
+            completed_request(at, Some("claude"), Some(name), 600_000, 900, 200)
+        })
+        .collect();
+        view.codex = crate::dashboard::CodexSettingsDoc {
+            available: true,
+            fast: false,
+            model: "gpt-6-astra".into(),
+            effort: None,
+        };
+        view.grok = crate::dashboard::GrokSettingsDoc {
+            available: true,
+            model: "grok-4.7".into(),
+            effort: Some("xhigh".into()),
+        };
+        view.version = "llmux 0.2.25 (preview 2026-10-16-0709-a162822a9215)".into();
+        view.pid = 1695;
+        view.uptime = Duration::from_secs(392_400);
+        view.upstream = Some("https://api.anthropic.com".into());
+        let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/home/fixture"));
+        view.config_path = Some(home.join(".config/llmux.json").display().to_string());
+        let chrome = Chrome {
+            attach: Some(super::super::Attach {
+                pid: Some(1695),
+                connected: true,
+            }),
+            ..chrome_overlay(Overlay::None)
+        };
+        (view, chrome)
+    }
+
+    /// The per-frame context `draw` builds, for calling the planners directly.
+    fn frame_ctx(view: &DashboardView, chrome: &Chrome) -> FrameCtx {
+        let now = SystemTime::now();
+        FrameCtx {
+            now,
+            tz_offset: format::local_offset_secs(now),
+            order: view.display_order(chrome.account_sort, now),
+            headers_only: select::headers_only_mode(&view.snapshot, &view.select_params, None, now),
+            frame: chrome.frame,
+            mask: view.email_anonymous,
+            quota_display: chrome.quota_display_override.unwrap_or(view.quota_display),
+            reset_absolute: chrome.reset_absolute,
+        }
+    }
+
+    /// The narrowest terminal width at which MAIN uses the scheduler +
+    /// detail band for this view and chrome.
+    fn band_bound(view: &DashboardView, chrome: &Chrome) -> u16 {
+        let ctx = frame_ctx(view, chrome);
+        (1..=600u16)
+            .find(|&w| {
+                MiddlePlan::new(view, &ctx, chrome, w, usize::from(BAND_ROWS))
+                    .band
+                    .is_some()
+            })
+            .expect("the band fits some width")
+    }
+
+    /// Whether a rendered MAIN uses the band (its title row) or today's
+    /// middle pane.
+    fn has_band(rows: &[String]) -> bool {
+        rows.iter().any(|r| r.contains(" scheduler · poller "))
+    }
+
+    /// Every countdown, age and absolute stamp in the recompose fixture set
+    /// `span` away from now: `2s` gives every field its shortest form,
+    /// 99d23h59m its widest (`99d23h` — 6 cells, the widest
+    /// `compact_duration` form — and `MM-DD HH:MM`).
+    fn with_ages(mut view: DashboardView, span: Duration) -> DashboardView {
+        let now = SystemTime::now();
+        let ms = |t: SystemTime| t.duration_since(UNIX_EPOCH).expect("epoch").as_millis() as u64;
+        for account in &mut view.snapshot.accounts {
+            if account.token_expires_at_ms.is_some() {
+                account.token_expires_at_ms = Some(ms(now + span));
+            }
+            account.last_refresh_ms = Some(ms(now - span));
+            for window in [&mut account.five_hour, &mut account.seven_day]
+                .into_iter()
+                .flatten()
+            {
+                window.resets_at = now + span;
+                window.fetched_at = now - span;
+            }
+        }
+        for health in view.poll_health.values_mut() {
+            health.last_ok = Some(now - span);
+            health.next_at = now + span;
+        }
+        if let Some(switch) = &mut view.last_switch {
+            switch.at = now - span;
+        }
+        // `eval in ~{60 - uptime % 60}`: 1s when short, 1m00s when wide.
+        let short = span < Duration::from_secs(60);
+        view.uptime = Duration::from_secs(392_400 + if short { 59 } else { 0 });
+        view
+    }
+
+    const SHORTEST_AGE: Duration = Duration::from_secs(2);
+    const WIDEST_AGE: Duration = Duration::from_secs(99 * 86_400 + 23 * 3_600 + 59 * 60);
+
+    /// The recompose fixture with one very short and one very long account
+    /// name in the claude group; returns their ids.
+    fn with_name_spread(mut view: DashboardView) -> (DashboardView, String, String) {
+        let short = "claude:u2@x.io".to_string();
+        let long = "claude:user14-with-a-much-longer-local-part@example.io".to_string();
+        for (from, to) in [(rid("claude", 2), &short), (rid("claude", 14), &long)] {
+            let account = view
+                .snapshot
+                .accounts
+                .iter_mut()
+                .find(|a| a.id.0 == from)
+                .expect("fixture account");
+            account.id = crate::scheduler::AccountId(to.clone());
+            if let Some(health) = view.poll_health.remove(&from) {
+                view.poll_health.insert(to.clone(), health);
+            }
+        }
+        (view, short, long)
+    }
+
+    /// Chrome with the account cursor on `id`.
+    fn cursor_on(view: &DashboardView, chrome: &Chrome, id: &str) -> Chrome {
+        let ctx = frame_ctx(view, chrome);
+        let idx = ctx
+            .order
+            .iter()
+            .position(|&i| view.snapshot.accounts[i].id.0 == id)
+            .expect("account in order");
+        Chrome {
+            mode: Mode::Select { idx },
+            attach: chrome.attach,
+            ..chrome_overlay(Overlay::None)
+        }
+    }
+
+    /// (a) Moving the cursor from the shortest-named to the longest-named
+    /// account keeps the band at the bound width — the decision does not
+    /// read the selected account's text.
+    #[test]
+    fn band_survives_cursor_moves_between_short_and_long_names() {
+        let (view, chrome) = recompose_view();
+        let (view, short, long) = with_name_spread(view);
+        let w = band_bound(&view, &chrome);
+        // Plus one account per group and credential kind (claude oauth,
+        // codex, grok), so every kind's name and token lines run.
+        let kinds = [rid("codex", 16), rid("grok", 19), rid("grok", 21)];
+        for id in [&short, &long].into_iter().chain(&kinds) {
+            let rows = render_rows(&view, &cursor_on(&view, &chrome, id), w, 43);
+            assert!(
+                has_band(&rows),
+                "cursor on {id} at the bound width {w}:\n{}",
+                rows.join("\n")
+            );
+        }
+    }
+
+    /// (b) Every age and time field at its shortest and at its widest form
+    /// keeps the band at the bound width, with every detail line whole.
+    #[test]
+    fn band_survives_every_age_at_its_shortest_and_widest_form() {
+        let (view, chrome) = recompose_view();
+        let w = band_bound(&with_ages(view, SHORTEST_AGE), &chrome);
+        for span in [SHORTEST_AGE, WIDEST_AGE] {
+            let aged = with_ages(recompose_view().0, span);
+            let rows = render_rows(&aged, &chrome, w, 43);
+            let frame = rows.join("\n");
+            assert!(has_band(&rows), "{span:?} at the bound width {w}:\n{frame}");
+            // Whole, not cut: every line the band draws this frame fits its
+            // column, and both titles fit the border row.
+            let ctx = frame_ctx(&aged, &chrome);
+            let plan = MiddlePlan::new(&aged, &ctx, &chrome, w, usize::from(BAND_ROWS));
+            let geometry = plan.band.as_ref().expect("band geometry");
+            let detail = plan.detail.as_ref().expect("detail");
+            let totals = Line::from(band_totals_segment(&plan.summary.totals)).width();
+            let lefts = band_left_lines(&plan.summary, usize::from(BAND_ROWS));
+            for (row, line) in band_right_lines(detail).iter().enumerate() {
+                let start = geometry.starts[row];
+                let mut left_w = lefts.get(row).map_or(0, Line::width);
+                if geometry.totals_on_mode_row && row == plan.summary.band_head.len() - 1 {
+                    left_w += totals;
+                }
+                assert!(left_w + BAND_SEP_W <= start, "{span:?} row {row}:\n{frame}");
+                assert!(
+                    start + line.width() <= usize::from(w),
+                    "{span:?}: {line:?}\n{frame}"
+                );
+            }
+            let title_w = Line::from(band_title_spans_from(
+                &plan.summary.poller,
+                (!geometry.totals_on_mode_row).then_some(plan.summary.totals.as_slice()),
+            ))
+            .width();
+            let detail_title_w = Line::from(BAND_DETAIL_TITLE).width();
+            assert!(title_w + TITLE_GAP <= geometry.detail_title_x, "{frame}");
+            assert!(
+                geometry.detail_title_x + detail_title_w <= usize::from(w),
+                "{frame}"
+            );
+        }
+    }
+
+    /// (c) One column below the bound, today's middle applies whatever the
+    /// cursor and the ages are.
+    #[test]
+    fn below_the_bound_the_middle_falls_back_for_any_cursor_and_age() {
+        let (view, chrome) = recompose_view();
+        let (view, short, long) = with_name_spread(view);
+        let w = band_bound(&view, &chrome);
+        for span in [SHORTEST_AGE, WIDEST_AGE] {
+            let aged = with_ages(with_name_spread(recompose_view().0).0, span);
+            for id in [&short, &long] {
+                let rows = render_rows(&aged, &cursor_on(&aged, &chrome, id), w - 1, 43);
+                assert!(
+                    !has_band(&rows),
+                    "{span:?}, cursor on {id}, width {}:\n{}",
+                    w - 1,
+                    rows.join("\n")
+                );
+            }
+        }
+    }
+
+    /// The bound depends on the terminal width and the account set only:
+    /// the capture-shaped fixture needs this many columns, whatever its ages.
+    #[test]
+    fn band_bound_for_the_capture_shaped_fixture() {
+        let (view, chrome) = recompose_view();
+        let w = band_bound(&view, &chrome);
+        println!("band bound for the recompose fixture: {w} columns");
+        for span in [SHORTEST_AGE, WIDEST_AGE] {
+            assert_eq!(band_bound(&with_ages(recompose_view().0, span), &chrome), w);
+        }
+    }
+
+    /// The models strip's packing decision does not read the live `last`
+    /// column (`2 in-flight` vs `9s`): no height jump when it changes.
+    #[test]
+    fn strip_packing_survives_the_last_column_changing() {
+        let now = SystemTime::now();
+        let ms = |t: SystemTime| t.duration_since(UNIX_EPOCH).expect("epoch").as_millis() as u64;
+        let with_last = |in_flight: u32| {
+            let mut view = recompose_view().0;
+            for m in &mut view.model_usage {
+                m.in_flight = in_flight;
+                m.last_used_ms = ms(now - Duration::from_secs(2));
+            }
+            view
+        };
+        let (quiet, busy) = (with_last(0), with_last(12));
+        let w = (1..=600u16)
+            .find(|&w| strip_plan(&quiet, w, None).per_line >= 2)
+            .expect("packs at some width");
+        assert_eq!(
+            strip_plan(&busy, w, None),
+            strip_plan(&quiet, w, None),
+            "same plan at width {w}"
+        );
+    }
+
+    /// Index of the first row containing `needle`, with the frame in the
+    /// panic message.
+    fn row_of(rows: &[String], needle: &str) -> usize {
+        rows.iter()
+            .position(|r| r.contains(needle))
+            .unwrap_or_else(|| panic!("no row contains {needle:?}:\n{}", rows.join("\n")))
+    }
+
+    /// Every maximal run of share-bar glyphs in `row`, as its cell length.
+    fn share_bar_runs(row: &str) -> Vec<usize> {
+        let mut runs = Vec::new();
+        let mut len = 0;
+        for c in row.chars() {
+            if c == '▰' || c == '▱' {
+                len += 1;
+            } else if len > 0 {
+                runs.push(len);
+                len = 0;
+            }
+        }
+        if len > 0 {
+            runs.push(len);
+        }
+        runs
+    }
+
+    /// The owner's 179×43 with the capture-shaped fixture: every account row,
+    /// the 7-row band (bound 161 columns, its rows pinned), packed models,
+    /// activity at its 4-row floor, the header tail on the tabs row.
+    #[test]
+    fn main_recomposed_179x43_capture_frame() {
+        let (view, chrome) = recompose_view();
+        let rows = render_rows(&view, &chrome, 179, 43);
+        let frame = rows.join("\n");
+        println!("{frame}");
+        assert_eq!(rows.len(), 43);
+
+        // Accounts: title with group counts, header + all 21 rows.
+        let accounts = row_of(&rows, " accounts · sort ");
+        assert_eq!(accounts, 2, "accounts pane right under the tabs:\n{frame}");
+        assert!(
+            rows[accounts].contains(" · 21 (claude 14 · codex 4 · grok 3) "),
+            "accounts title carries the group counts:\n{frame}"
+        );
+        assert!(!rows[accounts].contains("more"), "{frame}");
+        for n in 1..=21 {
+            let name = format!("user{n:02}");
+            assert!(
+                rows[accounts + 2..accounts + 23]
+                    .iter()
+                    .any(|r| r.contains(&name)),
+                "account row {name} visible:\n{frame}"
+            );
+        }
+
+        // Scheduler + detail band: one title row + six content rows.
+        let band = row_of(&rows, " scheduler · poller ");
+        assert_eq!(
+            band,
+            accounts + 23,
+            "band right under the 21 rows:\n{frame}"
+        );
+        // Totals ride the title, or the mode row when the title has no room.
+        assert!(
+            rows[band].contains(" · totals 1.3M req · 1.3M ok / 15.4k err"),
+            "totals in the title at 179:\n{frame}"
+        );
+        assert!(rows[band].contains(" detail ─"), "{frame}");
+        let detail: Vec<String> = rows[band + 1..band + 7]
+            .iter()
+            .map(|r| {
+                r.split_once('│')
+                    .map(|(_, right)| right.to_string())
+                    .unwrap_or_else(|| panic!("band row has a detail column:\n{frame}"))
+            })
+            .collect();
+        assert!(
+            detail[0].contains(&format!("{} · oauth · order #", rid("claude", 13)))
+                && detail[0].contains("active"),
+            "{frame}"
+        );
+        assert!(
+            detail[1].contains("token expires")
+                && detail[1].contains(" · refreshed ")
+                && detail[1].trim_end().ends_with(')'),
+            "token line uncut:\n{frame}"
+        );
+        assert!(
+            detail[2].contains(" 5h ") && detail[2].trim_end().ends_with(" ago"),
+            "{frame}"
+        );
+        assert!(
+            detail[3].contains(" 7d ") && detail[3].trim_end().ends_with(" ago"),
+            "{frame}"
+        );
+        assert!(
+            detail[4].contains("life  149.7k req (149.1k ok/606 err) · in 79.7M/out 12.3M"),
+            "life line uncut:\n{frame}"
+        );
+        assert!(detail[5].contains("poll  ok 4s ago · next ~"), "{frame}");
+        // Left: current · switch note · current · next · next · mode.
+        assert!(rows[band + 1].contains("current"), "{frame}");
+        assert!(
+            rows[band + 2].contains(&format!("{} → re-evaluation, 7h12m ago", rid("claude", 12))),
+            "{frame}"
+        );
+        assert!(rows[band + 4].contains("next"), "{frame}");
+        assert!(rows[band + 6].contains("mode"), "{frame}");
+        assert_eq!(band_bound(&view, &chrome), 161);
+        let pinned: Vec<String> = rows[band..band + 7]
+            .iter()
+            .map(|r| mask_clocks(r.trim_end()))
+            .collect();
+        let expected = [
+            BAND_179_TITLE,
+            BAND_179_ROW_1,
+            BAND_179_ROW_2,
+            BAND_179_ROW_3,
+            BAND_179_ROW_4,
+            BAND_179_ROW_5,
+            BAND_179_ROW_6,
+        ];
+        for (got, want) in pinned.iter().zip(expected) {
+            assert_eq!(got, want, "\n{}", pinned.join("\n"));
+        }
+
+        // Models: unchanged title, 1 + ceil(5/2) rows, whole tok strings.
+        let models = row_of(&rows, " models — top 5 of 6 by tokens");
+        assert_eq!(models, band + 7, "band is seven rows:\n{frame}");
+        assert!(
+            rows[models].contains("hydrated activity/runtime (g: all)"),
+            "{frame}"
+        );
+        assert!(
+            rows[models].contains(" group · model · share · req · tok · $ · last "),
+            "{frame}"
+        );
+        let strip = &rows[models + 1..models + 4];
+        assert!(strip.iter().any(|r| r.contains("154581.1M")), "{frame}");
+        for row in strip {
+            assert!(share_bar_runs(row).iter().all(|&len| len == 10), "{row}");
+        }
+        assert_eq!(
+            strip.iter().map(|r| share_bar_runs(r).len()).sum::<usize>(),
+            5
+        );
+
+        // Activity: everything left — its 4-row floor (title + 3 entries).
+        let activity = row_of(&rows, " activity ");
+        assert_eq!(activity, models + 4, "models take four rows:\n{frame}");
+        let groups = row_of(&rows, " sched default");
+        assert_eq!(groups - activity, 4, "three activity entries:\n{frame}");
+        assert_eq!(groups, 40, "{frame}");
+
+        // Header tail moved to the tabs row, home contracted, pid collapsed.
+        assert!(!rows[0].contains(" cfg "), "{frame}");
+        assert!(rows[0].contains("pid 1695"), "{frame}");
+        assert!(rows[1].trim_end().ends_with(" attached"), "{frame}");
+        assert!(rows[1].contains(" cfg "), "{frame}");
+        if dirs::home_dir().is_some() {
+            assert!(
+                rows[1].contains(" cfg ~/.config/llmux.json  attached"),
+                "{frame}"
+            );
+        }
+    }
+
+    /// Local clock stamps — `(HH:MM)` and `(MM-DD HH:MM)` — masked, so a
+    /// rendered row can be pinned whatever the time of the run.
+    fn mask_clocks(row: &str) -> String {
+        let mut out = String::new();
+        let mut rest = row;
+        while let Some(open) = rest.find('(') {
+            out.push_str(&rest[..open]);
+            let tail = &rest[open..];
+            let close = tail.find(')').map_or(tail.len(), |i| i + 1);
+            let inner = &tail[1..close.saturating_sub(1).max(1)];
+            let shape: String = inner
+                .chars()
+                .map(|c| if c.is_ascii_digit() { '9' } else { c })
+                .collect();
+            out.push_str(match shape.as_str() {
+                "99:99" => "(HH:MM)",
+                "99-99 99:99" => "(MM-DD HH:MM)",
+                _ => &tail[..close],
+            });
+            rest = &tail[close..];
+        }
+        out.push_str(rest);
+        out
+    }
+
+    const BAND_179_TITLE: &str =
+        " scheduler · poller 17 accts · last ok 4s–5m00s ago · next ~19s · totals 1.3M req · 1.3M ok / 15.4k err · in 5036.9M / out 847.6M tok ────────── detail ───────────────────────────";
+    const BAND_179_ROW_1: &str =
+        " current  claude claude:user13xxxxxx@ex.io                                              │ claude:user13xxxxxx@ex.io · oauth · order #13 · ⠋ active";
+    const BAND_179_ROW_2: &str =
+        "                 claude:user12xxxxx@ex.io → re-evaluation, 7h12m ago                    │ token expires 6h25m (HH:MM) · refresh due · refreshed 42m00s ago (HH:MM)";
+    const BAND_179_ROW_3: &str =
+        "          codex  codex:user18xxxxxx@ex.io                                               │ 5h    30% · resets 2h56m (HH:MM) · headers 2s ago";
+    const BAND_179_ROW_4: &str =
+        " next     claude claude:user01xxxxxx@ex.io  eval in ~1m00s                              │ 7d    31% · resets 2d3h (MM-DD HH:MM) · headers 5s ago";
+    const BAND_179_ROW_5: &str =
+        "          codex  codex:user15xxxxxxxxx@ex.io                                            │ life  149.7k req (149.1k ok/606 err) · in 79.7M/out 12.3M";
+    const BAND_179_ROW_6: &str =
+        " mode     default   [S switch]                                                          │ poll  ok 4s ago · next ~5m19s";
+
+    /// Column of the `│` in a band row.
+    fn bar_at(row: &str) -> usize {
+        row.chars()
+            .position(|c| c == '│')
+            .expect("band row has a │")
+    }
+
+    /// (d) A row whose left text reaches past the detail block shifts only
+    /// its own detail line right, with its own `│`; nothing is cut.
+    #[test]
+    fn band_row_with_a_long_left_text_shifts_only_its_detail_line() {
+        // A 7d switch noted on the codex row (27-character ids): the note
+        // row, third in the band, pairs with the 5h line and reaches past
+        // the block column at the band's own bound width.
+        let chrome = recompose_view().1;
+        let view = user_shaped("codex", 27, 27, "SevenDayOverThreshold");
+        let w = band_bound(&view, &chrome);
+        let rows = render_rows(&view, &chrome, w, 43);
+        let frame = rows.join("\n");
+        let band = row_of(&rows, " scheduler · poller ");
+        let ctx = frame_ctx(&view, &chrome);
+        let plan = MiddlePlan::new(&view, &ctx, &chrome, w, usize::from(BAND_ROWS));
+        let geometry = plan.band.as_ref().expect("band at its bound");
+        let lefts = band_left_lines(&plan.summary, usize::from(BAND_ROWS));
+        let note = 2;
+        assert!(
+            lefts[note].width() + BAND_SEP_W > geometry.detail_x,
+            "{geometry:?}"
+        );
+        let block_bar = geometry.detail_x - 1;
+        assert!(bar_at(&rows[band + 1 + note]) > block_bar, "{frame}");
+        for row in [0, 1, 3, 4, 5] {
+            assert_eq!(
+                bar_at(&rows[band + 1 + row]),
+                block_bar,
+                "row {row}:\n{frame}"
+            );
+        }
+        // Both halves of the shifted row are whole.
+        let (left, right) = rows[band + 1 + note].split_once('│').expect("bar");
+        assert!(
+            left.trim_end().ends_with(&format!(
+                "{} → SevenDayOverThreshold, 7h12m ago",
+                id_of("codex", 2, 27)
+            )),
+            "{frame}"
+        );
+        assert!(
+            right.starts_with(" 5h ") && right.trim_end().ends_with(" ago"),
+            "{frame}"
+        );
+    }
+
+    /// Every id padded to `len` cells (the local part grows), for the
+    /// widest-id question at 179 columns.
+    fn with_id_length(mut view: DashboardView, len: usize) -> DashboardView {
+        let rename = |id: &str| -> String {
+            let (group, rest) = id.split_once(':').expect("group prefix");
+            let (local, domain) = rest.split_once('@').expect("email");
+            let pad = len.saturating_sub(group.len() + 1 + local.len() + 1 + domain.len());
+            format!("{group}:{local}{}@{domain}", "x".repeat(pad))
+        };
+        for account in &mut view.snapshot.accounts {
+            let new = rename(&account.id.0);
+            if let Some(health) = view.poll_health.remove(&account.id.0) {
+                view.poll_health.insert(new.clone(), health);
+            }
+            if let Some(totals) = view.session_totals.remove(&account.id.0) {
+                view.session_totals.insert(new.clone(), totals);
+            }
+            account.id = crate::scheduler::AccountId(new);
+        }
+        for current in view.snapshot.current.values_mut() {
+            *current = crate::scheduler::AccountId(rename(&current.0));
+        }
+        if let Some(switch) = &mut view.last_switch {
+            switch.to = rename(&switch.to);
+            switch.from = switch.from.as_deref().map(rename);
+        }
+        view
+    }
+
+    /// Rename one account everywhere the fixture refers to it.
+    fn rename_account(view: &mut DashboardView, old: &str, new: &str) {
+        for account in &mut view.snapshot.accounts {
+            if account.id.0 == old {
+                account.id = crate::scheduler::AccountId(new.into());
+            }
+        }
+        if let Some(health) = view.poll_health.remove(old) {
+            view.poll_health.insert(new.into(), health);
+        }
+        if let Some(totals) = view.session_totals.remove(old) {
+            view.session_totals.insert(new.into(), totals);
+        }
+        for current in view.snapshot.current.values_mut() {
+            if current.0 == old {
+                *current = crate::scheduler::AccountId(new.into());
+            }
+        }
+        if let Some(switch) = &mut view.last_switch {
+            if switch.to == old {
+                switch.to = new.into();
+            }
+            if switch.from.as_deref() == Some(old) {
+                switch.from = Some(new.into());
+            }
+        }
+    }
+
+    /// An id of exactly `len` characters for `group`.
+    fn id_of(group: &str, n: usize, len: usize) -> String {
+        let head = format!("{group}:u{n}");
+        let tail = "@ex.io";
+        format!("{head}{}{tail}", "x".repeat(len - head.len() - tail.len()))
+    }
+
+    /// The owner's measured shape: every id padded to 27 characters, the
+    /// switch note on the `group` row with a `current_len` current id, a
+    /// `from_len` previous id and `reason`.
+    fn user_shaped(
+        group: &str,
+        current_len: usize,
+        from_len: usize,
+        reason: &str,
+    ) -> DashboardView {
+        let (view, _) = recompose_view();
+        let mut view = with_id_length(view, 27);
+        let current = view
+            .snapshot
+            .current
+            .get(&crate::routing::BackendGroup::from_kind(
+                if group == "claude" { "oauth" } else { group },
+            ))
+            .expect("group current")
+            .0
+            .clone();
+        let from = view
+            .snapshot
+            .accounts
+            .iter()
+            .find(|a| a.id.0.starts_with(group) && a.id.0 != current)
+            .expect("another account in the group")
+            .id
+            .0
+            .clone();
+        rename_account(&mut view, &current, &id_of(group, 1, current_len));
+        rename_account(&mut view, &from, &id_of(group, 2, from_len));
+        view.last_switch = Some(super::super::LastSwitch {
+            from: Some(id_of(group, 2, from_len)),
+            to: id_of(group, 1, current_len),
+            reason: Some(reason.into()),
+            at: SystemTime::now() - Duration::from_secs(25_920),
+        });
+        view
+    }
+
+    /// The owner's real shape at 179: 27-character ids, the note on the
+    /// claude row (current 23, from 26, `re-evaluation`) → the band.
+    #[test]
+    fn band_at_179_holds_the_user_shaped_ids() {
+        let chrome = recompose_view().1;
+        let view = user_shaped("claude", 23, 26, "re-evaluation");
+        let rows = render_rows(&view, &chrome, 179, 43);
+        assert!(has_band(&rows), "{}", rows.join("\n"));
+        println!("user-shaped bound: {}", band_bound(&view, &chrome));
+    }
+
+    /// The common automatic switches (forward.rs:2898 writes the gate's
+    /// name, 21 characters) with the longest ids keep the band at 179
+    /// whichever group switched: (i) a 7d switch noted on the claude row,
+    /// (ii) on the codex row, (iii) a 5h switch on either.
+    #[test]
+    fn band_at_179_user_shaped_event_cases() {
+        let chrome = recompose_view().1;
+        let mut missing = Vec::new();
+        let mut bounds = Vec::new();
+        for (case, group, reason) in [
+            ("(i)", "claude", "SevenDayOverThreshold"),
+            ("(ii)", "codex", "SevenDayOverThreshold"),
+            ("(iii) claude", "claude", "FiveHourOverThreshold"),
+            ("(iii) codex", "codex", "FiveHourOverThreshold"),
+        ] {
+            let view = user_shaped(group, 27, 27, reason);
+            let bound = band_bound(&view, &chrome);
+            if !has_band(&render_rows(&view, &chrome, 179, 43)) {
+                missing.push(format!("{case} needs {bound}"));
+            }
+            bounds.push(bound);
+        }
+        assert!(missing.is_empty(), "no band at 179: {}", missing.join(", "));
+        // The note row pairs with the token line on the claude side (172)
+        // and with the 5h line on the codex side (160).
+        assert_eq!(bounds, [172, 160, 172, 160]);
+    }
+
+    /// The note's row is an event input: after a codex switch the note
+    /// row sits under the codex current row and pairs with the 5h line
+    /// instead of the token line, so the capture fixture's bound moves from
+    /// 161 to 148 — the band stays at every width it had.
+    #[test]
+    fn a_codex_switch_note_moves_the_band_bound() {
+        let (mut view, chrome) = recompose_view();
+        assert_eq!(band_bound(&view, &chrome), 161);
+        if let Some(switch) = &mut view.last_switch {
+            switch.to = rid("codex", 18);
+            switch.from = Some(rid("codex", 17));
+        }
+        assert_eq!(band_bound(&view, &chrome), 148);
+    }
+
+    /// A shorter terminal keeps four activity rows and says how many account
+    /// rows it could not show — never a silent cut.
+    #[test]
+    fn main_recomposed_30_rows_counts_hidden_account_rows() {
+        let (view, chrome) = recompose_view();
+        let rows = render_rows(&view, &chrome, band_bound(&view, &chrome), 30);
+        let frame = rows.join("\n");
+        let accounts = row_of(&rows, " accounts · sort ");
+        let band = row_of(&rows, " scheduler · poller ");
+        let shown = band - accounts - 2;
+        assert!(
+            rows[accounts].contains(&format!(" · +{} more ", 21 - shown)),
+            "accounts title counts the hidden rows:\n{frame}"
+        );
+        let activity = row_of(&rows, " activity ");
+        let groups = row_of(&rows, " sched default");
+        assert!(groups - activity >= 4, "activity keeps four rows:\n{frame}");
+    }
+
+    /// Below the band's width MAIN keeps today's middle (scheduler pane with
+    /// poller/totals inside it, a 48-column detail pane at ≥110) and today's
+    /// models table.
+    #[test]
+    fn main_recomposed_narrow_widths_keep_todays_middle_and_models_table() {
+        let (view, chrome) = recompose_view();
+        for (w, h) in [(100u16, 30u16), (120, 40)] {
+            let rows = render_rows(&view, &chrome, w, h);
+            let frame = rows.join("\n");
+            assert!(!frame.contains("scheduler · poller"), "{w}x{h}:\n{frame}");
+            let sched = row_of(&rows, " scheduler ");
+            let middle = &rows[sched + 1..sched + 8];
+            assert!(
+                middle.iter().any(|r| r.contains(" poller ")),
+                "{w}x{h}:\n{frame}"
+            );
+            assert!(
+                middle.iter().any(|r| r.contains(" totals ")),
+                "{w}x{h}:\n{frame}"
+            );
+            let detail_at: String = rows[sched].chars().skip(w as usize - 48).collect();
+            assert_eq!(
+                detail_at.starts_with(" detail "),
+                w >= SIDE_BY_SIDE_AT,
+                "{w}x{h}:\n{frame}"
+            );
+            let models = row_of(&rows, " models — top 5 of 6 by tokens");
+            assert_eq!(models, sched + 8, "today's 8-row middle:\n{frame}");
+            assert!(
+                rows[models + 1].contains("group") && rows[models + 1].contains("model"),
+                "today's models table header:\n{frame}"
+            );
+            assert!(
+                !rows[models].contains(" group · model "),
+                "{w}x{h}:\n{frame}"
+            );
+        }
+    }
+
+    /// Render MAIN and return its rows plus the frame's hit record.
+    fn render_with_hits(
+        view: &DashboardView,
+        chrome: &Chrome,
+        w: u16,
+        h: u16,
+    ) -> (Vec<String>, MainChrome) {
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).expect("terminal");
+        let mut hits = None;
+        terminal
+            .draw(|f| draw(f, Some(view), chrome, &mut hits))
+            .expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+        let rows = (0..h)
+            .map(|y| (0..w).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+            .collect();
+        (rows, hits.expect("MAIN hit record"))
+    }
+
+    /// Mouse targets follow the recomposed geometry: one clickable rect per
+    /// VISIBLE account row, and each drag separator on the top border row of
+    /// the band, the models strip and the activity pane.
+    #[test]
+    fn main_recomposed_hit_targets_follow_the_new_geometry() {
+        let (view, chrome) = recompose_view();
+        for (h, visible) in [(43u16, 21usize), (30, 8)] {
+            let (rows, hits) = render_with_hits(&view, &chrome, 179, h);
+            let frame = rows.join("\n");
+            assert_eq!(hits.account_rows.len(), visible, "{frame}");
+            let accounts = row_of(&rows, " accounts · sort ");
+            for (pos, hit) in hits.account_rows.iter().enumerate() {
+                assert_eq!(usize::from(hit.area.y), accounts + 2 + pos);
+                assert_eq!(hit.display_idx, pos);
+            }
+            let ys: Vec<(u16, PaneId)> = hits.separators.iter().map(|s| (s.y, s.pane)).collect();
+            assert_eq!(
+                ys,
+                vec![
+                    (
+                        row_of(&rows, " scheduler · poller ") as u16,
+                        PaneId::Accounts
+                    ),
+                    (row_of(&rows, " models — ") as u16, PaneId::Middle),
+                    (row_of(&rows, " activity ") as u16, PaneId::Strip),
+                ],
+                "{frame}"
+            );
+        }
+    }
+
+    /// Drag overrides still replace the automatic heights (UI-3 U7/U8), and
+    /// a dragged-short accounts pane says how many rows it hides.
+    #[test]
+    fn main_recomposed_drag_overrides_replace_automatic_heights() {
+        let (view, mut chrome) = recompose_view();
+        let w = band_bound(&view, &chrome);
+        chrome.pane_heights.accounts = Some(10);
+        let rows = render_rows(&view, &chrome, w, 43);
+        let frame = rows.join("\n");
+        let accounts = row_of(&rows, " accounts · sort ");
+        assert!(rows[accounts].contains(" · +13 more "), "{frame}");
+        assert_eq!(
+            row_of(&rows, " scheduler · poller "),
+            accounts + 10,
+            "{frame}"
+        );
+        // A dragged-tall band keeps the band layout and gains the reset row
+        // today's 7-row detail pane clipped.
+        chrome.pane_heights.accounts = None;
+        chrome.pane_heights.middle = Some(8);
+        let rows = render_rows(&view, &chrome, w, 50);
+        let frame = rows.join("\n");
+        let band = row_of(&rows, " scheduler · poller ");
+        assert_eq!(row_of(&rows, " models — "), band + 8, "{frame}");
+        assert!(rows[band + 7].contains("│ reset "), "{frame}");
+    }
+
+    /// With ONE scheduler group the summary's `load` line is visible in
+    /// today's pane; the band keeps it in its left column.
+    #[test]
+    fn main_recomposed_band_keeps_the_load_line_with_one_group() {
+        let (mut view, chrome) = recompose_view();
+        view.snapshot
+            .accounts
+            .retain(|a| a.group == crate::routing::BackendGroup::Claude);
+        view.snapshot
+            .current
+            .retain(|g, _| *g == crate::routing::BackendGroup::Claude);
+        view.codex.available = false;
+        let rows = render_rows(&view, &chrome, band_bound(&view, &chrome), 43);
+        let frame = rows.join("\n");
+        let band = row_of(&rows, " scheduler · poller ");
+        let left: Vec<&str> = rows[band + 1..band + 7]
+            .iter()
+            .map(|r| r.split_once('│').map_or(r.as_str(), |(l, _)| l))
+            .collect();
+        assert!(
+            left[0].contains("current") && left[1].contains("re-evaluation"),
+            "{frame}"
+        );
+        assert!(
+            left[2].contains("next") && left[3].contains("mode"),
+            "{frame}"
+        );
+        assert!(left[4].contains(" load "), "{frame}");
+    }
+
+    /// Synthetic widths for the pure geometry: a 103-wide left row, a
+    /// 90-wide token line, a 170-wide title whose 70-wide totals text can
+    /// leave it for the mode row (index 4).
+    fn fixture_widths(left: &[usize], right: &[usize]) -> BandWidths {
+        BandWidths {
+            title: 170,
+            title_bare: 71,
+            left: left.to_vec(),
+            mode_row: 4,
+            totals_w: 70,
+            right: right.to_vec(),
+        }
+    }
+
+    const FIXTURE_LEFT: [usize; 5] = [103, 40, 57, 40, 34];
+    const FIXTURE_RIGHT: [usize; 5] = [69, 90, 78, 78, 58];
+
+    /// The band fit decision (rule 3, row-paired geometry), pure.
+    #[test]
+    fn band_geometry_fits_only_when_every_line_and_both_titles_fit() {
+        let widths = fixture_widths(&FIXTURE_LEFT, &FIXTURE_RIGHT);
+        // 179: the block sits at 179 - 90 = 89; row 1's 103-wide left text
+        // pushes its line right to 105; the title cannot hold totals
+        // (172 + 8 > 179), so they move to the mode row, which then starts
+        // its line at 104 + 2.
+        assert_eq!(
+            band_geometry(179, 5, &widths),
+            Some(BandGeometry {
+                detail_x: 89,
+                starts: vec![105, 89, 89, 89, 106],
+                left: vec![103, 40, 57, 40, 104],
+                detail_title_x: 89,
+                totals_on_mode_row: true,
+            })
+        );
+        // From 180 the title holds totals again (170 + 2 + 8).
+        let wide = band_geometry(180, 5, &widths).expect("fits");
+        assert!(!wide.totals_on_mode_row);
+        assert_eq!((wide.detail_x, wide.detail_title_x), (90, 172));
+        assert_eq!(wide.starts, vec![105, 90, 90, 90, 90]);
+        // The narrowest fit: row 1 needs 103 + 2 + 69 = 174.
+        assert!(band_geometry(174, 5, &widths).is_some());
+        assert!(band_geometry(173, 5, &widths).is_none());
+        // A 102-wide left text on row 2 pairs with the token line: 194.
+        let codex_note = fixture_widths(&[41, 102, 57, 40, 34], &FIXTURE_RIGHT);
+        assert!(band_geometry(194, 5, &codex_note).is_some());
+        assert!(band_geometry(193, 5, &codex_note).is_none());
+        // A line wider than the block starts left of it rather than be cut.
+        let long_name = fixture_widths(&[41, 40, 57, 40, 34], &[98, 90, 78, 78, 58]);
+        assert_eq!(
+            band_geometry(179, 5, &long_name).expect("fits").starts[0],
+            81
+        );
+        // A detail line that cannot fit on its row → today's middle.
+        let wide_right = fixture_widths(&FIXTURE_LEFT, &[69, 180, 78, 78, 58]);
+        assert!(band_geometry(179, 5, &wide_right).is_none());
+        // A title that does not fit even without totals → fallback.
+        let long_titles = BandWidths {
+            title: 245,
+            title_bare: 175,
+            ..fixture_widths(&FIXTURE_LEFT, &FIXTURE_RIGHT)
+        };
+        assert!(band_geometry(179, 5, &long_titles).is_none());
+        // More detail lines than the band's rows → today's middle.
+        let six = fixture_widths(&FIXTURE_LEFT, &[69, 90, 78, 78, 58, 30]);
+        assert!(band_geometry(179, 5, &six).is_none());
+        assert!(band_geometry(179, 6, &six).is_some());
+        // No detail at all → no band.
+        assert!(band_geometry(179, 5, &fixture_widths(&[10], &[])).is_none());
+    }
+
+    /// Rule 4, pure: the largest per-line count whose aligned line fits.
+    #[test]
+    fn strip_per_line_packs_the_most_entries_that_fit() {
+        // 2+6+15+10+6+9+9+11 fields + 7 gaps = 75 cells; past the first
+        // column the marker is 1 cell, so a second entry adds 3 + 74.
+        let entry: StripWidths = [2, 6, 15, 10, 6, 9, 9, 11];
+        let five = [entry; 5];
+        assert_eq!(strip_line_width(&strip_columns(&five, 2)), 75 + 3 + 74);
+        assert_eq!(strip_per_line(&five, 179), 2);
+        assert_eq!(strip_per_line(&five, 152), 2);
+        assert_eq!(strip_per_line(&five, 151), 1, "below two → today's table");
+        assert_eq!(strip_per_line(&five, 229), 3);
+        assert_eq!(strip_per_line(&five, 228), 2);
+        assert_eq!(strip_per_line(&five[..1], 400), 1, "one entry never packs");
+        // Columns align per entry column: a long name in column 0 does not
+        // widen column 1.
+        let mut long = five;
+        long[2][2] = 30;
+        let columns = strip_columns(&long, 2);
+        assert_eq!((columns[0][2], columns[1][2]), (30, 15));
+    }
+
+    #[test]
+    fn contract_home_only_rewrites_paths_under_home() {
+        let home = std::path::Path::new("/Users/me");
+        assert_eq!(
+            contract_home("/Users/me/.config/llmux.json", Some(home)),
+            "~/.config/llmux.json"
+        );
+        assert_eq!(contract_home("/Users/me", Some(home)), "~");
+        assert_eq!(
+            contract_home("/Users/meow/x.json", Some(home)),
+            "/Users/meow/x.json"
+        );
+        assert_eq!(
+            contract_home("/etc/llmux.json", Some(home)),
+            "/etc/llmux.json"
+        );
+        assert_eq!(contract_home("/Users/me/x", None), "/Users/me/x");
+        assert_eq!(
+            contract_home("/Users/me/x", Some(std::path::Path::new("/Users/me/"))),
+            "~/x"
+        );
+    }
+
+    /// The tabs-row tail collapses the attach marker only when it repeats
+    /// the header's own pid; every other marker stays verbatim.
+    #[test]
+    fn header_tail_collapses_only_a_repeated_pid() {
+        use super::super::Attach;
+        let mut view = view_with(Vec::new());
+        view.pid = 42;
+        view.config_path = Some("/Users/me/.config/llmux.json".into());
+        let home = Some(std::path::Path::new("/Users/me"));
+        let tail = |attach: Option<Attach>| -> String {
+            let chrome = Chrome {
+                attach,
+                ..chrome_overlay(Overlay::None)
+            };
+            header_tail_spans(&view, &chrome, home)
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect()
+        };
+        let same = tail(Some(Attach {
+            pid: Some(42),
+            connected: true,
+        }));
+        assert_eq!(same, " cfg ~/.config/llmux.json  attached ");
+        let other = tail(Some(Attach {
+            pid: Some(7),
+            connected: true,
+        }));
+        assert!(other.ends_with(" attached → pid 7 "), "{other}");
+        let unknown = tail(Some(Attach {
+            pid: None,
+            connected: true,
+        }));
+        assert!(unknown.contains("pid ?"), "{unknown}");
+        let reconnecting = tail(Some(Attach {
+            pid: Some(42),
+            connected: false,
+        }));
+        assert!(
+            reconnecting.ends_with(" reconnecting → pid 42… "),
+            "{reconnecting}"
+        );
+        assert_eq!(tail(None), " cfg ~/.config/llmux.json ");
+    }
+
+    /// Review item 1: when cfg fits the header and only the attach marker
+    /// overflows it, and the tabs row has no room for the moved tail, the
+    /// header renders exactly as before — cfg stays visible in row 0.
+    #[test]
+    fn header_keeps_cfg_when_the_tabs_row_cannot_take_the_tail() {
+        let mut view = view_with(Vec::new());
+        view.config_path = Some(format!("/opt/{}/llmux.json", "deep/".repeat(18)));
+        let chrome = Chrome {
+            attach: Some(super::super::Attach {
+                pid: Some(7),
+                connected: true,
+            }),
+            ..chrome_overlay(Overlay::None)
+        };
+        let lead = Line::from(header_lead_spans(&view, SystemTime::now())).width();
+        let cfg = Line::from(format!(
+            " cfg {} ",
+            view.config_path.as_deref().unwrap_or("")
+        ))
+        .width();
+        // cfg fits, ` attached → pid 7 ` (18 cells) does not.
+        let w = (lead + cfg + 2) as u16;
+        let rows = render_rows(&view, &chrome, w, 30);
+        assert!(
+            rows[0].contains(" cfg /opt/deep/"),
+            "cfg must stay in the header at {w}:\n{}\n{}",
+            rows[0],
+            rows[1]
+        );
+    }
+
+    /// Review item 2: the packing decision measures terminal cells, so wide
+    /// (CJK) model names at the boundary width still render whole — the
+    /// plan's per-line count is what renders and the second entry's last
+    /// field is on the line.
+    #[test]
+    fn strip_packing_measures_wide_names_in_cells() {
+        let mut view = view_with(vec![
+            model_row("claude", "模型一二三四五六七八九十", 2_000, 10),
+            model_row("claude", "模型十九八七六五四三二一", 1_000, 10),
+        ]);
+        for m in &mut view.model_usage {
+            // The widest `last` form, so the bound leaves no slack.
+            m.in_flight = u32::MAX;
+        }
+        let w = (1..=600u16)
+            .find(|&w| strip_plan(&view, w, None).per_line >= 2)
+            .expect("packs at some width");
+        let rows = render_rows(&view, &chrome_overlay(Overlay::None), w, 40);
+        let title = row_of(&rows, " models — ");
+        let line = rows[title + 1].trim_end();
+        assert_eq!(line.matches("CLAUDE").count(), 2, "{w}: {line}");
+        assert!(
+            line.ends_with(&format!("{} in-flight", u32::MAX)),
+            "second entry whole at {w}: {line}"
+        );
+    }
+
+    /// Review item 3: a value past its bound form (an age of 100 days or
+    /// more: `150d12h`, one cell past `99d23h`) widens the decision instead
+    /// of being cut — a one-time layout change.
+    #[test]
+    fn band_never_cuts_a_value_past_its_bound_form() {
+        let chrome = recompose_view().1;
+        let mut view = with_ages(recompose_view().0, WIDEST_AGE);
+        let now = SystemTime::now();
+        let ms = |t: SystemTime| t.duration_since(UNIX_EPOCH).expect("epoch").as_millis() as u64;
+        let current = rid("claude", 13);
+        for account in &mut view.snapshot.accounts {
+            if account.id.0 == current {
+                account.last_refresh_ms =
+                    Some(ms(now - Duration::from_secs(150 * 86_400 + 12 * 3_600)));
+            }
+        }
+        let w = band_bound(&view, &chrome);
+        let ctx = frame_ctx(&view, &chrome);
+        let plan = MiddlePlan::new(&view, &ctx, &chrome, w, usize::from(BAND_ROWS));
+        let geometry = plan.band.as_ref().expect("band");
+        let detail = plan.detail.as_ref().expect("detail");
+        for (row, line) in band_right_lines(detail).iter().enumerate() {
+            assert!(
+                geometry.starts[row] + line.width() <= usize::from(w),
+                "row {row} cut at {w}: {line:?}"
+            );
+        }
+        let rows = render_rows(&view, &chrome, w, 43);
+        let band = row_of(&rows, " scheduler · poller ");
+        assert!(
+            rows[band + 2].contains("refreshed 150d12h ago ("),
+            "{}",
+            rows.join("\n")
+        );
+    }
+
+    /// Review round 2: a value past its bound form on a NON-selected
+    /// account (codex #16's token line, one cell past its bound because it
+    /// was refreshed 150d12h ago) is covered for every selectable row, so
+    /// the cursor landing on that account moves nothing: same geometry, same
+    /// `│` columns, same band/fallback choice as with the cursor on #13.
+    #[test]
+    fn band_geometry_does_not_follow_the_cursor_past_a_bound() {
+        let (mut view, chrome) = recompose_view();
+        let now = SystemTime::now();
+        let ms = |t: SystemTime| t.duration_since(UNIX_EPOCH).expect("epoch").as_millis() as u64;
+        let target = rid("codex", 16);
+        for account in &mut view.snapshot.accounts {
+            if account.id.0 == target {
+                account.token_expires_at_ms = Some(ms(now + WIDEST_AGE));
+                account.last_refresh_ms =
+                    Some(ms(now - Duration::from_secs(150 * 86_400 + 12 * 3_600)));
+            }
+        }
+        let on_13 = cursor_on(&view, &chrome, &rid("claude", 13));
+        let on_16 = cursor_on(&view, &chrome, &target);
+        let w = band_bound(&view, &on_13);
+        let geometry = |chrome: &Chrome| {
+            let ctx = frame_ctx(&view, chrome);
+            MiddlePlan::new(&view, &ctx, chrome, w, usize::from(BAND_ROWS)).band
+        };
+        assert_eq!(geometry(&on_13), geometry(&on_16), "at {w}");
+        let bars = |chrome: &Chrome| -> Option<Vec<usize>> {
+            let rows = render_rows(&view, chrome, w, 43);
+            has_band(&rows).then(|| {
+                let band = row_of(&rows, " scheduler · poller ");
+                rows[band + 1..band + 7].iter().map(|r| bar_at(r)).collect()
+            })
+        };
+        let (bars_13, bars_16) = (bars(&on_13), bars(&on_16));
+        assert!(bars_13.is_some(), "band at the bound width {w}");
+        assert_eq!(bars_13, bars_16, "│ columns at {w}");
+    }
+
+    /// Review item 6: a long poller back-off list pushes `totals …` out of
+    /// the title onto the mode row, which then ends with the totals text,
+    /// carries its own `│` right of the block, and cuts nothing.
+    #[test]
+    fn totals_ride_the_mode_row_when_the_title_is_full() {
+        let (mut view, chrome) = recompose_view();
+        for n in [1, 2, 3] {
+            if let Some(health) = view.poll_health.get_mut(&rid("claude", n)) {
+                health.consecutive_failures = 3;
+            }
+        }
+        let w = 179;
+        let rows = render_rows(&view, &chrome, w, 43);
+        let frame = rows.join("\n");
+        assert!(has_band(&rows), "{frame}");
+        let band = row_of(&rows, " scheduler · poller ");
+        assert!(!rows[band].contains(" · totals "), "{frame}");
+        assert!(rows[band].contains(" · backoff "), "{frame}");
+        let ctx = frame_ctx(&view, &chrome);
+        let plan = MiddlePlan::new(&view, &ctx, &chrome, w, usize::from(BAND_ROWS));
+        let geometry = plan.band.as_ref().expect("band");
+        assert!(geometry.totals_on_mode_row);
+        let mode = plan.summary.band_head.len() - 1;
+        let (left, right) = rows[band + 1 + mode].split_once('│').expect("bar");
+        assert!(
+            left.trim_end().ends_with("in 5036.9M / out 847.6M tok"),
+            "{frame}"
+        );
+        assert!(
+            bar_at(&rows[band + 1 + mode]) > geometry.detail_x - 1,
+            "{frame}"
+        );
+        assert!(
+            right.starts_with(" poll  ") && !right.trim_end().is_empty(),
+            "{frame}"
+        );
+        for (row, line) in band_right_lines(plan.detail.as_ref().expect("detail"))
+            .iter()
+            .enumerate()
+        {
+            assert!(
+                geometry.starts[row] + line.width() <= usize::from(w),
+                "row {row}"
+            );
+        }
+        // Whole title: it ends in the detail title or its fill, never cut.
+        assert!(
+            rows[band].ends_with(BAND_DETAIL_TITLE) || rows[band].ends_with('─'),
+            "title whole:\n{frame}"
+        );
+    }
+
+    /// A header that fits keeps cfg + attach in place and the tabs row
+    /// carries no tail — wide terminals render exactly as before.
+    #[test]
+    fn header_that_fits_keeps_its_tail_in_place() {
+        let (view, chrome) = recompose_view();
+        let rows = render_rows(&view, &chrome, 260, 43);
+        let frame = rows.join("\n");
+        assert!(
+            rows[0].contains(" cfg ") && rows[0].contains("attached → pid 1695"),
+            "{frame}"
+        );
+        assert!(!rows[1].contains(" cfg "), "{frame}");
+    }
+
+    /// Tiny and short terminals squeeze the recomposed layout without a
+    /// panic (the solver takes over below the activity floor, as before).
+    #[test]
+    fn main_recomposed_renders_at_tiny_sizes_without_panic() {
+        let (view, chrome) = recompose_view();
+        for (w, h) in [
+            (1u16, 1u16),
+            (20, 5),
+            (60, 12),
+            (179, 10),
+            (179, 20),
+            (400, 43),
+        ] {
+            let rows = render_rows(&view, &chrome, w, h);
+            assert_eq!(rows.len(), usize::from(h));
+        }
+    }
+
+    // --- fold 7d-spent accounts (`z`, owner decision 2026-10-22) ---------
+
+    /// Display numbers (1-based, name order) of the recompose fixture's
+    /// accounts whose 7d window is spent past the 99% ceiling: seven claude
+    /// accounts and one codex account, as in the owner-approved picture.
+    const FOLD_MEMBERS: [usize; 8] = [2, 6, 7, 8, 10, 12, 14, 15];
+    /// The claude account over its 5h ceiling: `!`-marked, never folded.
+    const FIVE_H_OVER: usize = 4;
+
+    /// The recompose fixture with [`FOLD_MEMBERS`] at 100% of their 7d
+    /// window (status `7d 100.0% > 99%` on every one) and [`FIVE_H_OVER`]
+    /// at 95% of its 5h window, plus a fixed config path so the frame never
+    /// depends on the machine's home directory.
+    fn fold_view() -> (DashboardView, Chrome) {
+        let (mut view, chrome) = recompose_view();
+        for (i, account) in view.snapshot.accounts.iter_mut().enumerate() {
+            let n = i + 1;
+            if FOLD_MEMBERS.contains(&n) {
+                if let Some(window) = account.seven_day.as_mut() {
+                    window.utilization = 1.0;
+                }
+            }
+            if n == FIVE_H_OVER {
+                if let Some(window) = account.five_hour.as_mut() {
+                    window.utilization = 0.95;
+                }
+            }
+        }
+        view.config_path = Some("/etc/llmux/llmux.json".into());
+        (view, chrome)
+    }
+
+    /// Width-preserving mask of the frame's wall-clock text: `(HH:MM)` /
+    /// `(MM-DD HH:MM)` stamps ([`mask_clocks`]), the activity `HH:MM:SS`
+    /// stamps and the 0.1 s elapsed times (`6.0s`) — every digit in them
+    /// becomes `9`.
+    fn mask_volatile(row: &str) -> String {
+        let chars: Vec<char> = mask_clocks(row).chars().collect();
+        let mut out = chars.clone();
+        let digit = |i: usize| chars.get(i).is_some_and(char::is_ascii_digit);
+        for i in 0..chars.len() {
+            if digit(i) && digit(i + 1) && chars.get(i + 2) == Some(&':') && digit(i + 3) {
+                for j in (i..i + 8).filter(|&j| digit(j)) {
+                    out[j] = '9';
+                }
+            }
+            if chars[i] == '.'
+                && i > 0
+                && digit(i - 1)
+                && digit(i + 1)
+                && chars.get(i + 2) == Some(&'s')
+            {
+                let mut j = i;
+                while j > 0 && digit(j - 1) {
+                    j -= 1;
+                    out[j] = '9';
+                }
+                out[i + 1] = '9';
+            }
+        }
+        out.into_iter().collect()
+    }
+
+    /// One rendered MAIN frame as masked text rows ([`mask_volatile`]) each
+    /// followed by its style runs (`fg/bg/modifier×cells`), and an FNV-1a
+    /// hash of that text — text AND styles, for the fold-OFF identity pin.
+    fn frame_digest(view: &DashboardView, chrome: &Chrome, w: u16, h: u16) -> (String, u64) {
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).expect("terminal");
+        let mut hits = None;
+        let buffer = terminal
+            .draw(|f| draw(f, Some(view), chrome, &mut hits))
+            .expect("draw")
+            .buffer
+            .clone();
+        let mut out = String::new();
+        for y in 0..h {
+            let text: String = (0..w).map(|x| buffer[(x, y)].symbol()).collect();
+            out.push_str(&mask_volatile(&text));
+            out.push('\n');
+            let mut runs: Vec<(String, usize)> = Vec::new();
+            for x in 0..w {
+                let cell = &buffer[(x, y)];
+                let style = format!("{:?}/{:?}/{}", cell.fg, cell.bg, cell.modifier.bits());
+                match runs.last_mut() {
+                    Some((last, n)) if *last == style => *n += 1,
+                    _ => runs.push((style, 1)),
+                }
+            }
+            let runs: Vec<String> = runs.iter().map(|(s, n)| format!("{s}×{n}")).collect();
+            out.push_str(&runs.join(" "));
+            out.push('\n');
+        }
+        let hash = out.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+            (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+        });
+        (out, hash)
+    }
+
+    /// Digest of the fold fixture at 179×43, pinned from the renderer as it
+    /// was before the fold existed (PR-A main, 26b5ab9); re-pinned on the fork after
+    /// the gemini-free fixture change (see sync/tui PR).
+    const FOLD_OFF_179X43_DIGEST: u64 = 9_532_344_216_522_521_565;
+
+    /// Fold OFF (the default) renders exactly as the dashboard did before
+    /// the fold existed — every cell's text and style.
+    #[test]
+    fn fold_off_frame_is_identical_to_the_pre_fold_renderer() {
+        let (view, chrome) = fold_view();
+        let chrome = Chrome {
+            fold_exhausted: false,
+            ..chrome
+        };
+        let (frame, hash) = frame_digest(&view, &chrome, 179, 43);
+        assert_eq!(
+            hash, FOLD_OFF_179X43_DIGEST,
+            "fold-OFF frame changed (hash {hash}):\n{frame}"
+        );
+    }
+
+    /// The backend group of fixture account `n`.
+    fn fold_group(n: usize) -> &'static str {
+        match n {
+            1..=14 => "claude",
+            15..=18 => "codex",
+            _ => "grok",
+        }
+    }
+
+    /// Display numbers of the live-shaped fixture's 7d-spent accounts:
+    /// seven claude and two codex, as on the owner's dashboard (2026-10-22).
+    const LIVE_MEMBERS: [usize; 9] = [2, 3, 6, 7, 11, 12, 14, 15, 16];
+    /// Claude #4 is over its 5h ceiling and #5 is paused — both also at 100%
+    /// of their 7d window, and both stay in the table.
+    const LIVE_FIVE_H_OVER: usize = 4;
+    const LIVE_PAUSED: usize = 5;
+
+    /// The live-shaped table name of fixture account `n` (synthetic): 8–10
+    /// cells on the members, 16 cells on three non-members, all on
+    /// `ex.io`-style domains no abbreviation rewrites — in name order, so
+    /// `#n` is fixture account `n`.
+    fn fold_name(n: usize) -> String {
+        [
+            "u01@ex.io",
+            "u02@ex.io",
+            "u03@ex.io",
+            "u04@ex.io",
+            "u05@ex.io",
+            "u06@ex.io",
+            "u07@ex.io",
+            "u08-fixture@x.io",
+            "u09@ex.io",
+            "u010@ex.io",
+            "u015@ex.io",
+            "u016@ex.io",
+            "u017xxxxxx@ex.io",
+            "u018@ex.io",
+            "c1@ex.io",
+            "c02@ex.io",
+            "c03@ex.io",
+            "c04xxxxxxx@ex.io",
+            "grok1@ex.io",
+            "grok2@ex.io",
+            "grok3@ex.io",
+        ][n - 1]
+            .to_string()
+    }
+
+    /// The full id behind [`fold_name`]: the group prefix the table strips.
+    fn live_id(n: usize) -> String {
+        format!("{}:{}", fold_group(n), fold_name(n))
+    }
+
+    /// A MAIN state shaped like the owner's live dashboard: the recompose
+    /// fixture with the live names ([`fold_name`]); [`LIVE_MEMBERS`] at 100%
+    /// of a 7d window resetting in `4d 2h`, the claude ones with a Fable
+    /// window at 82% left (`4d 2h`); req `81.0k`–`88.0k` and tok
+    /// `1202.0M`–`1216.0M` (the live value widths); `rst` reading `0`,
+    /// `n/e` and `?`; and the 5h-over and paused accounts also 7d-spent.
+    fn live_view() -> (DashboardView, Chrome) {
+        use crate::scheduler::window::{LimitSeverity, ScopedQuotaWindow, WindowSource};
+        let (mut view, chrome) = recompose_view();
+        let now = SystemTime::now();
+        // 30 s inside `4d 2h`.
+        let window = |utilization: f64| QuotaWindow {
+            utilization,
+            resets_at: now + Duration::from_secs(4 * 86_400 + 2 * 3_600 + 30),
+            fetched_at: now - Duration::from_secs(5),
+            source: WindowSource::Headers,
+        };
+        for n in 1..=21 {
+            rename_account(&mut view, &rid(fold_group(n), n), &live_id(n));
+        }
+        for c in &mut view.in_flight {
+            c.account = Some(live_id(13));
+        }
+        for (i, account) in view.snapshot.accounts.iter_mut().enumerate() {
+            let n = i + 1;
+            if LIVE_MEMBERS.contains(&n) || n == LIVE_FIVE_H_OVER || n == LIVE_PAUSED {
+                account.seven_day = Some(window(1.0));
+            }
+            if LIVE_MEMBERS.contains(&n) && fold_group(n) == "claude" {
+                account.scoped_limits = vec![ScopedQuotaWindow {
+                    scope_label: crate::routing::FABLE_SCOPE_LABEL.into(),
+                    window: window(0.18),
+                    severity: LimitSeverity::Normal,
+                    is_active: false,
+                }];
+            }
+            if n == LIVE_FIVE_H_OVER {
+                if let Some(five) = account.five_hour.as_mut() {
+                    five.utilization = 0.95;
+                }
+            }
+            account.paused = n == LIVE_PAUSED;
+        }
+        for &n in &LIVE_MEMBERS {
+            view.session_totals.insert(
+                live_id(n),
+                super::super::activity::Totals {
+                    requests: 80_000 + 500 * n as u64,
+                    ok: 80_000,
+                    errors: 0,
+                    tokens_in: 1_200_000_000 + 1_000_000 * n as u64,
+                    tokens_out: 0,
+                },
+            );
+        }
+        view.usage_controls.clear();
+        for n in [2, 15] {
+            view.usage_controls.insert(
+                live_id(n),
+                crate::proxy::usage_controls::UsageControlDoc {
+                    available_resets: Some(0),
+                    ..Default::default()
+                },
+            );
+        }
+        view.usage_controls.insert(
+            live_id(3),
+            crate::proxy::usage_controls::UsageControlDoc {
+                eligibility: Some(crate::auth::codex_usage::ResetEligibility {
+                    eligible: Some(false),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        view.config_path = Some("/etc/llmux/llmux.json".into());
+        let chrome = Chrome {
+            fold_exhausted: true,
+            ..chrome
+        };
+        (view, chrome)
+    }
+
+    /// [`live_view`] with #6 at 99.5% of its 7d window, so the members'
+    /// status texts differ.
+    fn live_differing_view() -> (DashboardView, Chrome) {
+        let (mut view, chrome) = live_view();
+        if let Some(window) = view.snapshot.accounts[5].seven_day.as_mut() {
+            window.utilization = 0.995;
+        }
+        (view, chrome)
+    }
+
+    /// `chrome` with the fold toggle off.
+    fn fold_off(chrome: &Chrome) -> Chrome {
+        Chrome {
+            fold_exhausted: false,
+            mode: chrome.mode,
+            attach: chrome.attach,
+            ..chrome_overlay(Overlay::None)
+        }
+    }
+
+    /// The fold MAIN plans at terminal width `w` (with the table's own
+    /// column layout at that width, as [`draw_main`] does).
+    fn fold_at(view: &DashboardView, ctx: &FrameCtx, chrome: &Chrome, w: u16) -> Fold {
+        fold_plan(view, ctx, chrome, &table_layout(view, ctx, w), w)
+    }
+
+    /// The narrowest terminal width at which the fold applies.
+    fn fold_bound(view: &DashboardView, chrome: &Chrome) -> u16 {
+        let ctx = frame_ctx(view, chrome);
+        (1..=600u16)
+            .find(|&w| fold_at(view, &ctx, chrome, w).plan().is_some())
+            .expect("the fold applies at some width")
+    }
+
+    /// Terminal column of `needle` in a rendered row (every glyph in these
+    /// rows is one cell wide, so the column is the char count before it).
+    fn col_of(row: &str, needle: &str) -> u16 {
+        let byte = row
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle:?} not in {row:?}"));
+        row[..byte].chars().count() as u16
+    }
+
+    /// Every whitespace-separated token of `line`, in order.
+    fn tokens(line: &str) -> Vec<&str> {
+        line.split_whitespace().collect()
+    }
+
+    /// Whether `want` appears in `have` as an in-order subsequence.
+    fn in_order(have: &[&str], want: &[&str]) -> bool {
+        let mut it = have.iter();
+        want.iter().all(|w| it.any(|h| h == w))
+    }
+
+    /// Render MAIN and return the full buffer (text + styles).
+    fn render_buffer(
+        view: &DashboardView,
+        chrome: &Chrome,
+        w: u16,
+        h: u16,
+    ) -> ratatui::buffer::Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).expect("terminal");
+        let mut hits = None;
+        terminal
+            .draw(|f| draw(f, Some(view), chrome, &mut hits))
+            .expect("draw")
+            .buffer
+            .clone()
+    }
+
+    /// Rows of the activity pane: from its title to the settings bar.
+    fn activity_rows(rows: &[String]) -> usize {
+        row_of(rows, " sched default") - row_of(rows, " activity ")
+    }
+
+    /// The text of fold entry `name` on `line`: from its `!` marker to the
+    /// next entry's marker (or the line's end).
+    fn entry_on<'a>(line: &'a str, name: &str) -> &'a str {
+        let at = line.find(name).expect("entry name");
+        let start = line[..at].rfind('!').expect("entry marker");
+        let end = line[at..].find("   !").map_or(line.len(), |next| at + next);
+        &line[start..end]
+    }
+
+    /// The fold-OFF frame and the fold-ON frame ([`frame_digest`] lines,
+    /// text and styles) differ only in the accounts title row and the
+    /// keybar row, and those two differ exactly by `note` and `z fold`.
+    fn assert_only_title_and_keybar_differ(view: &DashboardView, on: &Chrome, note: &str) {
+        let (off, _) = frame_digest(view, &fold_off(on), 179, 43);
+        let (on, _) = frame_digest(view, on, 179, 43);
+        let (off, on): (Vec<&str>, Vec<&str>) = (off.lines().collect(), on.lines().collect());
+        assert_eq!(off.len(), on.len());
+        let (title, keybar) = (2 * 2, 2 * 42);
+        for (i, (a, b)) in off.iter().zip(&on).enumerate() {
+            if ![title, title + 1, keybar, keybar + 1].contains(&i) {
+                assert_eq!(a, b, "line {i}:\n{}", on.join("\n"));
+            }
+        }
+        let counts = "(claude 14 · codex 4 · grok 3)";
+        assert!(
+            off[title].contains(&format!("{counts} ─")),
+            "{}",
+            off[title]
+        );
+        assert!(
+            on[title].contains(&format!("{counts}{note} ─")),
+            "{}",
+            on[title]
+        );
+        assert_eq!(
+            on[keybar].trim_end(),
+            format!("{}  z fold", off[keybar].trim_end())
+        );
+    }
+
+    /// The owner's live shape at 179×43: the 12 accounts that are not
+    /// 7d-spent keep their rows and own numbers (the 5h-over and paused
+    /// ones among them), the title carries the fold label with the shared
+    /// status, and the 9 spent accounts become a dim-headed block of two
+    /// entries per line from the table's left column — every value still
+    /// on screen — and activity gains 3 rows.
+    #[test]
+    fn fold_live_shape_179x43_folds_two_per_line() {
+        let (view, chrome) = live_view();
+        let rows = render_rows(&view, &chrome, 179, 43);
+        let frame = rows.join("\n");
+        println!("{frame}");
+        assert_eq!(rows.len(), 43);
+        let ctx = frame_ctx(&view, &chrome);
+        let fold = fold_at(&view, &ctx, &chrome, 179);
+        let plan = fold.plan().expect("the fold applies at 179");
+        assert_eq!(
+            (plan.per_line, plan.lines()),
+            (2, 6),
+            "k = 2, 5 entry lines"
+        );
+        let accounts = row_of(&rows, " accounts · sort ");
+        assert!(
+            rows[accounts].contains(
+                " · 21 (claude 14 · codex 4 · grok 3) · 7d spent 9 folded: 7d 100.0% > 99% "
+            ) && !rows[accounts].contains("more"),
+            "{frame}"
+        );
+        // Table: the 12 non-members, in order, each with its own number.
+        let others: Vec<usize> = (1..=21).filter(|n| !LIVE_MEMBERS.contains(n)).collect();
+        assert_eq!(others.len(), 12);
+        for (i, n) in others.iter().enumerate() {
+            let row = &rows[accounts + 2 + i];
+            assert!(
+                row.contains(&format!("{n:<2} {}", fold_name(*n))),
+                "table row {i} is #{n}:\n{frame}"
+            );
+        }
+        let five = &rows[accounts + 2 + 1];
+        assert!(
+            five.starts_with("!  CLAUDE  4 ") && five.contains("5h 95.0% > 90%"),
+            "the 5h-over account stays in the table:\n{frame}"
+        );
+        assert!(
+            rows[accounts + 2 + 2].contains(&format!("5  {}", fold_name(5)))
+                && rows[accounts + 2 + 2].contains("paused"),
+            "the paused account stays in the table:\n{frame}"
+        );
+        // Fold block: the field header, then five entry lines, from the
+        // table's left column.
+        let head = accounts + 2 + 12;
+        assert!(rows[head].starts_with("   group   # account "), "{frame}");
+        assert_eq!(rows[head].matches("group").count(), 2, "{frame}");
+        assert_eq!(rows[head].matches(" tok").count(), 2, "{frame}");
+        assert!(!rows[head].contains("status"), "status is shared:\n{frame}");
+        let fold_rows = &rows[head + 1..head + 6];
+        assert!(fold_rows[0].starts_with("!  CLAUDE  2 "), "{frame}");
+        assert!(
+            !frame.contains("7d 100.0% > 99%  ") && frame.matches("7d 100.0% > 99%").count() == 1,
+            "the shared status shows once, in the title:\n{frame}"
+        );
+        for (line, pair) in fold_rows.iter().zip(LIVE_MEMBERS.chunks(2)) {
+            let names: Vec<usize> = pair
+                .iter()
+                .map(|&n| line.find(&fold_name(n)).expect("member on its line"))
+                .collect();
+            assert!(names.windows(2).all(|w| w[0] < w[1]), "{line}");
+        }
+        // Every member's values, as text, in the table's order.
+        for (i, &n) in LIVE_MEMBERS.iter().enumerate() {
+            let name = fold_name(n);
+            let entry = entry_on(&fold_rows[i / 2], &name);
+            let claude = fold_group(n) == "claude";
+            let group = if claude { "CLAUDE" } else { "CODEX" };
+            let rst = match n {
+                2 | 15 => "0",
+                3 => "n/e",
+                _ => "?",
+            };
+            let number = n.to_string();
+            let req = format::human_count(80_000 + 500 * n as u64);
+            let tok = format::human_count(1_200_000_000 + 1_000_000 * n as u64);
+            let mut want = vec!["!", group, number.as_str(), name.as_str()];
+            if claude {
+                want.extend(["70%", "4d", "2h", "0%!", "4d", "2h", "82%"]);
+            } else {
+                want.extend(["-", "4d", "2h", "0%!", "-"]);
+            }
+            want.extend([rst, "0", req.as_str(), tok.as_str()]);
+            assert!(
+                in_order(&tokens(entry), &want),
+                "#{n} entry {entry:?} carries {want:?}:\n{frame}"
+            );
+            assert!(!entry.contains("rst "), "no bar label in text:\n{frame}");
+        }
+        // The band follows the block; activity gains three rows.
+        assert_eq!(row_of(&rows, " scheduler · poller "), head + 6, "{frame}");
+        assert!(
+            rows[42].trim_end().ends_with("↑↓ scroll  z fold"),
+            "{frame}"
+        );
+        let off = render_rows(&view, &fold_off(&chrome), 179, 43);
+        assert_eq!(activity_rows(&rows), activity_rows(&off) + 3, "{frame}");
+    }
+
+    /// The fold never makes the pane taller (coordinator rule A): with
+    /// differing statuses only one entry fits a 179-column line, so the
+    /// block would take 1 + 9 lines for 9 rows — the fold does not apply,
+    /// the title says it saves no row, and the rest of the frame is the
+    /// fold-OFF frame.
+    #[test]
+    fn fold_that_saves_no_row_falls_back_to_the_full_table() {
+        let (view, chrome) = live_differing_view();
+        let ctx = frame_ctx(&view, &chrome);
+        assert!(matches!(
+            fold_at(&view, &ctx, &chrome, 179),
+            Fold::SavesNoRow
+        ));
+        assert_only_title_and_keybar_differ(&view, &chrome, " · fold: saves no row");
+    }
+
+    /// Fold ON with no 7d-spent account: the title says there is nothing to
+    /// fold, and the rest of the frame is the fold-OFF frame.
+    #[test]
+    fn fold_title_says_nothing_to_fold() {
+        let (mut view, chrome) = live_view();
+        for account in &mut view.snapshot.accounts {
+            if let Some(window) = account.seven_day.as_mut() {
+                window.utilization = 0.31;
+            }
+        }
+        let ctx = frame_ctx(&view, &chrome);
+        assert!(matches!(fold_at(&view, &ctx, &chrome, 179), Fold::Nothing));
+        assert_only_title_and_keybar_differ(&view, &chrome, " · fold: nothing to fold");
+    }
+
+    /// Below the narrowest width at which the block saves a row the fold
+    /// does not apply — today's full table — and the title says why: one
+    /// column below the bound only one entry fits a line (`saves no row`);
+    /// at 60 columns not even the title fits (`too narrow`).
+    #[test]
+    fn fold_title_says_why_below_the_fold_bound() {
+        let (view, chrome) = live_view();
+        let w = fold_bound(&view, &chrome);
+        println!("narrowest fold width: {w}");
+        let ctx = frame_ctx(&view, &chrome);
+        for narrow in [w - 1, 60] {
+            let fold = fold_at(&view, &ctx, &chrome, narrow);
+            if narrow == w - 1 {
+                assert!(matches!(fold, Fold::SavesNoRow), "{}", fold.note());
+            } else {
+                assert!(matches!(fold, Fold::TooNarrow), "{}", fold.note());
+            }
+            let rows = render_rows(&view, &chrome, narrow, 80);
+            let frame = rows.join("\n");
+            let accounts = row_of(&rows, " accounts · sort ");
+            if narrow == w - 1 {
+                assert!(
+                    rows[accounts].contains(" · fold: saves no row "),
+                    "{narrow}:\n{frame}"
+                );
+            }
+            for n in 1..=21 {
+                assert!(
+                    rows[accounts + 1 + n].contains(&format!("{n:<2} {}", &fold_name(n)[..3])),
+                    "row #{n} at {narrow}:\n{frame}"
+                );
+            }
+        }
+        let rows = render_rows(&view, &chrome, w, 80);
+        assert!(
+            rows.iter().any(|r| r.contains(" · 7d spent 9 folded: ")),
+            "{w}"
+        );
+    }
+
+    /// Members whose status texts differ: the title has no status, and each
+    /// entry carries its own status field (first after the account) — at
+    /// the narrowest width where that fold saves a row.
+    #[test]
+    fn fold_with_differing_statuses_gives_each_entry_its_status() {
+        let (view, chrome) = live_differing_view();
+        let w = fold_bound(&view, &chrome);
+        println!("differing-status fold bound: {w}");
+        let rows = render_rows(&view, &chrome, w, 60);
+        let frame = rows.join("\n");
+        println!("{frame}");
+        let accounts = row_of(&rows, " accounts · sort ");
+        assert!(rows[accounts].contains(" · 7d spent 9 folded ─"), "{frame}");
+        let head = accounts + 2 + 12;
+        assert!(rows[head].contains("status"), "{frame}");
+        let block = &rows[head + 1..row_of(&rows, " scheduler · poller ")];
+        let statuses: usize = block.iter().map(|r| r.matches("% > 99%").count()).sum();
+        assert_eq!(statuses, 9, "one status per entry:\n{frame}");
+        let six = block
+            .iter()
+            .find(|r| r.contains(&fold_name(6)))
+            .expect("#6 entry");
+        let after = &six[six.find(&fold_name(6)).expect("name")..];
+        assert!(
+            in_order(&tokens(after), &["7d", "99.5%", ">", "99%", "70%"]),
+            "#6's own status right after its account:\n{frame}"
+        );
+    }
+
+    /// A clock tick never moves the fold (coordinator rule B): one member's
+    /// 7d or Fbl reset at its widest form (`23h 59m ◑`, stale) or its
+    /// shortest (`42s`), its Fbl window expired, or its 5h window expired
+    /// (`○ 100%`) or stale
+    /// (`◑ 70%`), leaves the entries per line, every field width and every
+    /// entry's column exactly where they are.
+    #[test]
+    fn fold_geometry_does_not_follow_the_clock() {
+        #[derive(Clone, Copy)]
+        enum Win {
+            Seven,
+            Five,
+            Fable,
+        }
+        let now = SystemTime::now();
+        let variant = |change: Option<(Win, i64, u64)>| {
+            let (mut view, chrome) = live_view();
+            if let Some((win, resets, age)) = change {
+                let account = &mut view.snapshot.accounts[1];
+                let window = match win {
+                    Win::Seven => account.seven_day.as_mut(),
+                    Win::Five => account.five_hour.as_mut(),
+                    Win::Fable => account.scoped_limits.first_mut().map(|s| &mut s.window),
+                };
+                if let Some(w) = window {
+                    w.resets_at = if resets < 0 {
+                        now - Duration::from_secs(resets.unsigned_abs())
+                    } else {
+                        now + Duration::from_secs(resets as u64)
+                    };
+                    w.fetched_at = now - Duration::from_secs(age);
+                }
+            }
+            (view, chrome)
+        };
+        let variants = [
+            ("7d widest", variant(Some((Win::Seven, 86_370, 601)))),
+            ("7d shortest", variant(Some((Win::Seven, 42, 5)))),
+            ("Fbl widest", variant(Some((Win::Fable, 86_370, 601)))),
+            ("Fbl shortest", variant(Some((Win::Fable, 42, 5)))),
+            // Expired: the Fbl window resets back to 100% left while the
+            // member stays 7d-spent (`0s ○` / `100%`).
+            ("Fbl expired", variant(Some((Win::Fable, -1, 2)))),
+            ("5h expired", variant(Some((Win::Five, -1, 2)))),
+            ("5h stale", variant(Some((Win::Five, 10_590, 601)))),
+        ];
+        // Entries per line, field widths per entry column, and each folded
+        // entry's column on screen — `None` = no fold.
+        let geometry = |view: &DashboardView, chrome: &Chrome, w: u16| {
+            let ctx = frame_ctx(view, chrome);
+            let fold = fold_at(view, &ctx, chrome, w);
+            let plan = fold.plan()?;
+            let (rows, hits) = render_with_hits(view, chrome, w, 80);
+            let starts: Vec<(usize, u16)> = hits
+                .account_rows
+                .iter()
+                .filter(|h| plan.members.contains(&h.display_idx))
+                .map(|h| (h.display_idx, h.area.x))
+                .collect();
+            println!("  {}", rows[row_of(&rows, &fold_name(2))].trim_end());
+            Some((plan.per_line, plan.columns.clone(), starts))
+        };
+        let (base_view, base_chrome) = live_view();
+        for w in [fold_bound(&base_view, &base_chrome), 179, 250] {
+            println!("today at {w}:");
+            let base = geometry(&base_view, &base_chrome, w);
+            assert!(base.is_some(), "fold at {w}");
+            for (name, (view, chrome)) in &variants {
+                println!("{name} at {w}:");
+                assert_eq!(geometry(view, chrome, w), base, "{name} at {w}");
+            }
+        }
+    }
+
+    /// The cursor on a folded account highlights its entry the way the
+    /// table highlights a row (reverse video, `>` marker), the detail band
+    /// shows it, and the cursor walks every account in the same order with
+    /// the fold on or off.
+    #[test]
+    fn fold_cursor_on_a_folded_account_highlights_its_entry() {
+        let (view, chrome) = live_view();
+        let target = live_id(7);
+        let on = Chrome {
+            fold_exhausted: true,
+            ..cursor_on(&view, &chrome, &target)
+        };
+        let buffer = render_buffer(&view, &on, 179, 43);
+        let text = |y: u16| {
+            (0..179)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        };
+        let rows: Vec<String> = (0..43).map(text).collect();
+        let frame = rows.join("\n");
+        let accounts = row_of(&rows, " accounts · sort ");
+        let head = accounts + 2 + 12;
+        let y = (head + 1 + row_of(&rows[head + 1..], &fold_name(7))) as u16;
+        let row = &rows[usize::from(y)];
+        let x = col_of(row, &fold_name(7));
+        for dx in 0..fold_name(7).len() as u16 {
+            assert!(
+                buffer[(x + dx, y)].modifier.contains(Modifier::REVERSED),
+                "selected entry reversed at {dx}:\n{frame}"
+            );
+        }
+        assert!(
+            row.contains(&format!(">! CLAUDE  7 {}", fold_name(7))),
+            "{frame}"
+        );
+        let other = col_of(row, &fold_name(6));
+        assert!(
+            !buffer[(other, y)].modifier.contains(Modifier::REVERSED),
+            "only the selected entry:\n{frame}"
+        );
+        let band = row_of(&rows, " scheduler · poller ");
+        assert!(
+            rows[band + 1].contains(&format!("│ {target} · oauth")),
+            "{frame}"
+        );
+        // Same cursor walk, fold on or off.
+        let ctx = frame_ctx(&view, &chrome);
+        for (idx, &account) in ctx.order.iter().enumerate() {
+            let walk = |fold: bool| -> String {
+                let c = Chrome {
+                    mode: Mode::Select { idx },
+                    fold_exhausted: fold,
+                    attach: chrome.attach,
+                    ..chrome_overlay(Overlay::None)
+                };
+                let rows = render_rows(&view, &c, 179, 43);
+                rows[row_of(&rows, " scheduler · poller ") + 1].clone()
+            };
+            let id = &view.snapshot.accounts[account].id.0;
+            let detail = walk(true);
+            assert!(
+                detail.contains(&format!("│ {id} · ")),
+                "idx {idx}: {detail}"
+            );
+            assert_eq!(detail, walk(false), "idx {idx}");
+        }
+    }
+
+    /// A remote-backend `App` (no terminal), for driving real clicks.
+    fn fold_app() -> super::super::App {
+        super::super::App::new(super::super::Backend::Remote(Box::new(
+            super::super::Remote {
+                client: reqwest::Client::new(),
+                base_url: "http://localhost:3456".into(),
+                api_key: None,
+                pid: None,
+                doc: None,
+                connected: false,
+                pending_codex: None,
+                pending_settings: None,
+                pending_pause: None,
+                pending_limits: None,
+                pending_mode: None,
+                pending_add: None,
+                pending_remove: None,
+                pending_grok: None,
+            },
+        )))
+    }
+
+    /// Clicks resolve to the right account: a folded entry opens that
+    /// account, a table row below removed members opens its own account,
+    /// and the drag border sits on the shorter pane's bottom.
+    #[test]
+    fn fold_clicks_select_the_folded_entry_and_the_shifted_rows() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let (view, chrome) = live_view();
+        let (rows, hits) = render_with_hits(&view, &chrome, 179, 43);
+        let frame = rows.join("\n");
+        let accounts = row_of(&rows, " accounts · sort ");
+        let band = row_of(&rows, " scheduler · poller ");
+        assert_eq!(
+            (hits.separators[0].y, hits.separators[0].pane_top),
+            (band as u16, accounts as u16),
+            "{frame}"
+        );
+        let click = |id: &str, column: u16, row: u16| {
+            let mut app = fold_app();
+            app.fold_exhausted = true;
+            app.account_row_chrome = hits.account_rows.clone();
+            let down = MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            };
+            assert!(app.on_mouse(down, Some(&view)), "click at {column},{row}");
+            assert_eq!(
+                app.account_modal.as_ref().map(|m| m.account.as_str()),
+                Some(id),
+                "click at {column},{row}:\n{frame}"
+            );
+        };
+        // Table row 2 shows #4 (the row below folded #2 and #3).
+        let y = accounts + 2 + 1;
+        assert!(rows[y].contains(&fold_name(4)), "{frame}");
+        click(&live_id(4), 10, y as u16);
+        // Folded entries: right of a line, left of a line, alone on a line.
+        let head = accounts + 2 + 12;
+        // (An entry is found by its number and name together.)
+        for n in [7, 11, 16] {
+            let needle = format!("{n:>2} {}", fold_name(n));
+            let y = row_of(&rows[head + 1..], &needle) + head + 1;
+            let x = col_of(&rows[y], &needle) + 3;
+            click(&live_id(n), x, y as u16);
+        }
+        // Every hit maps a visible account once.
+        let mut seen: Vec<usize> = hits.account_rows.iter().map(|h| h.display_idx).collect();
+        seen.sort_unstable();
+        assert_eq!(seen, (0..21).collect::<Vec<_>>(), "{frame}");
+    }
+
+    /// The `+N more` count on a short terminal: table rows first, then the
+    /// fold block — N counts the hidden table rows plus the accounts on the
+    /// fold lines the pane cannot show.
+    #[test]
+    fn fold_on_a_short_terminal_counts_the_hidden_entries() {
+        let (view, chrome) = live_view();
+        let rows = render_rows(&view, &chrome, 179, 38);
+        let frame = rows.join("\n");
+        let accounts = row_of(&rows, " accounts · sort ");
+        let band = row_of(&rows, " scheduler · poller ");
+        assert_eq!(band - accounts, 18, "{frame}");
+        assert!(
+            rows[accounts].contains(" · 7d spent 9 folded: 7d 100.0% > 99% · +3 more "),
+            "{frame}"
+        );
+        assert!(rows[accounts + 14].starts_with("   group "), "{frame}");
+        assert!(rows[band - 1].contains(&fold_name(12)), "{frame}");
+        assert!(!frame.contains(&fold_name(14)), "{frame}");
+    }
+
+    /// Membership is recomputed every frame: an account whose 7d window
+    /// drops back under its ceiling returns to the table at once.
+    #[test]
+    fn fold_membership_follows_the_live_7d_window() {
+        let (mut view, chrome) = live_view();
+        if let Some(window) = view.snapshot.accounts[1].seven_day.as_mut() {
+            window.utilization = 0.31;
+        }
+        let rows = render_rows(&view, &chrome, 179, 43);
+        let frame = rows.join("\n");
+        let accounts = row_of(&rows, " accounts · sort ");
+        assert!(rows[accounts].contains(" · 7d spent 8 folded: "), "{frame}");
+        assert!(
+            rows[accounts + 3].contains(&format!("2  {}", fold_name(2))),
+            "{frame}"
+        );
+        assert!(rows[accounts + 2 + 13].starts_with("   group "), "{frame}");
+    }
+
+    /// A synthetic pool whose accounts title is long: 15 accounts in each
+    /// of the five groups (one-letter-and-number ids), codex #1–#4 (display
+    /// #16–#19) 7d-spent with one shared status, the Fable column off and no
+    /// reset inventory — so the fold entries are short and the title is
+    /// the widest part of the pane.
+    fn crowded_view() -> (DashboardView, Chrome) {
+        use crate::routing::BackendGroup;
+        use crate::scheduler::window::WindowSource;
+        use crate::scheduler::{AccountId, AccountSnapshot};
+        let now = SystemTime::now();
+        let window = |utilization: f64| {
+            Some(QuotaWindow {
+                utilization,
+                resets_at: now + Duration::from_secs(187_170),
+                fetched_at: now - Duration::from_secs(5),
+                source: WindowSource::Headers,
+            })
+        };
+        let mut view = view_with(Vec::new());
+        view.show_fable_weekly = false;
+        for (group, kind, letter) in [
+            (BackendGroup::Claude, "oauth", "a"),
+            (BackendGroup::Codex, "codex", "c"),
+            (BackendGroup::Grok, "grok", "g"),
+            (BackendGroup::OpenRouter, "openrouter", "o"),
+        ] {
+            for i in 1..=15 {
+                let spent = group == BackendGroup::Codex && i <= 4;
+                view.snapshot.accounts.push(AccountSnapshot {
+                    overlap_start: None,
+                    id: AccountId(format!("{}:{letter}{i}", group.as_str())),
+                    healthy: true,
+                    auth_failure_status: None,
+                    credential_kind: kind,
+                    group,
+                    five_hour: (group == BackendGroup::Claude)
+                        .then(|| window(0.30))
+                        .flatten(),
+                    seven_day: window(if spent { 1.0 } else { 0.31 }),
+                    scoped_limits: Vec::new(),
+                    scoped_cooldowns: Vec::new(),
+                    cooldown_until: None,
+                    cooldown_source: None,
+                    in_flight: 0,
+                    token_expires_at_ms: None,
+                    last_refresh_ms: None,
+                    paused: false,
+                    limits: Default::default(),
+                });
+            }
+        }
+        let chrome = Chrome {
+            fold_exhausted: true,
+            ..chrome_overlay(Overlay::None)
+        };
+        (view, chrome)
+    }
+
+    /// The crowded pool's accounts title with the fold `note` and the
+    /// widest `+N more` (every account hidden).
+    fn crowded_title(note: &str) -> String {
+        format!(
+            " accounts · sort name · 60 (claude 15 · codex 15 · grok 15 · openrouter 15){note} · +60 more "
+        )
+    }
+
+    /// Each spent codex account's status text sits on its own line of the
+    /// frame — its table row or its fold entry — right after its name.
+    fn assert_each_member_shows_its_status(rows: &[String], frame: &str) {
+        for (n, name) in [(16, "c1"), (17, "c2"), (18, "c3"), (19, "c4")] {
+            let needle = format!("{n} {name} ");
+            let row = rows
+                .iter()
+                .find(|r| r.contains(&needle))
+                .unwrap_or_else(|| panic!("#{n} on screen:\n{frame}"));
+            let at = row.find(&needle).expect("needle");
+            let end = row[at..].find("   !").map_or(row.len(), |next| at + next);
+            assert!(
+                row[at..end].contains("7d 100.0% > 99%"),
+                "#{n} carries its full status: {:?}\n{frame}",
+                &row[at..end]
+            );
+        }
+    }
+
+    /// MUST-FIX (trinity R1): when the title with the shared status does
+    /// not fit the pane, the status must not be cut off the title and lost.
+    /// The shared-form entries fit two per line at both widths, but that
+    /// title (with `+N more` at its widest) does not: at 123 columns each
+    /// entry carries its own status — whatever the pane height, so the
+    /// choice does not flip when rows get hidden — and at 106 even the
+    /// per-entry title does not fit, so the full table shows them.
+    #[test]
+    fn fold_shared_status_never_clipped_from_the_title() {
+        let (view, chrome) = crowded_view();
+        let shared = crowded_title(" · 7d spent 4 folded: 7d 100.0% > 99%");
+        for (w, h) in [(106u16, 120u16), (123, 40), (123, 120)] {
+            assert!(Line::from(shared.as_str()).width() > usize::from(w));
+            let rows = render_rows(&view, &chrome, w, h);
+            let frame = rows.join("\n");
+            let title = &rows[row_of(&rows, " accounts · sort ")];
+            assert!(
+                !title.contains("folded:") || title.contains("folded: 7d 100.0% > 99% "),
+                "{w}x{h}: title cut mid-status: {title}"
+            );
+            if h == 120 {
+                println!("{w}x{h}:\n{frame}");
+                assert_each_member_shows_its_status(&rows, &frame);
+            }
+        }
+        // The decision itself: per-entry form at 134, no fold at 106.
+        let ctx = frame_ctx(&view, &chrome);
+        match fold_at(&view, &ctx, &chrome, 123) {
+            Fold::Applied(plan) => {
+                assert_eq!(plan.shared_status, None);
+            }
+            // The fork's pool fixture has no gemini group, so its title is
+            // 12 cells shorter than upstream's and the width band where the
+            // shared title overflows is too narrow for two entries per line:
+            // the fold backs off to the full table (still never clipped).
+            other => assert!(
+                other.note().contains("saves no row"),
+                "per-entry fold or full-table fallback at 123, got {}",
+                other.note()
+            ),
+        }
+        assert!(matches!(
+            fold_at(&view, &ctx, &chrome, 106),
+            Fold::TooNarrow
+        ));
+    }
+
+    /// One column below the per-entry title's width (`+N more` at its
+    /// widest), even the per-entry form cannot show its title whole: the
+    /// fold does not apply, the full table carries every status, and the
+    /// title says the pane is too narrow.
+    #[test]
+    fn fold_too_narrow_when_even_the_per_entry_title_does_not_fit() {
+        let (view, chrome) = crowded_view();
+        let per_entry = crowded_title(" · 7d spent 4 folded");
+        let w = Line::from(per_entry.as_str()).width() as u16 - 1;
+        let rows = render_rows(&view, &chrome, w, 120);
+        let frame = rows.join("\n");
+        let accounts = row_of(&rows, " accounts · sort ");
+        assert!(
+            rows[accounts].contains(" · fold: too narrow "),
+            "{w}:\n{frame}"
+        );
+        assert!(!rows[accounts].contains("7d spent"), "{frame}");
+        assert!(
+            rows[accounts + 1 + 16].contains("16 c1 "),
+            "full table, #16 in its row:\n{frame}"
+        );
+        assert_each_member_shows_its_status(&rows, &frame);
+    }
+    #[test]
+    fn usage_history_failure_summary_visible_in_expanded_main_band() {
+        let (mut view, name) = rich_account_view();
+        view.auth_history.insert(
+            name.clone(),
+            vec![crate::account_history::AccountEvent::new(
+                &name,
+                "background_refresh",
+                "permanent_failure",
+                Some(400),
+                "invalid_grant: refresh token expired",
+                "refresh grant rejected; re-login required",
+                UNIX_EPOCH + Duration::from_secs(1793129990),
+            )],
+        );
+        let mut chrome = chrome_overlay(Overlay::None);
+        chrome.pane_heights.middle = Some(11);
+        let width = band_bound(&view, &chrome).max(240);
+        let body = render_rows(&view, &chrome, width, 60).join("\n");
+        assert!(body.contains("last failure"), "{body}");
+        assert!(
+            body.contains("invalid_grant: refresh token expired"),
+            "{body}"
+        );
+        assert!(body.contains("HTTP 400"), "{body}");
+        println!("{body}");
+    }
+
+    #[test]
+    fn account_history_is_visible_in_scrollable_real_render() {
+        let (mut view, name) = rich_account_view();
+        view.auth_history.insert(
+            name.clone(),
+            vec![crate::account_history::AccountEvent::new(
+                &name,
+                "background_refresh",
+                "permanent_failure",
+                Some(400),
+                "invalid_grant: refresh token expired",
+                "refresh grant rejected; re-login required",
+                UNIX_EPOCH + Duration::from_secs(1793129990),
+            )],
+        );
+        let mut chrome = chrome_overlay(Overlay::None);
+        chrome.account_modal = Some(AccountModal {
+            account: name,
+            scroll: 0,
+        });
+        let rows = render_rows(&view, &chrome, 120, 40);
+        let body = rows.join("\n");
+        assert!(body.contains("authentication / usage history"), "{body}");
+        assert!(body.contains("HTTP 400"), "{body}");
+        assert!(
+            body.contains("invalid_grant: refresh token expired"),
+            "{body}"
+        );
+        assert!(body.contains("re-login required"), "{body}");
+        println!("{body}");
     }
 }

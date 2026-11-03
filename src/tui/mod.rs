@@ -513,6 +513,9 @@ pub(crate) struct Chrome {
     pub quota_display_override: Option<crate::config::QuotaDisplay>,
     /// `t`-key session toggle: absolute local reset stamps in the quota bars.
     pub reset_absolute: bool,
+    /// `z`-key session toggle: MAIN packs the accounts whose 7d window is
+    /// over its ceiling into a text block under the table (off by default).
+    pub fold_exhausted: bool,
     /// Live text of the limits editor (`Mode::EditLimits`); empty otherwise.
     /// Rendered raw in the footer (percent ceilings are not secrets).
     pub limits_input: String,
@@ -936,6 +939,10 @@ struct App {
     /// Session toggle (`t`): quota bars show the reset as an absolute UTC
     /// stamp instead of the countdown.
     reset_absolute: bool,
+    /// Session toggle (`z` on MAIN): fold the accounts whose 7d window is
+    /// over its ceiling into a text block under the accounts table. Off
+    /// until the first press; session-local like `u`/`t`/`o`.
+    fold_exhausted: bool,
     /// Usage-tab granularity (`g` cycles hour/day/month, usage-stats).
     usage_gran: activity::UsageGran,
     /// Usage-tab scroll offset in BUCKETS (0 = newest at the top); reset when
@@ -1063,6 +1070,7 @@ impl App {
             clip_inflight: false,
             clip_tx: None,
             reset_absolute: false,
+            fold_exhausted: false,
             pending_control: None,
             control_inflight: false,
             control_tx: None,
@@ -1270,6 +1278,7 @@ impl App {
             add_input_len: self.add_input.chars().count(),
             quota_display_override: self.quota_display_override,
             reset_absolute: self.reset_absolute,
+            fold_exhausted: self.fold_exhausted,
             pane_heights: self.pane_heights,
             menu_anchor: self.menu_anchor,
             menu_account: self.menu_account.clone(),
@@ -1431,6 +1440,31 @@ impl App {
         // `q` scrolls nothing and quits nothing while it is open.
         if self.account_modal.is_some() {
             self.on_key_account_modal(key.code);
+            return;
+        }
+        if key.code == KeyCode::Char('h')
+            && matches!(self.overlay, Overlay::None | Overlay::Accounts)
+            && matches!(self.mode, Mode::Normal | Mode::Select { .. })
+        {
+            if let Some(view) = view {
+                let order = view.display_order(self.account_sort, SystemTime::now());
+                let selected = match self.mode {
+                    Mode::Select { idx } => {
+                        order.get(idx).and_then(|&i| view.snapshot.accounts.get(i))
+                    }
+                    _ => view
+                        .snapshot
+                        .representative_current()
+                        .and_then(|id| view.snapshot.accounts.iter().find(|a| &a.id == id))
+                        .or_else(|| view.snapshot.accounts.first()),
+                };
+                if let Some(account) = selected {
+                    self.account_modal = Some(AccountModal {
+                        account: account.id.0.clone(),
+                        scroll: 0,
+                    });
+                }
+            }
             return;
         }
         // A pending `Mode` interaction (account switch / key entry / remove
@@ -3233,6 +3267,8 @@ impl App {
             KeyCode::Char('t') => self.toggle_reset_display(),
             // Accounts row order WITHIN each backend group: name ↔ next-pick.
             KeyCode::Char('o') => self.toggle_account_sort(),
+            // Fold the 7d-spent accounts into a text block under the table.
+            KeyCode::Char('z') => self.toggle_fold_exhausted(),
             // Scheduler mode: default (quota-max) ↔ round-robin (min switch).
             KeyCode::Char('S') => self.toggle_scheduler_mode(view),
             _ => {}
@@ -3299,6 +3335,20 @@ impl App {
                 "reset shown as absolute time (local)"
             } else {
                 "reset shown as countdown"
+            }
+            .into(),
+        );
+    }
+
+    /// Flip MAIN's fold of the accounts whose 7d window is over its ceiling
+    /// (session-local, like `t`/`u`/`o`; off until the first press).
+    fn toggle_fold_exhausted(&mut self) {
+        self.fold_exhausted = !self.fold_exhausted;
+        self.set_status(
+            if self.fold_exhausted {
+                "fold on"
+            } else {
+                "fold off"
             }
             .into(),
         );
@@ -6682,6 +6732,37 @@ mod tests {
         assert_eq!(app.account_sort, triage::AccountSort::Name);
     }
 
+    /// `z` on MAIN folds the 7d-spent accounts: off by default, flipped by
+    /// the key with a status line naming the state, carried on every
+    /// frame's chrome, and session-local like `u` — an overlay round trip
+    /// and the other display toggles leave it alone.
+    #[test]
+    fn fold_key_toggles_on_main_and_persists_like_u() {
+        let view = control_view();
+        let mut app = remote_app();
+        assert!(
+            !app.fold_exhausted && !app.chrome().fold_exhausted,
+            "off by default"
+        );
+        app.on_key(press(KeyCode::Char('z')), Some(&view));
+        assert!(app.fold_exhausted && app.chrome().fold_exhausted);
+        // Plain state, never a claim that something folded (the accounts
+        // title says what the fold did this frame).
+        assert_eq!(app.status_line(), Some("fold on"));
+        app.on_key(press(KeyCode::Char('a')), Some(&view));
+        assert_eq!(app.overlay, Overlay::Accounts);
+        app.on_key(press(KeyCode::Esc), Some(&view));
+        app.on_key(press(KeyCode::Char('u')), Some(&view));
+        app.on_key(press(KeyCode::Char('t')), Some(&view));
+        assert!(app.fold_exhausted && app.chrome().fold_exhausted, "kept");
+        app.on_key(press(KeyCode::Char('z')), Some(&view));
+        assert!(
+            !app.fold_exhausted && !app.chrome().fold_exhausted,
+            "toggles back"
+        );
+        assert_eq!(app.status_line(), Some("fold off"));
+    }
+
     #[test]
     fn config_sched_mode_confirms_then_applies() {
         // Review MUST-FIX: the scheduler-mode row must reach the confirm
@@ -8590,6 +8671,8 @@ mod tests {
             config_facts: Default::default(),
             usage_stats: Vec::new(),
             usage_controls: Default::default(),
+            plans: Default::default(),
+            auth_history: Default::default(),
             health: Default::default(),
             session_labels: Default::default(),
             pid: 1,
