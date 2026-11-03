@@ -8000,15 +8000,12 @@ fn detail_parts_at(view: &DashboardView, ctx: &FrameCtx, pos: usize) -> Option<D
             .auth_history
             .get(&account.id.0)
             .and_then(|events| {
-                events
-                    .iter()
-                    .find(|e| e.outcome == "permanent_failure")
-                    .or_else(|| events.iter().find(|e| e.outcome == "excluded"))
-                    .or_else(|| {
-                        events
-                            .iter()
-                            .find(|e| matches!(e.outcome.as_str(), "transient_failure" | "failed"))
-                    })
+                events.iter().find(|e| {
+                    matches!(
+                        e.outcome.as_str(),
+                        "permanent_failure" | "excluded" | "transient_failure" | "failed"
+                    )
+                })
             })
             .map(|event| {
                 vec![

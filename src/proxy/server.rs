@@ -1275,7 +1275,22 @@ pub async fn serve(
     // PLAN_TICK once all are known. Display data only.
     let plan_state = state.clone();
     let plan_task = tokio::spawn(async move {
+        // The account roster at the last pass: an account added (login /
+        // import) while every plan is known must not wait out PLAN_TICK, so
+        // the long sleep is taken in PLAN_RETRY steps that re-run early when
+        // the roster changed.
+        let roster = |pool: &crate::scheduler::AccountPool| {
+            let mut ids: Vec<String> = pool
+                .snapshot()
+                .accounts
+                .into_iter()
+                .map(|a| a.id.0)
+                .collect();
+            ids.sort();
+            ids
+        };
         loop {
+            let seen = roster(&plan_state.pool);
             let missing = super::plans::refresh_plans(
                 &plan_state.plans,
                 &plan_state.pool,
@@ -1285,12 +1300,18 @@ pub async fn serve(
             .await;
             // Review P1: an account still without a plan (expired token at
             // start, failed read, fresh login) is retried soon, not in 6 h.
-            let next = if missing > 0 {
-                super::plans::PLAN_RETRY
-            } else {
-                super::plans::PLAN_TICK
-            };
-            tokio::time::sleep(next).await;
+            if missing > 0 {
+                tokio::time::sleep(super::plans::PLAN_RETRY).await;
+                continue;
+            }
+            let mut waited = Duration::ZERO;
+            while waited < super::plans::PLAN_TICK {
+                tokio::time::sleep(super::plans::PLAN_RETRY).await;
+                waited += super::plans::PLAN_RETRY;
+                if roster(&plan_state.pool) != seen {
+                    break;
+                }
+            }
         }
     });
 
