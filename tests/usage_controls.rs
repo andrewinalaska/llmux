@@ -331,6 +331,28 @@ async fn handle_claude_consume(
     .await
 }
 
+/// Block until the mock has RECEIVED a request for `path` (it records on
+/// arrival, before any scripted delay), i.e. the daemon has already read the
+/// credential it is sending. Replaces fixed sleeps: under load the request
+/// could start after the sleep, so a credential swap landed BEFORE the read
+/// and nothing was in flight to discard.
+async fn wait_until_seen(mock: &WhamMock, path: &str) {
+    for _ in 0..500 {
+        if mock
+            .state
+            .seen
+            .lock()
+            .expect("lock")
+            .iter()
+            .any(|s| s.path == path)
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the mock never received a request for {path}");
+}
+
 async fn next(queue: &Mutex<VecDeque<Scripted>>, default: &str) -> (http::StatusCode, String) {
     let scripted = queue.lock().expect("lock").pop_front();
     let (status, body, delay_ms) = scripted.unwrap_or_else(|| (200, default.to_string(), 0));
@@ -1512,7 +1534,7 @@ async fn credential_replaced_mid_flight_discards_the_observation() {
     ));
     // Swap the credential mid-request: SAME name, SAME upstream account id,
     // different secret — a re-login / replacement.
-    tokio::time::sleep(Duration::from_millis(80)).await;
+    wait_until_seen(&mock, "/wham/usage").await;
     proxy.pool.reload_accounts(&[AccountConfig {
         name: "cx".into(),
         credential: AccountCredential::Codex {
@@ -1988,7 +2010,7 @@ async fn credential_replaced_during_inventory_read_blocks_the_redemption() {
         proxy.url("/llmux/reset-credits/consume"),
         serde_json::json!({"account":"cx","redeem_request_id":"rid-1","confirm":true}),
     ));
-    tokio::time::sleep(Duration::from_millis(80)).await;
+    wait_until_seen(&mock, "/wham/rate-limit-reset-credits").await;
     proxy.pool.reload_accounts(&[AccountConfig {
         name: "cx".into(),
         credential: AccountCredential::Codex {
