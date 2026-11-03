@@ -816,6 +816,8 @@ mod tests {
             config_facts: Default::default(),
             usage_stats: Vec::new(),
             usage_controls: Default::default(),
+            plans: Default::default(),
+            auth_history: Default::default(),
             version: "llmux test".into(),
             pid: 1,
             uptime: Duration::from_secs(1),

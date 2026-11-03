@@ -379,6 +379,9 @@ pub struct AppState {
     /// Serialized additively onto the dashboard document; NEVER persisted into
     /// credentials.
     pub usage_controls: Arc<super::usage_controls::UsageControlStore>,
+    /// Daemon-learned subscription plan per account (`.prd/25`), read by
+    /// `/llmux/status` and the dashboard document. Display data only.
+    pub plans: Arc<super::plans::PlanStore>,
     /// Where pending-redemption receipts are written before the irreversible
     /// consume POST (state dir `usage-resets.json`, atomic replace). `None`
     /// disables redemption entirely — an unrecorded redemption could be
@@ -499,6 +502,7 @@ impl AppState {
             shutdown: Arc::new(tokio::sync::Notify::new()),
             logins: Arc::new(super::login::LoginRegistry::default()),
             usage_controls: Arc::new(super::usage_controls::UsageControlStore::default()),
+            plans: Arc::new(super::plans::PlanStore::default()),
             // `<state dir>/usage-resets.json`, derived from the activity log's
             // own resolved path so the XDG rule lives in ONE place
             // (`cli::daemon::state_dir`, which this crate does not re-implement).
@@ -582,6 +586,33 @@ impl AppState {
     /// single-request session.
     pub fn next_request_id(&self) -> u64 {
         self.request_counter.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// Apply and explain an account exclusion, guarded by the request's credential.
+    pub(crate) fn record_auth_failure(
+        &self,
+        account: &AccountId,
+        expected: &crate::scheduler::AccountFingerprint,
+        status: Option<http::StatusCode>,
+        reason: &str,
+    ) -> bool {
+        let applied = self.pool.record_auth_failure_if(account, expected, status);
+        self.hub
+            .account_history
+            .record(crate::account_history::AccountEvent::new(
+                &account.0,
+                "auth_state",
+                if applied { "excluded" } else { "discarded" },
+                status.map(|s| s.as_u16()),
+                reason,
+                if applied {
+                    "account excluded (auth_failed); re-login required"
+                } else {
+                    "retired credential; current login unchanged"
+                },
+                SystemTime::now(),
+            ));
+        applied
     }
 
     /// Emit an activity event: `try_send`, dropped on a full channel.
@@ -999,7 +1030,28 @@ impl AppState {
                 .map(|idx| c.accounts[idx].name.clone())
                 .unwrap_or(probe.name);
         })?;
+        let previous = self.pool.fingerprint(&AccountId(name.clone()));
         self.apply_roster(&merged);
+        let replaced = self.pool.fingerprint(&AccountId(name.clone())) != previous;
+        if let Some(fingerprint) = self.pool.fingerprint(&AccountId(name.clone())) {
+            self.hub
+                .reset_poll_health(&name, fingerprint.generation, SystemTime::now());
+        }
+        self.hub
+            .account_history
+            .record(crate::account_history::AccountEvent::new(
+                &name,
+                "registration",
+                "success",
+                None,
+                "credentials installed by login/import",
+                if replaced {
+                    "new login; fresh usage scheduled (global throttle applies)"
+                } else {
+                    "unchanged credentials; existing auth/usage state retained"
+                },
+                SystemTime::now(),
+            ));
         // Names/kinds are not credentials; no token reaches a log line.
         tracing::info!(account = %name, kind, action = ?outcome, "account injected");
         Ok((name, outcome))
@@ -1082,6 +1134,15 @@ pub async fn serve(
     // a background task spawned after the listener is ready, so a big history
     // can no longer delay startup ("serve first, hydrate later").
     let hydrate_cut = state.hub.arm_persistence(state.activity_log_path.clone());
+    if let Some(path) = state
+        .activity_log_path
+        .as_ref()
+        .map(|p| p.with_file_name("account-history.json"))
+    {
+        if let Err(err) = state.hub.account_history.arm(path) {
+            tracing::warn!(error = %err, "account history persistence unavailable");
+        }
+    }
 
     // Arm the durable keys-usage store (`docs/keys-history/spec.md` K). Its
     // location is derived from THIS state's `config_path` (never from the
@@ -1145,7 +1206,8 @@ pub async fn serve(
         state.config.grok.upstream.clone(),
         state.config.scheduler,
     )
-    .with_events(state.events.clone());
+    .with_events(state.events.clone())
+    .with_hub(state.hub.clone());
     poller.prime(SystemTime::now()).await;
 
     // Initial selection so the first request doesn't pay for it. Evaluate
@@ -1207,6 +1269,51 @@ pub async fn serve(
                 }
             })
         });
+
+    // Background: subscription plan per account (`.prd/25`) — first pass right
+    // away (off the readiness path), then PLAN_RETRY while a plan is missing,
+    // PLAN_TICK once all are known. Display data only.
+    let plan_state = state.clone();
+    let plan_task = tokio::spawn(async move {
+        // The account roster at the last pass: an account added (login /
+        // import) while every plan is known must not wait out PLAN_TICK, so
+        // the long sleep is taken in PLAN_RETRY steps that re-run early when
+        // the roster changed.
+        let roster = |pool: &crate::scheduler::AccountPool| {
+            let mut ids: Vec<String> = pool
+                .snapshot()
+                .accounts
+                .into_iter()
+                .map(|a| a.id.0)
+                .collect();
+            ids.sort();
+            ids
+        };
+        loop {
+            let seen = roster(&plan_state.pool);
+            let missing = super::plans::refresh_plans(
+                &plan_state.plans,
+                &plan_state.pool,
+                &plan_state.client,
+                &plan_state.config.upstream,
+            )
+            .await;
+            // Review P1: an account still without a plan (expired token at
+            // start, failed read, fresh login) is retried soon, not in 6 h.
+            if missing > 0 {
+                tokio::time::sleep(super::plans::PLAN_RETRY).await;
+                continue;
+            }
+            let mut waited = Duration::ZERO;
+            while waited < super::plans::PLAN_TICK {
+                tokio::time::sleep(super::plans::PLAN_RETRY).await;
+                waited += super::plans::PLAN_RETRY;
+                if roster(&plan_state.pool) != seen {
+                    break;
+                }
+            }
+        }
+    });
 
     let tick_pool = state.pool.clone();
     let tick_events = state.events.clone();
@@ -1382,6 +1489,7 @@ pub async fn serve(
         abortable: [
             Some(poller_task.abort_handle()),
             Some(tick_task.abort_handle()),
+            Some(plan_task.abort_handle()),
             sweep_task
                 .as_ref()
                 .map(tokio::task::JoinHandle::abort_handle),
@@ -1549,7 +1657,15 @@ pub async fn background_refresh_pass(state: &AppState) {
     let Some((account_id, credential, fingerprint, _)) = candidate else {
         return;
     };
-    match forward::refresh_credential(state, &account_id, &credential, &fingerprint).await {
+    match forward::refresh_credential(
+        state,
+        &account_id,
+        &credential,
+        &fingerprint,
+        "background_refresh",
+    )
+    .await
+    {
         forward::RefreshOutcome::Refreshed(fresh) => {
             if let AccountCredential::Oauth { expires_at_ms, .. }
             | AccountCredential::Codex { expires_at_ms, .. } = fresh
@@ -1565,10 +1681,12 @@ pub async fn background_refresh_pass(state: &AppState) {
             // Only bench if the dead refresh token is STILL this account's
             // credential: a re-login that landed during the refresh has
             // already healed it (relogin-trace B1/B5).
-            if state
-                .pool
-                .record_auth_failure_if(&account_id, &fingerprint, Some(status))
-            {
+            if state.record_auth_failure(
+                &account_id,
+                &fingerprint,
+                Some(status),
+                "background refresh permanently rejected",
+            ) {
                 state.emit(ActivityEvent::Error {
                     context: Some("refresh".into()),
                     message: format!(
@@ -2112,6 +2230,9 @@ pub struct ServerMeta {
     /// per-account OPTIONAL — an absent entry means "never observed", never
     /// zero. Not `Copy` because of this map; every caller passes `&ServerMeta`.
     pub usage_controls: HashMap<String, crate::proxy::usage_controls::UsageControlDoc>,
+    /// Daemon-learned subscription plan by account name (`.prd/25`). Additive
+    /// and per-account OPTIONAL — absent = not (yet) known.
+    pub plans: HashMap<String, crate::proxy::plans::AccountPlan>,
 }
 
 /// Serializable `/llmux/status` document — pure function of a pool
@@ -2165,6 +2286,7 @@ pub fn status_json(
                             crate::scheduler::select::tier_withheld(snapshot, params, account, now)
                         });
                 let lifetime = totals.get(&account.id);
+                let plan = meta.plans.get(&account.id.0);
                 serde_json::json!({
                     "name": account.id.0,
                     "type": account.credential_kind,
@@ -2193,6 +2315,12 @@ pub fn status_json(
                     // Daemon-owned usage-control metadata (additive; null when
                     // this account has never been refreshed / has no controls).
                     "usage_control": meta.usage_controls.get(&account.id.0),
+                    // Subscription plan (`.prd/25`, additive; null when not
+                    // known): a short label plus the upstream value verbatim —
+                    // Claude `rate_limit_tier`, Codex `plan_type`.
+                    "plan": plan.and_then(|p| p.label.clone()),
+                    "rate_limit_tier": plan.and_then(|p| p.rate_limit_tier.clone()),
+                    "plan_type": plan.and_then(|p| p.plan_type.clone()),
                     "cooldown_until": account.cooldown_until.filter(|_| cooling).map(epoch_secs),
                     "in_flight": account.in_flight,
                     // Token health (additive): expiry + last refresh, epoch
@@ -2245,6 +2373,7 @@ async fn status(State(state): State<AppState>) -> Response {
         port: state.bound_port.load(Ordering::Relaxed),
         email_anonymous: state.email_anonymous.load(Ordering::Relaxed),
         usage_controls: state.usage_controls.all(),
+        plans: state.plans.all(),
     };
     let body = status_json(
         &state.pool.snapshot(),
@@ -4060,6 +4189,7 @@ mod tests {
             port: 3456,
             email_anonymous: false,
             usage_controls: Default::default(),
+            plans: Default::default(),
         };
         let doc = status_json(&pool.snapshot(), &totals, &params(), now, &meta);
 
@@ -4133,6 +4263,7 @@ mod tests {
             port: 3456,
             email_anonymous: false,
             usage_controls: Default::default(),
+            plans: Default::default(),
         };
         let doc = status_json(&pool.snapshot(), &totals, &params(), now, &meta);
         let accounts = doc["accounts"].as_array().expect("accounts array");
@@ -4185,6 +4316,50 @@ mod tests {
             .is_empty());
     }
 
+    /// `.prd/25`: the daemon-learned plan reaches `/llmux/status` additively —
+    /// a short label plus the upstream value verbatim; null when unknown.
+    #[test]
+    fn status_json_reports_each_accounts_plan() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_783_000_000);
+        let pool = AccountPool::new(&[oauth_account("dev1"), oauth_account("plain")]);
+        pool.evaluate(None, &params(), now);
+        let mut plans = HashMap::new();
+        plans.insert(
+            "dev1".to_string(),
+            crate::proxy::plans::AccountPlan::claude("default_claude_max_20x"),
+        );
+        let meta = ServerMeta {
+            pid: 1,
+            uptime_secs: 1,
+            port: 3456,
+            email_anonymous: false,
+            usage_controls: Default::default(),
+            plans,
+        };
+        let doc = status_json(
+            &pool.snapshot(),
+            &UsageTotals::default(),
+            &params(),
+            now,
+            &meta,
+        );
+        let accounts = doc["accounts"].as_array().expect("accounts array");
+        let by = |name: &str| {
+            accounts
+                .iter()
+                .find(|a| a["name"] == name)
+                .expect(name)
+                .clone()
+        };
+        let dev1 = by("dev1");
+        assert_eq!(dev1["plan"], "max20");
+        assert_eq!(dev1["rate_limit_tier"], "default_claude_max_20x");
+        assert_eq!(dev1["plan_type"], serde_json::Value::Null);
+        let plain = by("plain");
+        assert_eq!(plain["plan"], serde_json::Value::Null);
+        assert_eq!(plain["rate_limit_tier"], serde_json::Value::Null);
+    }
+
     #[test]
     fn status_json_tags_codex_accounts_with_codex_group() {
         // A codex credential lands in the "codex" backend group; oauth/apikey
@@ -4199,6 +4374,7 @@ mod tests {
             port: 3456,
             email_anonymous: false,
             usage_controls: Default::default(),
+            plans: Default::default(),
         };
         let doc = status_json(
             &pool.snapshot(),
@@ -4234,6 +4410,7 @@ mod tests {
             port: 0,
             email_anonymous: false,
             usage_controls: Default::default(),
+            plans: Default::default(),
         };
         let doc = status_json(
             &pool.snapshot(),
@@ -4266,6 +4443,7 @@ mod tests {
             port: 0,
             email_anonymous: false,
             usage_controls: Default::default(),
+            plans: Default::default(),
         };
         let doc = status_json(
             &pool.snapshot(),
@@ -4360,6 +4538,7 @@ mod tests {
             port: 0,
             email_anonymous: false,
             usage_controls: Default::default(),
+            plans: Default::default(),
         };
         let doc = status_json(
             &pool.snapshot(),
@@ -4426,6 +4605,7 @@ mod tests {
                 port: 0,
                 email_anonymous: false,
                 usage_controls: Default::default(),
+                plans: Default::default(),
             },
         );
         let names: Vec<&str> = doc["accounts"]
@@ -5509,6 +5689,7 @@ mod tests {
                 port: 0,
                 email_anonymous: true,
                 usage_controls: Default::default(),
+                plans: Default::default(),
             },
         );
         assert_eq!(doc["email_anonymous"], true);

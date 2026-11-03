@@ -3838,6 +3838,16 @@ fn account_modal_lines(
         ),
     ));
 
+    let history = view
+        .auth_history
+        .get(&account.id.0)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    if !history.is_empty() {
+        lines.push(modal_section("authentication / usage history"));
+        lines.extend(auth_history_lines(history, ctx.tz_offset));
+    }
+
     // --- 5h / 7d windows ---------------------------------------------------
     let consecutive_failures = view
         .poll_health
@@ -4113,6 +4123,60 @@ fn account_modal_lines(
                         .unwrap_or_else(|| dash.clone()),
                 ),
             ));
+        }
+    }
+    if history.is_empty() {
+        lines.push(modal_section("authentication / usage history"));
+        lines.extend(auth_history_lines(history, ctx.tz_offset));
+    }
+    lines
+}
+
+fn auth_history_lines(
+    history: &[crate::account_history::AccountEvent],
+    offset: i64,
+) -> Vec<Line<'static>> {
+    if history.is_empty() {
+        return vec![Line::from(
+            " No recorded history yet; events before this upgrade are unknown.",
+        )];
+    }
+    let mut lines = vec![Line::from(format!(
+        " Newest first · {} retained (up to 64/account) · local time · bodies/tokens omitted",
+        history.len()
+    ))];
+    for event in history {
+        let stamp = format::month_day_hm(UNIX_EPOCH + Duration::from_millis(event.at_ms), offset);
+        let http = event.http_status.map_or_else(
+            || "HTTP unavailable".into(),
+            |status| format!("HTTP {status}"),
+        );
+        let count = if event.count > 1 {
+            format!(
+                " ×{} since {}",
+                event.count,
+                format::month_day_hm(
+                    UNIX_EPOCH + Duration::from_millis(event.first_at_ms),
+                    offset
+                )
+            )
+        } else {
+            String::new()
+        };
+        lines.push(Line::from(format!(
+            " {stamp} · {} · {} · {http}{count}",
+            event.source, event.outcome
+        )));
+        lines.push(Line::from(format!(
+            "   {} → {}",
+            event.reason, event.effect
+        )));
+        if let Some(retry) = event.retry_at_ms {
+            lines.push(Line::from(format!(
+                "   next poll {} · failures {}",
+                format::month_day_hm(UNIX_EPOCH + Duration::from_millis(retry), offset),
+                event.consecutive_failures
+            )));
         }
     }
     lines
@@ -7073,7 +7137,11 @@ fn band_width_bounds(view: &DashboardView, rows: usize) -> BandWidths {
     let first = accounts
         .iter()
         .map(|a| {
-            let mut spans = detail_name_spans(masked_name(&a.id.0, mask), a.credential_kind);
+            let mut spans = detail_name_spans(
+                masked_name(&a.id.0, mask),
+                a.credential_kind,
+                view.plans.get(&a.id.0).map(String::as_str),
+            );
             spans.push(Span::raw(order.clone()));
             Line::from(spans).width() + status
         })
@@ -7359,13 +7427,14 @@ fn draw_band(
         .zip(geometry.starts.iter().copied())
         .map(|(line, start)| (start, line))
         .collect();
-    if rows > right.len() {
-        if let Some(reset) = detail.reset.clone() {
-            let left_w = geometry.left.get(right.len()).copied().unwrap_or(0);
-            let start = geometry.start(left_w, reset.width(), width);
-            if start + reset.width() <= width {
-                right.push((start, reset));
-            }
+    for extra in detail.auth.iter().chain(detail.reset.iter()) {
+        if rows <= right.len() {
+            break;
+        }
+        let left_w = geometry.left.get(right.len()).copied().unwrap_or(0);
+        let start = geometry.start(left_w, extra.width(), width);
+        if start + extra.width() <= width {
+            right.push((start, extra.clone()));
         }
     }
     for row in 0..rows {
@@ -7813,6 +7882,7 @@ struct DetailParts {
     poll: String,
     /// The reset-inventory row, once the daemon reports usage controls.
     reset: Option<Line<'static>>,
+    auth: Vec<Line<'static>>,
 }
 
 impl DetailParts {
@@ -7839,8 +7909,11 @@ fn draw_detail_parts(frame: &mut Frame, area: Rect, parts: &DetailParts) {
         parts.life.clone(),
         detail_poll_line(&parts.poll),
     ];
+    lines.extend(parts.auth.clone());
     lines.extend(parts.reset.clone());
-    let block = Block::new().borders(Borders::TOP).title(" detail ");
+    let block = Block::new()
+        .borders(Borders::TOP)
+        .title(" detail · h / click account: full history ");
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
@@ -7884,6 +7957,7 @@ fn detail_parts_at(view: &DashboardView, ctx: &FrameCtx, pos: usize) -> Option<D
     let name = detail_name_spans(
         masked_name(&account.id.0, ctx.mask),
         account.credential_kind,
+        view.plans.get(&account.id.0).map(String::as_str),
     );
     let status = status_span(account, gate, is_current, params, now, ctx.frame);
     let token = detail_token_line(account, view.refresh_ahead, now, ctx.tz_offset);
@@ -7922,18 +7996,54 @@ fn detail_parts_at(view: &DashboardView, ctx: &FrameCtx, pos: usize) -> Option<D
         life,
         poll,
         reset,
+        auth: view
+            .auth_history
+            .get(&account.id.0)
+            .and_then(|events| {
+                events.iter().find(|e| {
+                    matches!(
+                        e.outcome.as_str(),
+                        "permanent_failure" | "excluded" | "transient_failure" | "failed"
+                    )
+                })
+            })
+            .map(|event| {
+                vec![
+                    Line::from(format!(
+                        " last failure {} · {} · {}",
+                        format::month_day_hm(
+                            UNIX_EPOCH + Duration::from_millis(event.at_ms),
+                            ctx.tz_offset
+                        ),
+                        event.source,
+                        event
+                            .http_status
+                            .map_or_else(|| "HTTP unavailable".into(), |s| format!("HTTP {s}"))
+                    )),
+                    Line::from(format!("   {} → {}", event.reason, event.effect)),
+                ]
+            })
+            .unwrap_or_default(),
     })
 }
 
-/// ` {id}` bold + ` · {kind}` dim — the detail pane's first line.
-fn detail_name_spans(name: String, kind: &str) -> Vec<Span<'static>> {
-    vec![
+/// ` {id}` bold + ` · {kind}` dim, then ` · {plan}` when the daemon knows the
+/// account's subscription plan (`.prd/25`) — the detail pane's first line.
+fn detail_name_spans(name: String, kind: &str, plan: Option<&str>) -> Vec<Span<'static>> {
+    let mut spans = vec![
         Span::styled(
             format!(" {name}"),
             Style::new().add_modifier(Modifier::BOLD),
         ),
         Span::styled(format!(" · {kind}"), dim()),
-    ]
+    ];
+    if let Some(plan) = plan {
+        spans.push(Span::styled(
+            format!(" · {plan}"),
+            Style::new().fg(Color::Cyan),
+        ));
+    }
+    spans
 }
 
 /// ` token {expiry · refreshed · refresh due}`.
@@ -11095,6 +11205,8 @@ mod tests {
             config_facts: Default::default(),
             usage_stats: Vec::new(),
             usage_controls: Default::default(),
+            plans: Default::default(),
+            auth_history: Default::default(),
             health: Default::default(),
             session_labels: Default::default(),
             pid: 1,
@@ -11890,6 +12002,27 @@ mod tests {
         let frame = render_rows(&view, &chrome, 160, 30).join("\n");
         assert!(frame.contains("3 owned"), "{frame}");
         assert!(frame.contains("0 applicable now"), "{frame}");
+    }
+
+    /// `.prd/25`: the detail pane's first line names the account's plan when
+    /// the daemon knows it, and says nothing when it does not.
+    #[test]
+    fn accounts_detail_pane_names_the_plan() {
+        let mut view = usage_control_view();
+        let codex_pos = view
+            .display_order(Default::default(), SystemTime::now())
+            .iter()
+            .position(|&i| view.snapshot.accounts[i].credential_kind == "codex")
+            .expect("codex row");
+        let codex_idx = view.display_order(Default::default(), SystemTime::now())[codex_pos];
+        let codex_name = view.snapshot.accounts[codex_idx].id.0.clone();
+        let mut chrome = chrome_overlay(Overlay::Accounts);
+        chrome.mode = Mode::Select { idx: codex_pos };
+        let before = render_rows(&view, &chrome, 160, 30).join("\n");
+        assert!(!before.contains("· promax"), "{before}");
+        view.plans.insert(codex_name, "promax".to_string());
+        let after = render_rows(&view, &chrome, 160, 30).join("\n");
+        assert!(after.contains("· codex · promax"), "{after}");
     }
 
     /// The accounts keybar advertises the two new affordances — and keeps
@@ -20598,5 +20731,64 @@ mod tests {
             "full table, #16 in its row:\n{frame}"
         );
         assert_each_member_shows_its_status(&rows, &frame);
+    }
+    #[test]
+    fn usage_history_failure_summary_visible_in_expanded_main_band() {
+        let (mut view, name) = rich_account_view();
+        view.auth_history.insert(
+            name.clone(),
+            vec![crate::account_history::AccountEvent::new(
+                &name,
+                "background_refresh",
+                "permanent_failure",
+                Some(400),
+                "invalid_grant: refresh token expired",
+                "refresh grant rejected; re-login required",
+                UNIX_EPOCH + Duration::from_secs(1793129990),
+            )],
+        );
+        let mut chrome = chrome_overlay(Overlay::None);
+        chrome.pane_heights.middle = Some(11);
+        let width = band_bound(&view, &chrome).max(240);
+        let body = render_rows(&view, &chrome, width, 60).join("\n");
+        assert!(body.contains("last failure"), "{body}");
+        assert!(
+            body.contains("invalid_grant: refresh token expired"),
+            "{body}"
+        );
+        assert!(body.contains("HTTP 400"), "{body}");
+        println!("{body}");
+    }
+
+    #[test]
+    fn account_history_is_visible_in_scrollable_real_render() {
+        let (mut view, name) = rich_account_view();
+        view.auth_history.insert(
+            name.clone(),
+            vec![crate::account_history::AccountEvent::new(
+                &name,
+                "background_refresh",
+                "permanent_failure",
+                Some(400),
+                "invalid_grant: refresh token expired",
+                "refresh grant rejected; re-login required",
+                UNIX_EPOCH + Duration::from_secs(1793129990),
+            )],
+        );
+        let mut chrome = chrome_overlay(Overlay::None);
+        chrome.account_modal = Some(AccountModal {
+            account: name,
+            scroll: 0,
+        });
+        let rows = render_rows(&view, &chrome, 120, 40);
+        let body = rows.join("\n");
+        assert!(body.contains("authentication / usage history"), "{body}");
+        assert!(body.contains("HTTP 400"), "{body}");
+        assert!(
+            body.contains("invalid_grant: refresh token expired"),
+            "{body}"
+        );
+        assert!(body.contains("re-login required"), "{body}");
+        println!("{body}");
     }
 }

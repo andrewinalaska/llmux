@@ -177,6 +177,7 @@ Claude grants are gated upstream on the client **surface and version**: the endp
 
 
 - **Refresh.** `f` in the accounts overlay refreshes every supported account; `f` inside the `s` switcher refreshes the highlighted one; `llmux accounts refresh [ACCOUNT]` does the same from a shell. A refresh performs a real upstream usage read (no inference request is sent), bypasses scheduler eligibility and the idle-probe cooldown, and changes no pause/health/operator state. A failed read keeps the previous observation and reports the error — it never blanks the gauges. Entering the accounts surface requests ONE refresh when the reset inventory is missing or older than 60 s; `f` has no such floor.
+- **Subscription plan.** The daemon learns each account's plan by itself — no configuration. A Claude account's plan comes from `organization.rate_limit_tier` of Anthropic's `/api/oauth/profile` (read at daemon start, every 10 minutes while some account's plan is still unknown — an expired token is never used for the read — and every 6 h once all are known), a Codex account's from the `chatgpt_plan_type` claim of its access token. `GET /llmux/status` reports it per account as `plan` (a short label: `max20`, `max5`, `pro`, `promax`, …) plus the upstream value verbatim — `rate_limit_tier` for Claude, `plan_type` for Codex — and null when not known. `llmux status` prints it beside the remaining weekly quota (`max20 · 7d 66% left`), and the TUI detail pane names it on its first line (` <name> · <kind> · max20`). The plan is display data only: scheduling never reads it, and a bare `max` from an old credential is never read as x5 or x20.
 - **Reset inventory.** The accounts table gains an `rst` column and the detail pane a `reset` line: `3` resets owned, `3*` owned but upstream currently reports none applicable, `?` not observed yet, `n/e` a Claude account the server declared ineligible on this surface (the detail pane names the reason), `—` a provider with no resets at all. Unknown is never rendered as `0`. The detail line also carries the **expiry** of the soonest live credit/grant — absolute local time plus countdown — and, for Claude, when the weekly window resets. `llmux accounts resets ACCOUNT` prints the same inventory with per-credit detail: every credit's `expires` line shows the local time, the countdown and the raw upstream timestamp (Codex credits and Claude grants alike; a Claude grant also says which windows it clears and how many uses remain).
 - **Redeem one reset.** `R` in the accounts overlay opens a confirmation on the first row whose provider has resets — in a roster that lists Claude accounts before Codex that is a Claude row, so read the account name in the prompt and move with `↑↓`/`j k` before pressing `y`; a held (unresolved) redemption pins the gate to its own account. The prompt names the account and the single reset it spends (`r` still removes an account — the redemption is deliberately the shifted key). `y` redeems; any other key closes the dialog. `llmux accounts reset ACCOUNT` is the shell equivalent and refuses on a non-TTY without `--yes`. A new redemption requires a fresh entitlement read showing a redeemable credit; unknown or zero inventory refuses before any redemption is attempted. Codex redeems through WHAM's `consume`; Claude posts `{program, grant_id, request_id}` to the account organization's `reset_rate_limits` route (the organization id is read from the profile endpoint first — a failure there spends nothing). A Claude grant is redeemable only while the server reports it `usable_now` (the projected credit status `available`); `blocked` means a grant that only applies once a limit is hit.
 - **Idempotency.** The client mints the redemption's request id, prints it before sending, and holds it until a terminal outcome (`reset`, `already_redeemed`, `nothing_to_reset`, `no_credit`, and for Claude `cooldown` — a post-reset cooling period, nothing spent). Claude's `unavailable` answer is treated as uncertain, exactly as the web client does: retry with the same id. Closing the TUI dialog does not abandon a pending redemption, and a retry reuses the SAME id — a fresh key could spend a second reset. On an uncertain outcome the CLI prints the exact `--request-id` invocation to repeat. `already_redeemed` means the replay spent nothing extra. If the follow-up usage read fails after a successful redemption, that is a success with a stale-read warning, not a retryable failure.
@@ -261,12 +262,53 @@ llmux channel stable
 
 `llmux update` also restarts a running daemon whose version differs from the binary brew has installed, so a daemon left behind by an out-of-band `brew upgrade` — or by a restart skipped on an earlier run — converges instead of reporting "already up to date" while serving the old build. The comparison is server-vs-installed-artifact (`<installed llmux> --version`), not against the `llmux` process you invoked, which may itself be a stale keg or the other channel's binary.
 
+### Account authentication and usage history (preview)
+
+The account detail modal now keeps a scrollable **authentication / usage history**.
+Click an account row, or press `h` on MAIN / the accounts tab (in the switcher,
+`h` targets the highlighted account). Each receipt shows an absolute local time,
+request source, HTTP status when observed, safe OAuth reason, resulting auth
+state, and usage retry deadline / consecutive failures. The expanded detail pane (including MAIN)
+prioritizes the last permanent auth reason over a later usage-poll error.
+
+`! 400 auth X` means the scheduler recorded HTTP 400 when it excluded that
+account; the history distinguishes an OAuth `invalid_grant` from other failures.
+`! auth X` means no HTTP status was available — it does not prove credentials
+were deleted. Usage HTTP 429 means a rate-limited gauge read and does not revoke
+authentication. A Claude usage 403 is recorded as an exclusion only when the
+credential guard applied it; Grok and Gemini usage reads remain informational.
+Responses discarded after token rotation change neither poll health nor backoff.
+A missing Gemini project records `skipped`, with no HTTP status or successful
+poll timestamp, because no usage request was sent. The reset row's `last error`
+belongs to the separate combined
+usage/reset-inventory read; it is not the token-refresh error. After a request
+401, a transient refresh outage (429/5xx/network) now returns retryable 502 and
+keeps auth eligible; permanent refresh rejection or a second request 401 still
+excludes the current credential.
+
+A changed credential from re-login / re-registration clears the previous poll
+health and makes that account due for fresh usage on the next scheduling pass,
+subject to the shared 10-second poll spacing. A fresh failed read starts a new
+backoff and remains visibly degraded; unread usage is never fabricated as 0%.
+Normal automatic token rotation keeps the existing rate-limit backoff. Results
+and queued health events from a retired login cannot re-degrade its replacement.
+
+History is local to the daemon, in private `account-history.json` beside
+`activity.jsonl`, and reaches attached dashboards through each account's
+`auth_history` field. It retains up to 64 receipts per account / 2048 total;
+consecutive identical observations coalesce with first/last time and count.
+Writes use a bounded background wake queue and an atomic 0600 snapshot capped
+at 2 MiB (oldest receipts are dropped first). Raw
+provider bodies, credentials and token hashes are not recorded. History before
+the upgrade is **unknown**; existing logs are not silently imported.
+
 ### Release availability
 
-Stable is v0.2.25 (2026-10-08). Preview is rolling and carries whatever landed on `main` after the last tag. This table says which release each user-visible feature needs.
+Stable is v0.2.26 (2026-10-26). Preview is rolling and carries whatever landed on `main` after the last tag. This table says which release each user-visible feature needs.
 
-| Feature | Stable 0.2.24 (2026-10-07) | Stable 0.2.25 (2026-10-08) | Preview |
+| Feature | Stable 0.2.25 (2026-10-08) | Stable 0.2.26 (2026-10-26) | Preview |
 |---|---|---|---|
+| Authentication/usage history, re-login poll recovery, transient refresh handling | no | no | yes |
 | `llmux run` / `llmux run --codex`, the four backend groups, schedulers, raw request viewer, remote mode, issued client keys, `/model` picker lineup | yes | yes | yes |
 | Islands first-run setup screens (connecting / needs attention / no accounts / ready) and the Start coding launcher (Claude Code or Codex, project folder, Open in Terminal) | no | yes (source `7fe64d1`) | yes |
 | Authenticated local control between the Islands app and the daemon (`llmux islands-connection --port N` handoff; `LocalControlAuth`) | no (see note below) | yes | yes |
@@ -275,8 +317,9 @@ Stable is v0.2.25 (2026-10-08). Preview is rolling and carries whatever landed o
 | Numeric combined auth states in `status` / Islands | no | yes | yes |
 | Recomposed dashboard layout ([Dashboard layout](#dashboard-layout-main): scheduler + detail band, packed models strip, `+N more` accounts title, header tail on the tab row) | no | no | yes |
 | `z` fold of 7d-spent accounts on the dashboard ([Dashboard layout](#dashboard-layout-main), off by default) | no | no | yes |
+| Subscription plan per account: `plan` / `rate_limit_tier` / `plan_type` in `/llmux/status`, `llmux status` lines (`max20 · 7d 66% left`), TUI detail pane ([Usage controls](#usage-controls-refresh--resets)) | no | yes | yes |
 
-Note on 0.2.24 local control: the 0.2.24 Islands app sends loopback requests without a key, while the daemon requires an admin credential on `/llmux/*`, so that app cannot read a daemon locally. This is confirmed from source (`LlmuxClient.swift`, `server.rs`), not reproduced in a running GUI. `llmux update` moves a 0.2.24 install to 0.2.25.
+Note on 0.2.24 local control (an older stable, before the columns above): the 0.2.24 Islands app sends loopback requests without a key, while the daemon requires an admin credential on `/llmux/*`, so that app cannot read a daemon locally. This is confirmed from source (`LlmuxClient.swift`, `server.rs`), not reproduced in a running GUI. `llmux update` moves a 0.2.24 install to 0.2.25.
 
 Install per channel: `brew install --cask 2lab-ai/tap/llmux-islands` installs the app plus the stable CLI; `brew install 2lab-ai/tap/llmux` installs the stable CLI only; `brew install --cask 2lab-ai/tap/llmux-islands-preview` / `brew install 2lab-ai/tap/llmux-preview` are the preview equivalents; `llmux channel preview|stable` switches both.
 
@@ -932,12 +975,13 @@ show `! auth X`, or `paused + auth X` when also paused, without an invented stat
 Pause and authentication health remain independent; this combined label changes
 only the display, not scheduling priority or retry policy.
 
-A permanent refresh rejection uses the refresh endpoint's status. When an upstream
-401 triggers refresh and that refresh fails, the last HTTP failure status is
-shown; a refresh failure without an HTTP status retains the observed 401. This
-display does not change retry policy: ordinary 404 responses still relay and
-ordinary 503 responses remain transient.
+A permanent refresh rejection uses the refresh endpoint's status. A second
+upstream 401 after a successful forced refresh records 401. In the current
+preview, a transient forced-refresh failure returns retryable 502 without
+permanently excluding the account; its observed status/reason appears in the
+history above. Ordinary inference 404 responses still relay and ordinary 503
+responses remain transient.
 A successful credential refresh or changed credentials on re-login clear the
 stored failure code; late failures from replaced credentials cannot restore it.
-Only the numeric status is added to account documents, never response bodies or
-credentials.
+The numeric status and safe structured lifecycle receipts are included in account
+documents; provider bodies and credentials are omitted.
