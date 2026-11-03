@@ -27,6 +27,148 @@ This is the detailed, operational half of the docs: every command, the daemon/da
 
 In the TUI: `s` switches account, `a` adds, `n` starts a new browser login, `r` removes, `R` reloads config, `d` toggles detail, `l` cycles the log panel, `p` opens the perf tab, `K` opens the keys tab (multi-tenant client keys + per-tenant usage; read-only — mutations go through `llmux key …`), `q` quits, and `j`/`k` or arrows navigate. For Codex accounts, `f` toggles fast (priority) mode, `m` cycles the model, and `e` cycles reasoning effort. The Grok group's `effort:` value on the same settings bar is click-cycled (or activated from the config tab's `grok.reasoning_effort` row): `bypass → none → low → medium → high → xhigh`, with the per-model clamp still applied at request time — `xhigh` rides through on `grok-4.6` and lands as `high` on `grok-4.5`. In the accounts overlay, `f` refreshes usage and `R` redeems one rate-limit reset (see [Usage controls](#usage-controls-refresh--resets)) — on MAIN those keys keep their old meanings (`f` codex fast, `R` reload config). Accounts rows are grouped Claude → Codex → Grok → OpenRouter, and `o` (MAIN or the accounts overlay) toggles the order WITHIN each group between account name (the default; a natural, numeric-aware order — digit runs compare as numbers, so a block reads `ai`, `ai1`, `ai2`, … `ai10`, not `ai10`, `ai1`, `ai`) and the scheduler's next-pick order — the pane title reports which is active. Left-clicking an accounts row (dashboard or accounts tab) opens a scrollable modal with every detail recorded for that account — Esc closes it, and right-click still opens the row's context menu. In attach mode (`llmux dashboard`, or `server` attaching to a daemon), config-mutation keys `a`/`r`/`R` (reload) are disabled because they would act on the server host's config; `s` still works through `POST /llmux/switch`, and the usage controls work because they act on the daemon. Activity-panel mouse semantics are described under [Activity feed](#activity-feed).
 
+### Tab shortcut hints
+
+On MAIN (the dashboard), at terminal widths of **140 columns or more**, the
+single-row tab strip shows `[Esc] dashboard`, `[a] accounts`, `[g] stats`,
+`[U] usage`, `[K] keys`, `[p] perf`, `[l] logs`, `[s] sessions`, `[?] misc`,
+and `[c] config`, in that order. Inside an overlay, only `[Esc] dashboard`
+keeps a hint; the other tabs show their names because overlay keys have their
+own meanings (`g` changes granularity in Usage, for example). Return to MAIN
+with `Esc` before using a letter shortcut to open another surface. Below 140
+columns, all ten tabs keep their name-only labels on every surface.
+Each tab's displayed hint and name share one clickable target; separators are
+not targets. These are existing keys, not new bindings or Tab/Enter navigation.
+
+### Dashboard layout (MAIN)
+
+Top to bottom, the dashboard is always: header, tab row, accounts, scheduler
+and detail, models, activity, the group settings line, the status line and
+the key bar. Numbers keep their usual format everywhere.
+
+- **Heights.** The header, the tab row, the settings line and the two bottom
+  rows take one row each. Accounts take one row per account plus two (title
+  and column header). Activity takes every row that is left, and at least 4
+  (its title and three entries). When the terminal is too short for all of
+  that, the accounts pane gives up rows first (it never goes below 3 rows),
+  and its title says how many accounts it cannot show — for example
+  `accounts · sort name · 21 (claude 14 · codex 4 · grok 2 · gemini 1) · +12 more`.
+  The title always lists the number of accounts per group, in table order —
+  on the accounts tab too, which also adds `+N more` when its table is cut.
+  A pane height you set by dragging a border still wins over these rules.
+- **Scheduler and detail band.** When it fits, the scheduler summary and the
+  selected account's details share one 7-row band. Its top border reads
+  `scheduler · poller … · totals …` and, further right, `detail`; when the
+  border has no room for `totals …`, the totals move to the end of the
+  `mode` row. Below it, the left column shows each group's `current` row,
+  then `next` and `mode` (then `load` and the Codex settings while rows are
+  left). The last switch gets a row of its own directly under the `current`
+  row of the group that switched — `{previous} → {reason}, {age} ago`,
+  starting under the account name — and that row is blank before any
+  switch, so the band never changes height on a switch. After a `│` the
+  detail column shows six lines: name · credential type · order · status,
+  the token line, the 5h window, the 7d window, the lifetime totals and the
+  poll line (`poll  ok 4s ago · next ~5m18s`) — the same text as before,
+  uncut. Each band row pairs one left line with one detail line. The detail
+  lines start in one column, set so the widest of lines 2–6 ends at the
+  right edge; a row whose left text is longer than that starts its detail
+  line just after its own text, with its own `│`. Whether the band is used,
+  and where every column sits, changes only on a terminal width change, a
+  change to the set of accounts, a scheduler event (a switch, a failing
+  usage poll) or a count gaining a digit (for example `err` going from 999
+  to 1.0k). Moving the cursor does not change it, and neither does a clock
+  ticking, because the band keeps room for the widest form of everything
+  the cursor or the clock changes: the detail lines of every account the
+  cursor can select, and every countdown, age and time stamp at its widest
+  below 100 days (`99d23h`, a `MM-DD HH:MM` stamp). A value that grows past
+  that form — an age of 100 days or more — is never cut: the layout makes
+  room for it once. Event text — the current and previous account, the
+  switch reason, which group switched, the poll back-off list, the counts —
+  is measured as shown.
+  Below the needed width the dashboard keeps the previous 8-row scheduler
+  pane, with the 48-column detail pane beside it at 110 columns or more.
+  With 27-character account ids the band fits 179 columns for every switch
+  reason: an automatic switch (`SevenDayOverThreshold` /
+  `FiveHourOverThreshold`) needs 172 columns on the Claude side and 160 on
+  the Codex side. The detail `reset`
+  line was never visible on the dashboard (the 8-row pane cut it off); it
+  appears in the band's seventh row when you drag the band taller than 7
+  rows and the line fits, and the accounts tab's detail pane always shows
+  it.
+- **Models.** When two or more models fit side by side, the models strip packs
+  them several to a line (for example, the top 5 on 3 lines): each entry
+  is the group, the model, the 10-cell share bar, requests, tokens, cost and
+  last use, aligned in columns, and the title row adds a dim
+  `group · model · share · req · tok · $ · last` legend when there is room.
+  Token counts are shown whole (`154581.1M`); the old fixed-width column cut
+  the unit off. Narrower terminals keep the one-model-per-row table. The
+  packing choice reserves room for the widest `last` value (`N in-flight`),
+  so a model starting or finishing a request does not change the strip's
+  height.
+- **Header tail.** When the header does not fit its row, its last part —
+  `cfg <config path>` and the attach marker — moves to the right end of the
+  tab row. There your home directory is shown as `~`, and the marker reads
+  just `attached` when it names the same pid the header already shows
+  (`attached → pid N` for another pid; `pid ?` and `reconnecting` are shown
+  as before). If the tab row has no room either, the tail is left out (the
+  header used to cut it off). When the whole header fits, nothing moves.
+- **Folding spent accounts (`z`).** Off by default. `z` on the dashboard
+  turns it on or off for this session, the same way `u` works, and while
+  it is on the key bar ends with `z fold`. It folds only the accounts the
+  scheduler holds back because their 7d usage is over the ceiling — the
+  ones whose status reads `7d 100.0% > 99%`. A `!` for any other reason (a
+  5h limit, a Fable limit, an auth failure) keeps the account in the
+  table. The table keeps every other account in its usual order and
+  format, and each keeps its own `#`, so the numbers skip the folded ones.
+  The folded accounts are listed directly under the table, from its left
+  edge: one dim line of column names, then the accounts several to a line,
+  in table order, aligned in columns. The accounts title says how many were
+  folded, after the group counts. When all folded accounts have the same
+  status and the whole title fits the width (measured with the widest
+  `+N more` it could carry, so its shape does not change as rows get
+  hidden), it reads `· 7d spent 9 folded: 7d 100.0% > 99%` and the status
+  is shown only there. Otherwise it reads `· 7d spent 9 folded` and each
+  account shows its own status; that title must fit the same way. When
+  neither fits, the dashboard shows the full table. Each folded account
+  shows the same values as its table row, as text — the gauges lose only
+  their fill bar, so the reset time,
+  the `○`/`◑` marks, the percentage and its `!` stay. An account goes back
+  into the table as soon as its 7d usage drops under the ceiling. The
+  cursor still moves through every account in table order, a folded
+  account under the cursor is highlighted like a table row, and clicking
+  a folded account works like clicking its row. When the terminal is too
+  short, `+N more` counts the table rows that do not fit plus the folded
+  accounts on the lines that do not fit. The columns keep room for the
+  widest form of every value the clock changes (a reset countdown with
+  its `◑` mark, a 5h window resetting or going stale), so the block does
+  not move as time passes. The fold never makes the accounts pane taller.
+  When it is on but cannot help, the dashboard shows the full table and
+  the title says why: `· fold: nothing to fold` when no account is
+  7d-spent, `· fold: too narrow` when neither title nor even one folded
+  account per line fits the width, and `· fold: saves no row` when the
+  folded lines would not take fewer rows than the accounts they fold
+  (always the case with one or two spent accounts). Pressing `z` only says
+  `fold on` or `fold off`.
+
+### Reading account quota columns
+
+`LEFT` means quota remaining; `USED` means quota consumed. The `5h` header
+shows the active meaning (`5h LEFT` or `5h USED`). The `7d` and optional
+`7d Fbl` gauges put `RESET` on the left of the header and the active meaning
+above the percentage on the right. These labels follow both the configured
+`quota_display` mode and the session-local `u` toggle.
+
+The time inside a weekly gauge is its reset countdown. `rst ` is added only
+when the four cells immediately before the existing centered time are blank;
+it never moves the time or grows the gauge. If those cells do not fit, the
+label is omitted, including for an absolute `t` timestamp in an 11-cell bar.
+Cold or unavailable cells do not gain a reset time. Gauge fill, colors, bold
+countdown units, freshness markers, percentages and account order are unchanged.
+
+The in-gauge `rst` labels a **reset time**. The separate, existing `rst`
+column described below counts **reset credits/grants owned**; it is not a
+countdown and its label is unchanged.
+
 ### Usage controls (refresh · resets)
 
 An external reset does not invalidate llmux's observed quota window, so a freshly reset account can keep reading as exhausted. The accounts surface owns the two explicit controls that fix that, and both act on the DAEMON — identically in local and attach mode. Two providers carry reset entitlements: **Codex** (ChatGPT rate-limit reset credits, read from WHAM) and **Claude** (usage-limit reset grants — the "Limit resets" card under claude.ai Settings → Usage — read from the same `/api/oauth/usage` document the poller uses, with `cedar_ember=1`). Grok, API-key and OpenRouter accounts have none and answer 422.
@@ -46,7 +188,7 @@ Claude grants are gated upstream on the client **surface and version**: the endp
 
 ### Usage tab (calendar usage + cost)
 
-The `usage` tab (`U`, or click the tab bar) shows calendar-bucketed usage over the persisted request history: hourly, daily, or monthly buckets (`g` cycles), each bucket broken down per model with request count, the four token classes (input / output / cache read / cache write), and the API-equivalent USD cost per model and per bucket. `j`/`k` (or arrows, the mouse wheel, `PgUp`/`PgDn`; `Home`/`End` jump) scroll by bucket; the title carries the period totals. Retention: hourly buckets cover the trailing 72 h, daily buckets 180 days, monthly buckets are unbounded (all replayed history from `activity.jsonl`). Day/month boundaries follow the daemon's local calendar; costs are API-equivalent estimates priced with the daemon's `pricing` overrides — not a bill. Long-context pricing (grok: a request whose prompt is ≥ 200k tokens is billed entirely at the higher rates) is applied per request, so a bucket's cost is always the sum of its requests' costs, never a re-pricing of its token totals. Amounts render ledger-style — decimal points aligned to one column (up to $999,999 per bucket), thousands separators, integer digits emphasized over the dimmer fraction digits, per-model rows a tier darker than bucket totals. A model with no known rate shows `—` instead of a cost, its bucket total is marked `+?`, and the title gains `(+unpriced)` — a missing rate is never rendered as a free `$0`. The same rows are served to attach clients on `GET /llmux/dashboard` (`usage_stats`), so local and remote render identically.
+The `usage` tab (`U`, or click the tab bar) shows calendar-bucketed usage over the persisted request history: hourly, daily, or monthly buckets (`g` cycles), each bucket broken down per model with request count, the four token classes (input / output / cache read / cache write), and the API-equivalent USD cost per model and per bucket. `j`/`k` (or arrows, the mouse wheel, `PgUp`/`PgDn`; `Home`/`End` jump) scroll by bucket; the title's **ALL** count and sums include every bucket returned by the daemon for the current granularity, including buckets outside the viewport — not just the first displayed date. Scrolling changes the top/displayed bucket, not the ALL totals, and is not a date filter or date selection. The existing spare footer status row identifies that top bucket when no flash status or modal owns it; real status messages take precedence. The title keeps `≈ API-equivalent estimate · NOT ACTUAL BILL` visible independently of the footer (`≈ API est. · NOT BILL` below 160 columns, shortened further to `≈API est/NOT BILL` when needed to keep the ALL count, token/cost totals, and `(+unpriced)` qualifier together; the narrowest form, `≈API est/NOT BILL · ALL <n> <granularity> · <tok> tok <cost>`, is exactly as wide as the title before these labels, so it fits wherever that title fit). Retention: hourly buckets cover the trailing 72 h, daily buckets 180 days, monthly buckets are unbounded (all replayed history from `activity.jsonl`). Day/month boundaries follow the daemon's local calendar; costs are API-equivalent estimates priced with the daemon's `pricing` overrides — not a bill. Amounts render ledger-style — decimal points aligned to one column (up to $999,999 per bucket), thousands separators, integer digits emphasized over the dimmer fraction digits, per-model rows a tier darker than bucket totals. A model with no known rate shows `—` instead of a cost, its bucket total is marked `+?`, and the title gains `(+unpriced)` — a missing rate is never rendered as a free `$0`. The same rows are served to attach clients on `GET /llmux/dashboard` (`usage_stats`), so local and remote render identically.
 
 ### Cache-write TTL split
 
@@ -131,6 +273,8 @@ Stable is v0.2.25 (2026-10-08). Preview is rolling and carries whatever landed o
 | `llmux env --codex` | no — `env` prints Claude Code exports only | yes | yes |
 | Haiku 5.5 catalog row (`haiku` → `claude-haiku-5-5[1m]`) | no | yes | yes |
 | Numeric combined auth states in `status` / Islands | no | yes | yes |
+| Recomposed dashboard layout ([Dashboard layout](#dashboard-layout-main): scheduler + detail band, packed models strip, `+N more` accounts title, header tail on the tab row) | no | no | yes |
+| `z` fold of 7d-spent accounts on the dashboard ([Dashboard layout](#dashboard-layout-main), off by default) | no | no | yes |
 
 Note on 0.2.24 local control: the 0.2.24 Islands app sends loopback requests without a key, while the daemon requires an admin credential on `/llmux/*`, so that app cannot read a daemon locally. This is confirmed from source (`LlmuxClient.swift`, `server.rs`), not reproduced in a running GUI. `llmux update` moves a 0.2.24 install to 0.2.25.
 
