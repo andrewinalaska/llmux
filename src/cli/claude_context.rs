@@ -328,6 +328,10 @@ mod tests {
     fn launch_model_standard_settings_file_and_override() {
         let dir = std::env::temp_dir().join(format!("llmux-context-{}", ulid::Ulid::new()));
         std::fs::create_dir_all(dir.join("project/.claude")).unwrap();
+        // Mark the project root: without it resolve() walks up to the nearest
+        // ancestor with a `.git` (a stray /tmp/.git on a dev box), skipping
+        // this directory's settings.
+        std::fs::create_dir_all(dir.join("project/.git")).unwrap();
         std::fs::create_dir_all(dir.join("user")).unwrap();
         std::fs::write(dir.join("user/settings.json"), r#"{"model":"sol[1m]"}"#).unwrap();
         let load = |a: &[String]| resolve(a, None, &dir.join("user"), &dir.join("project"), &[]);
