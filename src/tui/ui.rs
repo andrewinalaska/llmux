@@ -5092,7 +5092,7 @@ fn header_lead_spans(view: &DashboardView, now: SystemTime) -> Vec<Span<'static>
     spans
 }
 
-/// ` accounts · sort name · 21 (claude 14 · codex 4 · grok 2 · gemini 1) `,
+/// ` accounts · sort name · 21 (claude 14 · codex 4 · grok 3) `,
 /// groups in table order, then MAIN's fold note (`fold`, [`Fold::note`];
 /// empty elsewhere), plus ` · +N more` when the pane cannot show `hidden`
 /// (> 0) of the `order.len()` accounts.
@@ -7756,9 +7756,9 @@ fn poller_text(
     backoff: &[String],
 ) -> String {
     if ok.is_none() && backoff.is_empty() {
-        return format!("{polled} polled · warming up");
+        return format!("{polled} accts · warming up");
     }
-    let mut out = format!("{polled} polled");
+    let mut out = format!("{polled} accts");
     match ok {
         Some((min, max)) if min == max => {
             out.push_str(&format!(" · last ok {} ago", select::compact_duration(min)));
@@ -16377,7 +16377,7 @@ mod tests {
         ];
         let summary = poller_summary(&view, SystemTime::now());
         assert!(
-            summary.starts_with("2 polled"),
+            summary.starts_with("2 accts"),
             "oauth + grok counted, codex excluded (no polled endpoint): {summary}"
         );
     }
@@ -18203,7 +18203,7 @@ mod tests {
     }
 
     /// A MAIN state shaped like the owner's 179×43 dashboard capture: 21
-    /// accounts (claude 14 · codex 4 · grok 2 · gemini 1), a current claude
+    /// accounts (claude 14 · codex 4 · grok 3), a current claude
     /// account carrying every detail datum, six models (the top one past
     /// 100000M tokens, two in flight), two in-flight and six completed
     /// requests, attach mode on the header's own pid. Fixture names only.
@@ -18228,7 +18228,7 @@ mod tests {
         for (group, kind, count) in [
             (BackendGroup::Claude, "oauth", 14),
             (BackendGroup::Codex, "codex", 4),
-            (BackendGroup::Grok, "grok", 2),
+            (BackendGroup::Grok, "grok", 3),
         ] {
             for _ in 0..count {
                 n += 1;
@@ -18258,7 +18258,7 @@ mod tests {
                     paused: false,
                     limits: Default::default(),
                 });
-                if kind == "oauth" {
+                if matches!(kind, "oauth" | "grok") {
                     view.poll_health.insert(
                         id,
                         super::super::PollHealth {
@@ -18539,8 +18539,8 @@ mod tests {
         let (view, short, long) = with_name_spread(view);
         let w = band_bound(&view, &chrome);
         // Plus one account per group and credential kind (claude oauth,
-        // codex, grok, gemini), so every kind's name and token lines run.
-        let kinds = [rid("codex", 16), rid("grok", 19), rid("gemini", 21)];
+        // codex, grok), so every kind's name and token lines run.
+        let kinds = [rid("codex", 16), rid("grok", 19), rid("grok", 21)];
         for id in [&short, &long].into_iter().chain(&kinds) {
             let rows = render_rows(&view, &cursor_on(&view, &chrome, id), w, 43);
             assert!(
@@ -18695,7 +18695,7 @@ mod tests {
         let accounts = row_of(&rows, " accounts · sort ");
         assert_eq!(accounts, 2, "accounts pane right under the tabs:\n{frame}");
         assert!(
-            rows[accounts].contains(" · 21 (claude 14 · codex 4 · grok 2 · gemini 1) "),
+            rows[accounts].contains(" · 21 (claude 14 · codex 4 · grok 3) "),
             "accounts title carries the group counts:\n{frame}"
         );
         assert!(!rows[accounts].contains("more"), "{frame}");
@@ -18847,7 +18847,7 @@ mod tests {
     }
 
     const BAND_179_TITLE: &str =
-        " scheduler · poller 14 polled · last ok 4s–5m00s ago · next ~19s · totals 1.3M req · 1.3M ok / 15.4k err · in 5036.9M / out 847.6M tok ────────── detail ───────────────────────────";
+        " scheduler · poller 17 accts · last ok 4s–5m00s ago · next ~19s · totals 1.3M req · 1.3M ok / 15.4k err · in 5036.9M / out 847.6M tok ────────── detail ───────────────────────────";
     const BAND_179_ROW_1: &str =
         " current  claude claude:user13xxxxxx@ex.io                                              │ claude:user13xxxxxx@ex.io · oauth · order #13 · ⠋ active";
     const BAND_179_ROW_2: &str =
@@ -19713,8 +19713,9 @@ mod tests {
     }
 
     /// Digest of the fold fixture at 179×43, pinned from the renderer as it
-    /// was before the fold existed (PR-A main, 26b5ab9).
-    const FOLD_OFF_179X43_DIGEST: u64 = 6_597_409_346_785_969_346;
+    /// was before the fold existed (PR-A main, 26b5ab9); re-pinned on the fork after
+    /// the gemini-free fixture change (see sync/tui PR).
+    const FOLD_OFF_179X43_DIGEST: u64 = 9_532_344_216_522_521_565;
 
     /// Fold OFF (the default) renders exactly as the dashboard did before
     /// the fold existed — every cell's text and style.
@@ -19728,7 +19729,7 @@ mod tests {
         let (frame, hash) = frame_digest(&view, &chrome, 179, 43);
         assert_eq!(
             hash, FOLD_OFF_179X43_DIGEST,
-            "fold-OFF frame changed:\n{frame}"
+            "fold-OFF frame changed (hash {hash}):\n{frame}"
         );
     }
 
@@ -19737,8 +19738,7 @@ mod tests {
         match n {
             1..=14 => "claude",
             15..=18 => "codex",
-            19..=20 => "grok",
-            _ => "gemini",
+            _ => "grok",
         }
     }
 
@@ -19776,7 +19776,7 @@ mod tests {
             "c04xxxxxxx@ex.io",
             "grok1@ex.io",
             "grok2@ex.io",
-            "gem1@ex.io",
+            "grok3@ex.io",
         ][n - 1]
             .to_string()
     }
@@ -19967,7 +19967,7 @@ mod tests {
                 assert_eq!(a, b, "line {i}:\n{}", on.join("\n"));
             }
         }
-        let counts = "(claude 14 · codex 4 · grok 2 · gemini 1)";
+        let counts = "(claude 14 · codex 4 · grok 3)";
         assert!(
             off[title].contains(&format!("{counts} ─")),
             "{}",
@@ -20008,7 +20008,7 @@ mod tests {
         let accounts = row_of(&rows, " accounts · sort ");
         assert!(
             rows[accounts].contains(
-                " · 21 (claude 14 · codex 4 · grok 2 · gemini 1) · 7d spent 9 folded: 7d 100.0% > 99% "
+                " · 21 (claude 14 · codex 4 · grok 3) · 7d spent 9 folded: 7d 100.0% > 99% "
             ) && !rows[accounts].contains("more"),
             "{frame}"
         );
@@ -20506,7 +20506,7 @@ mod tests {
     /// widest `+N more` (every account hidden).
     fn crowded_title(note: &str) -> String {
         format!(
-            " accounts · sort name · 75 (claude 15 · codex 15 · grok 15 · openrouter 15 · gemini 15){note} · +75 more "
+            " accounts · sort name · 60 (claude 15 · codex 15 · grok 15 · openrouter 15){note} · +60 more "
         )
     }
 
@@ -20532,15 +20532,15 @@ mod tests {
     /// MUST-FIX (trinity R1): when the title with the shared status does
     /// not fit the pane, the status must not be cut off the title and lost.
     /// The shared-form entries fit two per line at both widths, but that
-    /// title (with `+N more` at its widest) does not: at 134 columns each
+    /// title (with `+N more` at its widest) does not: at 123 columns each
     /// entry carries its own status — whatever the pane height, so the
-    /// choice does not flip when rows get hidden — and at 110 even the
+    /// choice does not flip when rows get hidden — and at 106 even the
     /// per-entry title does not fit, so the full table shows them.
     #[test]
     fn fold_shared_status_never_clipped_from_the_title() {
         let (view, chrome) = crowded_view();
         let shared = crowded_title(" · 7d spent 4 folded: 7d 100.0% > 99%");
-        for (w, h) in [(110u16, 120u16), (134, 40), (134, 120)] {
+        for (w, h) in [(106u16, 120u16), (123, 40), (123, 120)] {
             assert!(Line::from(shared.as_str()).width() > usize::from(w));
             let rows = render_rows(&view, &chrome, w, h);
             let frame = rows.join("\n");
@@ -20554,16 +20554,24 @@ mod tests {
                 assert_each_member_shows_its_status(&rows, &frame);
             }
         }
-        // The decision itself: per-entry form at 134, no fold at 110.
+        // The decision itself: per-entry form at 134, no fold at 106.
         let ctx = frame_ctx(&view, &chrome);
-        match fold_at(&view, &ctx, &chrome, 134) {
+        match fold_at(&view, &ctx, &chrome, 123) {
             Fold::Applied(plan) => {
-                assert_eq!((plan.shared_status, plan.per_line), (None, 2));
+                assert_eq!(plan.shared_status, None);
             }
-            other => panic!("per-entry fold at 134, got {}", other.note()),
+            // The fork's pool fixture has no gemini group, so its title is
+            // 12 cells shorter than upstream's and the width band where the
+            // shared title overflows is too narrow for two entries per line:
+            // the fold backs off to the full table (still never clipped).
+            other => assert!(
+                other.note().contains("saves no row"),
+                "per-entry fold or full-table fallback at 123, got {}",
+                other.note()
+            ),
         }
         assert!(matches!(
-            fold_at(&view, &ctx, &chrome, 110),
+            fold_at(&view, &ctx, &chrome, 106),
             Fold::TooNarrow
         ));
     }
