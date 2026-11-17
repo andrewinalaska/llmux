@@ -396,6 +396,11 @@ const FABLE_5: ModelPrice = ModelPrice::new(10.0, 50.0, 1.0, 12.5).with_cache_cr
 /// Claude Fable 5.1: 10 / 12.50 / 20 / 0.25 / 50 — same as Fable 5 except the
 /// cache read, which is 0.025x input ($0.25), not Fable 5's $1.00.
 const FABLE_5_1: ModelPrice = ModelPrice::new(10.0, 50.0, 0.25, 12.5).with_cache_creation_1h(20.0);
+/// Claude Fable 5.2 (released 2026-11-09; platform.claude.com models overview
+/// and pricing, read 2026-11-17): $8 in / $40 out / cache read $0.20 (2.5% of
+/// input) / 5m write $10 / 1h write $16; no long-context tier. CHEAPER than
+/// Fable 5 / 5.1, so it must NOT fall to the Fable default row.
+const FABLE_5_2: ModelPrice = ModelPrice::new(8.0, 40.0, 0.20, 10.0).with_cache_creation_1h(16.0);
 /// gpt-5.5 / codex default {input 5.0, output 30.0, cache_read 0.5,
 /// cache_creation 0.0} (OpenAI pricing page, re-read 2026-09-28). Codex has no
 /// cache-creation charge. Also the `group == "codex"` unknown-model fallback.
@@ -482,6 +487,41 @@ const GPT_6_1_SOL: ModelPrice = ModelPrice::new(2.0, 10.0, 0.1, 2.5).with_long_c
     0.2,
     5.0,
 );
+/// gpt-6.1-terra (2026-10-26; generation 6.1's mid tier; OpenAI model page and
+/// pricing page, read 2026-11-17, standard tier, prompts <=272k): $1 in / $5
+/// out / $0.05 cached / $1.25 cache write (30m). Prompts over 272k bill the
+/// whole request at $2 in / $7.50 out / $0.10 cached / $2.50 write. Half of
+/// 6.1-sol, so it must NOT fall to the `gpt-6.1-` prefix default.
+const GPT_6_1_TERRA: ModelPrice = ModelPrice::new(1.0, 5.0, 0.05, 1.25).with_long_context_at(
+    OPENAI_LONG_CONTEXT_THRESHOLD,
+    2.0,
+    7.5,
+    0.1,
+    2.5,
+);
+/// gpt-6.2-sol (OpenAI pricing page, read 2026-11-17, standard tier, prompts
+/// <=272k): $2 in / $10 out / $0.10 cached / $2.50 cache write (30m); over 272k
+/// the whole request bills at $4 in / $15 out / $0.20 cached / $5 write. Same
+/// rates as 6.1-sol.
+const GPT_6_2_SOL: ModelPrice = ModelPrice::new(2.0, 10.0, 0.1, 2.5).with_long_context_at(
+    OPENAI_LONG_CONTEXT_THRESHOLD,
+    4.0,
+    15.0,
+    0.2,
+    5.0,
+);
+/// gpt-6.2-astra (OpenAI model page + pricing page, read 2026-11-17, standard
+/// tier, prompts <=272k): $8 in / $40 out / $0.40 cached / $10 cache write
+/// (30m); over 272k the whole request bills at $16 in / $60 out / $0.80
+/// cached / $20 write. Cheaper than gpt-6-astra ($10 / $50 / $1.00), so it
+/// must NOT fall to the `gpt-6-` astra default.
+const GPT_6_2_ASTRA: ModelPrice = ModelPrice::new(8.0, 40.0, 0.4, 10.0).with_long_context_at(
+    OPENAI_LONG_CONTEXT_THRESHOLD,
+    16.0,
+    60.0,
+    0.8,
+    20.0,
+);
 /// gpt-6-luna (2026-09-22 launch, standard tier): $0.10 in / $0.50 out /
 /// $0.01 cached input; over 272k: $0.20 in / $0.75 out / $0.02 cached.
 /// Same sourcing and conventions as [`GPT_6_SOL`].
@@ -527,6 +567,9 @@ const BUILTIN_TIERED_ROWS: &[ModelPrice] = &[
     GPT_6_ASTRA,
     GPT_6_SOL,
     GPT_6_1_SOL,
+    GPT_6_1_TERRA,
+    GPT_6_2_SOL,
+    GPT_6_2_ASTRA,
     GPT_6_LUNA,
     GROK_4_5,
     GROK_4_6,
@@ -565,6 +608,9 @@ fn builtin_price(model_norm_lower: &str) -> Option<ModelPrice> {
         "gpt-6" | "gpt-6-astra" => Some(GPT_6_ASTRA),
         "gpt-6-sol" => Some(GPT_6_SOL),
         "gpt-6.1" | "gpt-6.1-sol" => Some(GPT_6_1_SOL),
+        "gpt-6.1-terra" => Some(GPT_6_1_TERRA),
+        "gpt-6.2-sol" => Some(GPT_6_2_SOL),
+        "gpt-6.2" | "gpt-6.2-astra" => Some(GPT_6_2_ASTRA),
         "gpt-6-luna" => Some(GPT_6_LUNA),
         "grok-4.5" => Some(GROK_4_5),
         "grok-4.7" => Some(GROK_4_7),
@@ -600,10 +646,22 @@ fn builtin_price(model_norm_lower: &str) -> Option<ModelPrice> {
         // future dated `gpt-5.6-sol-*` snapshot resolve here. Same generation
         // boundary: `gpt-5.60-*` must NOT take 5.6 rates.
         Some(GPT_5_6_SOL)
+    } else if model_norm_lower.starts_with("gpt-6.1-terra-") {
+        // Terra is half sol's price: a dated / suffixed terra id must be
+        // caught before the `gpt-6.1-` default below overcharges it.
+        Some(GPT_6_1_TERRA)
     } else if model_norm_lower.starts_with("gpt-6.1-") {
-        // Generation 6.1 has one tier (sol); `gpt-6.10-*` must miss this
-        // branch, hence the required `-`.
+        // Sol is generation 6.1's flagship, so it is the `gpt-6.1-` default
+        // (terra has its own rows above); `gpt-6.10-*` must miss this branch,
+        // hence the required `-`.
         Some(GPT_6_1_SOL)
+    } else if model_norm_lower.starts_with("gpt-6.2-sol-") {
+        Some(GPT_6_2_SOL)
+    } else if model_norm_lower.starts_with("gpt-6.2-") {
+        // Astra is generation 6.2's flagship and the `gpt-6.2-` default (sol
+        // has its own row above); `gpt-6.20-*` must miss this branch, hence
+        // the required `-`.
+        Some(GPT_6_2_ASTRA)
     } else if model_norm_lower.starts_with("gpt-6-astra-") {
         Some(GPT_6_ASTRA)
     } else if model_norm_lower.starts_with("gpt-6-sol-") {
@@ -717,6 +775,7 @@ fn claude_price(slug: &str) -> Option<ModelPrice> {
         ("sonnet", _) => SONNET_TIER,
         ("haiku", Some((5, Some(5)))) => HAIKU_5_5,
         ("haiku", _) => HAIKU_4_5,
+        ("fable", Some((5, Some(2)))) => FABLE_5_2,
         ("fable", Some((5, Some(1)))) => FABLE_5_1,
         ("fable", _) => FABLE_5,
         _ => return None,
@@ -1350,6 +1409,75 @@ mod tests {
     /// Every Claude row family against the Anthropic pricing page (read
     /// 2026-09-28), bare id and the `[1m]` display spelling alike.
     #[test]
+    fn fable_5_2_takes_its_own_rates_not_the_fable_tier() {
+        // platform.claude.com pricing, read 2026-11-17: $8 / $40 / $0.20 cache
+        // read / $10 5m write / $16 1h write.
+        for model in [
+            "claude-fable-5-2",
+            "claude-fable-5-2[1m]",
+            "fable",
+            "fable-5-2",
+            "claude-fable-5-2-20261109",
+        ] {
+            assert_eq!(
+                builtin_price(&normalize_model(model).to_ascii_lowercase()),
+                Some(FABLE_5_2),
+                "{model}"
+            );
+        }
+        assert_eq!(FABLE_5_2.input, 8.0);
+        assert_eq!(FABLE_5_2.output, 40.0);
+        assert_eq!(FABLE_5_2.cache_read, 0.20);
+        assert_eq!(FABLE_5_2.cache_creation, 10.0);
+        // Version boundary: a look-alike is not 5.2.
+        assert_eq!(builtin_price("claude-fable-5-20"), Some(FABLE_5));
+        assert_eq!(builtin_price("claude-fable-5-2x"), Some(FABLE_5));
+        assert_eq!(builtin_price("claude-fable-5-1"), Some(FABLE_5_1));
+    }
+
+    #[test]
+    fn gpt_6_1_terra_and_6_2_rows_take_their_own_rates() {
+        // developers.openai.com pricing + model pages, read 2026-11-17.
+        for (model, want) in [
+            ("gpt-6.1-terra", GPT_6_1_TERRA),
+            ("gpt-6.1-terra[1m]", GPT_6_1_TERRA),
+            ("gpt-6.1-terra-20261026", GPT_6_1_TERRA),
+            ("gpt-6.2-sol", GPT_6_2_SOL),
+            ("gpt-6.2-sol-20261117", GPT_6_2_SOL),
+            ("gpt-6.2-astra", GPT_6_2_ASTRA),
+            ("gpt-6.2", GPT_6_2_ASTRA),
+            ("gpt-6.2-astra-20261117", GPT_6_2_ASTRA),
+            // An unlisted 6.2 tier takes the flagship (astra) default.
+            ("gpt-6.2-future", GPT_6_2_ASTRA),
+        ] {
+            assert_eq!(
+                builtin_price(&normalize_model(model).to_ascii_lowercase()),
+                Some(want),
+                "{model}"
+            );
+        }
+        let rates = |p: ModelPrice| (p.input, p.output, p.cache_read, p.cache_creation);
+        assert_eq!(rates(GPT_6_1_TERRA), (1.0, 5.0, 0.05, 1.25));
+        assert_eq!(rates(GPT_6_2_SOL), (2.0, 10.0, 0.1, 2.5));
+        assert_eq!(rates(GPT_6_2_ASTRA), (8.0, 40.0, 0.4, 10.0));
+        // Long-context tier (>272K prompt): input and cache x2, output x1.5.
+        for p in [GPT_6_1_TERRA, GPT_6_2_SOL, GPT_6_2_ASTRA] {
+            assert!(BUILTIN_TIERED_ROWS.contains(&p));
+            let l = p.long_context.expect("tiered");
+            assert_eq!(l.threshold, OPENAI_LONG_CONTEXT_THRESHOLD);
+            assert_eq!(l.input, p.input * 2.0);
+            assert_eq!(l.cache_read, p.cache_read * 2.0);
+            assert_eq!(l.output, p.output * 1.5);
+        }
+        // Older rows are unchanged and generation boundaries hold.
+        assert_eq!(builtin_price("gpt-6-astra"), Some(GPT_6_ASTRA));
+        assert_eq!(builtin_price("gpt-6.1-sol"), Some(GPT_6_1_SOL));
+        assert_eq!(builtin_price("gpt-6.1-terrax"), Some(GPT_6_1_SOL));
+        assert_eq!(builtin_price("gpt-6.20-sol"), None);
+        assert_eq!(builtin_price("gpt-5.6-terra"), Some(GPT_5_6_TERRA));
+    }
+
+    #[test]
     fn claude_rows_match_the_pricing_page() {
         let opus = (5.0, 25.0, 0.5, 6.25);
         let opus_legacy = (15.0, 75.0, 1.5, 18.75);
@@ -1389,7 +1517,8 @@ mod tests {
             sonnet_5_5,
             "sonnet → claude-sonnet-5-5"
         );
-        assert_eq!(claude_rates("fable").2, 0.25, "fable → claude-fable-5-1");
+        assert_eq!(claude_rates("fable").2, 0.20, "fable → claude-fable-5-2");
+        assert_eq!(claude_rates("fable-5-1").2, 0.25, "fable-5-1 stays 5.1");
         assert_eq!(claude_rates("haiku"), (0.1, 0.5, 0.01, 0.125));
     }
 
