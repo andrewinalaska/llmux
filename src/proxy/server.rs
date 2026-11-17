@@ -4839,9 +4839,9 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_json(response).await;
         let models = body["models"].as_array().expect("models array");
-        // 42 curated (14 claude + 14 codex + 4 grok + 10 openrouter) + 1
+        // 49 curated (15 claude + 20 codex + 4 grok + 10 openrouter) + 1
         // synthesized (grok-4.3 is out-of-catalog now).
-        assert_eq!(models.len(), 43);
+        assert_eq!(models.len(), 50);
 
         let by_id = |id: &str| {
             models
@@ -4872,10 +4872,44 @@ mod tests {
         );
         assert_eq!(
             by_id("gpt-6.1-sol")["aliases"],
-            serde_json::json!(["sol", "gpt-6.1"])
+            serde_json::json!(["gpt-6.1"])
+        );
+        // `sol` / `astra` moved to the 6.2 generation on 2026-11-17: sol on
+        // its base row (models.json 500000), astra on its `[1m]` twin.
+        assert_eq!(by_id("gpt-6.2-sol")["aliases"], serde_json::json!(["sol"]));
+        assert_eq!(by_id("gpt-6.2-sol")["max_context"], 500_000);
+        assert_eq!(by_id("gpt-6.2-sol[1m]")["max_context"], 1_000_000);
+        assert_eq!(
+            by_id("gpt-6.2-astra[1m]")["aliases"],
+            serde_json::json!(["astra", "gpt-6.2"])
+        );
+        assert_eq!(by_id("gpt-6.2-astra")["max_context"], 272_000);
+        assert_eq!(by_id("gpt-6.2-astra[1m]")["max_context"], 1_000_000);
+        assert_eq!(by_id("gpt-6-astra")["aliases"], serde_json::json!([]));
+        assert_eq!(
+            by_id("gpt-6-astra[1m]")["aliases"],
+            serde_json::json!(["gpt-6"])
         );
         assert_eq!(by_id("gpt-6.1-sol")["max_context"], 272_000);
         assert_eq!(by_id("gpt-6.1-sol[1m]")["max_context"], 1_000_000);
+        // `terra` moved to gpt-6.1-terra on 2026-11-10; its base row carries
+        // the models.json 500000, its twin the published 1M.
+        assert_eq!(
+            by_id("gpt-6.1-terra")["aliases"],
+            serde_json::json!(["terra"])
+        );
+        assert_eq!(by_id("gpt-6.1-terra")["max_context"], 500_000);
+        assert_eq!(by_id("gpt-6.1-terra[1m]")["max_context"], 1_000_000);
+        assert_eq!(by_id("gpt-5.6-terra")["aliases"], serde_json::json!([]));
+        // `fable` moved to claude-fable-5-2[1m] the same day.
+        assert_eq!(
+            by_id("claude-fable-5-2[1m]")["aliases"],
+            serde_json::json!(["fable", "fable-5-2"])
+        );
+        assert_eq!(
+            by_id("claude-fable-5-1[1m]")["aliases"],
+            serde_json::json!(["fable-5-1"])
+        );
         for id in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
             assert_eq!(by_id(id)["max_context"], 272_000);
         }
